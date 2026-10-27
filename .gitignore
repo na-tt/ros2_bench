@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ROS 2 / colcon workspace artifacts
+ws/build/
+ws/install/
+ws/log/
+
+# Benchmark assets (weights / footage kept out of git)
+assets/models/*
+assets/videos/*
+assets/images/*
+!assets/models/.gitkeep
+!assets/videos/.gitkeep
+!assets/images/.gitkeep

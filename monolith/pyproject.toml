@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "monolith"
+version = "0.1.0"
+description = "Single-process CV pipelines benchmarked against their ROS 2 counterparts"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+# Runtime deps of the yolocar pipeline. TensorRT itself ships with JetPack and
+# is imported lazily (yolocar.engine); the CUDA runtime is reached through
+# ctypes, so neither pycuda nor cuda-python is required.
+yolocar = [
+    "numpy>=1.26",
+    "opencv-python>=4.10",
+]
+# Only needed to (re)export the ONNX model that the .engine is built from.
+export = [
+    "ultralytics>=8.3",
+    "onnx>=1.16",
+]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+yolocar = "yolocar.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["yolocar*"]
+
+[tool.setuptools.package-data]
+yolocar = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

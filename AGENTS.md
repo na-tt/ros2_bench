@@ -1,4 +1,4 @@
-# Agent Guide: ROS 2 vs. Monolith Benchmark Project
+# Agent Guide: ros2_bench: ROS 2 vs. Monolith Benchmark Project
 
 ## Project Overview
 This repository benchmarks single-process Python computer vision (CV) pipelines against equivalent ROS 2 (`rclpy`) node implementations to evaluate overhead, latency, and throughput.
@@ -80,3 +80,16 @@ source install/setup.bash
   3. Create `ws/src/pipeline_x_ros/` as an `ament_python` package with a node importing from `pipelineX.processor`.
 * **Modifying CV Logic**:
   * Modify code **only** inside `monolith/pipelineX/`. Because `monolith` is installed with `-e` and `colcon` uses `--symlink-install`, changes take effect immediately across both standalone scripts and ROS 2 nodes without needing reinstallations.
+
+## Pipelines
+### yolocar
+#### Description
+Road objects video detection with yolo on dashcam footage.
+
+#### Specification
+- (1) **acquisition:** read frame from video file. bgr frame at experimental resolution
+- (2) **preprocessing:** image conditioning to expected input characteristics. rgb image, 1×3×640×640, float/uint8 per model
+- (3) **inference:** run yolo and produce candidate detection boxes.
+- (4) **NMS:** perform Non Maximum Supression to reduce detections.
+- (5) **domain filter:** filter to only class ids corresponding to road objects
+- (6) **coordinate adaptation:** boxes translated to input frame coordinates.
