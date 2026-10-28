@@ -40,3 +40,6 @@ yolocar = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "hardware: needs a CUDA device, tensorrt, cv2 and a built .engine; skips itself when they are missing (tests/test_yolocar_hardware.py)",
+]
