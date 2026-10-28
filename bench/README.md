@@ -72,6 +72,13 @@ The per-frame contract is the piece every front-end must satisfy:
 `t_mono` is `time.monotonic()`, which is system-wide on Linux, so the sampler's
 `t_mono` column joins directly against it.
 
+The ROS 2 front-end adds one key to this contract: `transport_ms`,
+end-to-end latency minus the three stage timings (serialisation + DDS +
+scheduling). The monolith has no such cost, so its absence there is not a
+missing measurement. In the ROS chain `infer_ms` also contains the detect-head
+decode/threshold (the candidates, not the raw head, cross the topic boundary):
+compare `infer + post` as a block, not the two buckets separately.
+
 ## Metrics
 
 | column | source | note |
@@ -83,11 +90,24 @@ The per-frame contract is the piece every front-end must satisfy:
 | `gpu %` | tegrastats | `GR3D_FREQ` duty cycle, not occupancy; a latency-bound chain reads low |
 | `W`, `J/f` | tegrastats | board-level `VDD_IN`; energy is the trapezoidal integral over the window |
 | `tj °C` | tegrastats | junction temperature, max over the window |
+| `xport` | records | ROS only: `transport_ms`, i.e. serialisation + DDS + scheduling |
 
 Board power is a single rail, so energy can only be attributed per frame
 end-to-end — never per pipeline stage. `tegrastats` lines carry a 1-second
 wall-clock prefix, so the sampler timestamps the line when it reads it; a board
 column can be up to one interval (default 100 ms) older than its `t_mono`.
+
+## Conditions
+
+* `monolith` — the single-process baseline.
+* `monolith-ctrl` — a byte-identical clone of it; the difference is the noise
+  floor.
+* `ros-4node` — the four-node chain (acquisition → preprocessing → inference →
+  postprocessing), one process per node, paced by an ack from the terminal
+  node. It needs the ROS 2 workspace to be built
+  (`cd ws && colcon build --symlink-install`) and `yolocar` importable via
+  `PYTHONPATH`; the shell condition in `scenarios.json` sources the workspace
+  and sets `PYTHONPATH`. See `ws/src/yolocar_ros/README.md`.
 
 ## Adding a condition
 
@@ -96,5 +116,7 @@ things that need `source install/setup.bash`. Placeholders: `{python}`, `{repo}`
 `{source}`, `{rotate}`, `{loops}`, `{duration}`, `{out}`, `{condition}`,
 `{repeat}`.
 
-The ROS 2 node must produce the same `records.jsonl` / `summary.json` pair —
-that contract is what makes the two front-ends comparable.
+The ROS 2 nodes must produce the same `records.jsonl` / `summary.json` pair —
+that contract is what makes the two front-ends comparable. The ROS condition
+currently emits one extra per-record key (`transport_ms`); extra keys are
+ignored by `analyze.py`.

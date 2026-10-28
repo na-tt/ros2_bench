@@ -145,6 +145,11 @@ def summarise_trial(
             for key in ("acq_ms", "pre_ms", "infer_ms", "post_ms")
         },
     }
+    # ROS-only: serialisation + DDS + scheduling, absent from the monolith.
+    if all("transport_ms" in record for record in window):
+        result["stage_ms"]["transport_ms"] = _median(
+            record["transport_ms"] for record in window
+        )
 
     samples = [
         row
@@ -261,7 +266,7 @@ def aggregate(trials: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         ]
         entry["stage_ms"] = {
             stage: _median(trial["stage_ms"].get(stage) for trial in group)
-            for stage in ("acq_ms", "pre_ms", "infer_ms", "post_ms")
+            for stage in ("acq_ms", "pre_ms", "infer_ms", "post_ms", "transport_ms")
         }
         report[condition] = entry
     return report
@@ -305,10 +310,13 @@ def to_markdown(report: dict[str, dict[str, Any]], window: str) -> str:
         )
 
     out = [f"Window: {window}", "", *lines, ""]
-    out.append("Stages (median ms): pre / infer / post, acquisition separately")
+    out.append(
+        "Stages (median ms): pre / infer / post, acquisition separately. "
+        "`xport` is the ROS-only serialisation + DDS + scheduling residual."
+    )
     out.append("")
-    out.append("| condition | acq | pre | infer | post | dets/frame |")
-    out.append("|---|---|---|---|---|---|")
+    out.append("| condition | acq | pre | infer | post | xport | dets/frame |")
+    out.append("|---|---|---|---|---|---|---|")
     for condition, entry in report.items():
         stages = entry["stage_ms"]
         out.append(
@@ -320,6 +328,7 @@ def to_markdown(report: dict[str, dict[str, Any]], window: str) -> str:
                     _fmt(stages.get("pre_ms"), 2),
                     _fmt(stages.get("infer_ms"), 2),
                     _fmt(stages.get("post_ms"), 2),
+                    _fmt(stages.get("transport_ms"), 2),
                     _fmt(entry.get("detections_per_frame"), 2),
                 ]
             )

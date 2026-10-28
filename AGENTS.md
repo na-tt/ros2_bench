@@ -43,7 +43,8 @@ ros2_bench/
 │
 └── ws/                          # ROS 2 Colcon Workspace
     └── src/
-        └── yolocar_ros/         # ROS 2 wrapper for `yolocar`
+        ├── yolocar_interfaces/  # msgs: FrameMeta + per-stage payloads
+        └── yolocar_ros/         # 4 nodes + launch/bench.launch.py
 ```
 
 New pipelines follow the same shape: `monolith/<name>/` with `pyproject.toml`
@@ -185,13 +186,17 @@ source install/setup.bash
   bench/analyze.py --from 30 --to 270 --md results/report.md --json results/report.json
   ```
 
-* **To run a ROS 2 implementation** (no node yet, only the empty scaffold -- see
-  *Current State*):
+* **To run a ROS 2 implementation** (the four-node chain -- see *Current State*):
   ```bash
-  cd ws
-  source install/setup.bash
-  ros2 run yolocar_ros yolocar_node
+  cd ws && colcon build --symlink-install && source install/setup.bash
+  cd ..   # paths default to the repository root
+  PYTHONPATH=monolith/yolocar/src:$PYTHONPATH \
+    ros2 launch yolocar_ros bench.launch.py duration:=120 \
+      records:=results/ros/records.jsonl summary:=results/ros/summary.json
   ```
+  The launch file starts acquisition, preprocessing, inference and
+  postprocessing as four processes and stops them together. `duration:=-1` runs
+  the source to its end.
 
 ---
 
@@ -231,9 +236,12 @@ never imports pipeline code. Details and the metric dictionary are in
   infer_ms, post_ms, present_ms, latency_ms, n_det`. `t_mono` is
   `time.monotonic()` (CLOCK_MONOTONIC, system-wide on Linux), so it joins
   directly against `sampler.csv`. A ROS node must carry the equivalent
-  timestamp *in the message*, not re-time around its own callback.
+  timestamp *in the message*, not re-time around its own callback. Extra keys
+  are allowed: the ROS front-end adds `transport_ms` (serialisation + DDS +
+  scheduling) and `analyze.py` reports it as `xport` when present.
 * `summary.json`: latency stats, `stage_ms`
-  (`acquisition/preprocess/inference/postprocess/presentation`), `events`
+  (`acquisition/preprocess/inference/postprocess/presentation`; the ROS
+  front-end adds `transport`), `events`
   (start/engine_loaded/first_frame/end), `provenance`, `fps`/`fps_wall`.
 * `sampler.csv` is produced by the harness, not by the workload.
 
@@ -307,16 +315,37 @@ type only at the very end.
 
 ## Current State & Known Issues
 
-* **`ws/` is a bare scaffold, no node yet.** `ws/src/yolocar_ros` is an
-  `ament_python` package created from the `ros2 pkg create` template with only the
-  name changed: empty `yolocar_ros/__init__.py`, `TODO` description and licence in
-  `package.xml`, stock `test_{copyright,flake8,pep257}.py`, no node, no launch
-  file. It builds with `--symlink-install` (`ws/install`, `ws/build`, `ws/log` are
-  gitignored), but publishes/subscribes nothing, so the `ros-short` condition in
-  `bench/scenarios.json` is still a disabled placeholder. Next step: implement the
-  node emitting the `records.jsonl` / `summary.json` contract above (carrying
-  `seq` + capture timestamp through the graph so latency is measured across nodes
-  instead of around a callback).
+* **`ws/src/yolocar_ros` is the four-node chain** (acquisition ->
+  preprocessing -> inference -> postprocessing), one process per stage, plus
+  `ws/src/yolocar_interfaces` with the messages (`FrameMeta`, `ImageFrame`,
+  `TensorFrame`, `CandidatesFrame`, `FrameAck`). Each stage calls the
+  corresponding `yolocar` function and adds only ROS 2 boilerplate. The
+  acquisition node publishes one frame and waits for the terminal node's ack, so
+  the graph is demand-driven like the monolith (one frame in flight, no silent
+  drops). `bench/scenarios.json` (`ros-4node`) drives it through
+  `launch/bench.launch.py`; any node exiting shuts the launch down.
+* **Compare `infer + post` as one block in the ROS chain.** The inference node
+  publishes decoded/thresholded `Candidates` instead of the raw
+  `(1, 84, 8400)` head (2.8 MB/frame), so `infer_ms` there includes
+  `decode_predictions`/`select_candidates`. `acq_ms`, `pre_ms` and the
+  detections remain directly comparable.
+* **The ROS chain is transport-bound, and that is the measurement.** The ROS
+  records add `transport_ms` (serialisation + DDS + scheduling) and the summary
+  adds a `transport` stage bucket. On this Jetson the two large payloads (2.7 MB
+  BGR frame, 4.9 MB float32 tensor) make the four-node chain ~70-85 ms p50 / ~10
+  fps, against ~17 ms / ~35 fps for the monolith. Do not reduce it by shrinking
+  the measured stages or by inserting queues; that is exactly what the
+  benchmark exists to show.
+* **`imgsz` and `input_dtype` are launch parameters, not engine facts.** The
+  preprocessing node cannot load the engine (that is the inference node's job),
+  so the launch file passes both and the inference node validates them against
+  the real engine contract. The shipped `yolov8n_fp16.engine` wants
+  `float32` / 640. A mismatch raises an explicit error instead of casting.
+* **Run the launch from the repository root.** Default source/model/records
+  paths are relative, and `yolocar` must be on `PYTHONPATH`
+  (`PYTHONPATH=monolith/yolocar/src:$PYTHONPATH`) because there is no `pip` on
+  the Jetson's `/usr/bin/python3` and the pipeline project is not installed
+  into the ROS workspace. The bench `ros-4node` condition does both.
 * **Never name a ROS package `yolocar`.** The scaffold was originally created as
   `yolocar`, which shares the import name of `monolith/yolocar/src/yolocar`, and
   because `~/.bashrc` sources `ws/install/setup.bash` the empty scaffold shadowed
@@ -339,4 +368,6 @@ type only at the very end.
 * **`results/` is generated and gitignored.** Keep a run's directory if you want
   to compare against it later; nothing in it is source.
 * Test counts at the end of this session: 109 (`pytest monolith/yolocar`,
-  including 17 hardware tests against the real engine).
+  including 17 hardware tests against the real engine); 20 passed + 1 skipped
+  (`colcon test --packages-select yolocar_ros`, including the ament lint tests
+  and the real-engine stage-split test).

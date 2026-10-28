@@ -34,10 +34,9 @@
       ],
       "env": {"PYTHONPATH": "{repo}/monolith/yolocar/src"}
     },
-    "ros-short": {
-      "enabled": false,
-      "note": "placeholder: enable once ws/src/yolocar_ros exists. The node must write the same records.jsonl / summary.json contract.",
-      "shell": "source {repo}/ws/install/setup.bash && ros2 launch yolocar_ros bench.launch.py duration:={duration} records:={out}/records.jsonl summary:={out}/summary.json"
+    "ros-4node": {
+      "note": "four-node chain (acquisition -> preprocessing -> inference -> postprocessing), one process each. The inference node owns the decode/threshold step, so compare `infer + post` against the monolith's two buckets. Prerequisite: `cd ws && colcon build --symlink-install`.",
+      "shell": "source {repo}/ws/install/setup.bash && PYTHONPATH={repo}/monolith/yolocar/src:$PYTHONPATH ros2 launch yolocar_ros bench.launch.py duration:={duration} loops:={loops} source:={source} rotate:={rotate} records:={out}/records.jsonl summary:={out}/summary.json log_level:=WARNING"
     }
   }
 }

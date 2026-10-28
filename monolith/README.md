@@ -12,7 +12,7 @@ separately installable Python project (its own `pyproject.toml`, `src/`,
 
 | Package                 | Project root         | Purpose                                     | ROS 2 wrapper       |
 | ----------------------- | -------------------- | ------------------------------------------- | ------------------- |
-| [`yolocar`](yolocar/)   | `monolith/yolocar/`  | YOLO road-object detection (TensorRT)       | `yolocar_ros` (todo) |
+| [`yolocar`](yolocar/)   | `monolith/yolocar/`  | YOLO road-object detection (TensorRT)       | `yolocar_ros` (4 nodes) |
 
 ## Layout
 

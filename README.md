@@ -22,11 +22,17 @@ it.
 
 ```bash
 pip install -e ./monolith/yolocar
-python3 -m yolocar.main --source assets/videos/clip.mp4   # single-process baseline
+python3 -m yolocar.main --source assets/video/0000f77c-6257be58.mov --rotate 180  # baseline
 
 cd ws && colcon build --symlink-install && source install/setup.bash
-ros2 run yolocar_ros yolocar_node                         # ROS 2 counterpart (todo)
+cd .. && PYTHONPATH=monolith/yolocar/src:$PYTHONPATH \
+  ros2 launch yolocar_ros bench.launch.py duration:=120 \
+    records:=results/ros/records.jsonl summary:=results/ros/summary.json
 ```
+
+The ROS 2 counterpart is a four-node chain
+(acquisition → preprocessing → inference → postprocessing), one process per
+stage; see `ws/src/yolocar_ros/README.md`.
 
 See `AGENTS.md` for the architecture rules and per-pipeline details, and
 `bench/README.md` for the measurement protocol.
