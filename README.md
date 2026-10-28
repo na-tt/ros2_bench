@@ -9,6 +9,7 @@ ros2_bench/
 ├── monolith/          # container: one independent Python project per pipeline
 │   └── yolocar/       # own pyproject.toml, src/yolocar/, tests/
 ├── assets/            # shared benchmark inputs (weights, videos, images)
+├── bench/             # measurement harness: interleaved trials, telemetry, reports
 └── ws/                # ROS 2 colcon workspace (wrappers only, no CV logic)
 ```
 
@@ -27,4 +28,5 @@ cd ws && colcon build --symlink-install && source install/setup.bash
 ros2 run yolocar_ros yolocar_node                         # ROS 2 counterpart (todo)
 ```
 
-See `AGENTS.md` for the architecture rules and per-pipeline details.
+See `AGENTS.md` for the architecture rules and per-pipeline details, and
+`bench/README.md` for the measurement protocol.
