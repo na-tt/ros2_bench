@@ -27,3 +27,5 @@ assets/images/*
 !assets/video/.gitkeep
 !assets/images/.gitkeep
 
+# Benchmark outputs
+results/
