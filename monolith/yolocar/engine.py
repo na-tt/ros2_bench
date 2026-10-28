@@ -10,8 +10,12 @@ Design notes
   non-blocking stream; :meth:`TensorRTEngine.infer` returns after the stream is
   synchronized, i.e. the outputs are ready.
 * ``infer`` returns *views* into the pinned output buffers unless ``copy=True``
-  is requested. The data is overwritten by the next call -- consume it
-  immediately (which is what the post-processing does).
+  is requested. The data is overwritten by the next call and the buffers are
+  released by :meth:`TensorRTEngine.close` -- consume the views immediately
+  (which is what the post-processing does) and never cache them.
+* Not thread-safe: one engine owns one execution context, one stream and one
+  set of buffers. Serialize calls to :meth:`infer`/:meth:`infer_named`
+  yourself (a single-threaded executor / callback group in the ROS 2 node).
 """
 
 from __future__ import annotations
@@ -77,6 +81,8 @@ class TensorRTEngine:
     ) -> None:
         self.engine_path = Path(engine_path)
         self.device_index = int(device_index)
+        if self.device_index < 0:
+            raise ValueError(f"device_index must be >= 0, got {self.device_index}")
         self.default_input_shape = (
             tuple(int(d) for d in default_input_shape)
             if default_input_shape is not None
@@ -92,6 +98,7 @@ class TensorRTEngine:
 
         # Populated by load()
         self._trt: Any = None
+        self._serialized: bytes = b""
         self._trt_logger: Any = None
         self._trt_runtime: Any = None
         self._engine: Any = None
@@ -152,16 +159,49 @@ class TensorRTEngine:
 
         import tensorrt as trt  # lazy: keeps the package importable without TRT
 
+        try:
+            self._load(trt)
+        except BaseException:
+            # Loading can fail half-way (bad profile, missing plugin, unresolved
+            # output shape) *after* the stream and some buffers exist. Release
+            # them deterministically: a retry loop in a benchmark would
+            # otherwise leak CUDA resources on every attempt.
+            self._teardown()
+            raise
+
+    def _load(self, trt: Any) -> None:
+        """Body of :meth:`load`; the caller tears resources down on failure."""
         self._trt = trt
-        level = _TRT_LOG_LEVELS.get(self._log_level, "WARNING")
+        level = _TRT_LOG_LEVELS.get(self._log_level)
+        if level is None:
+            raise ValueError(
+                f"unknown trt_log_level {self._log_level!r}; "
+                f"expected one of {sorted(_TRT_LOG_LEVELS)}"
+            )
         self._trt_logger = trt.Logger(getattr(trt.Logger, level))
-        serialized = self.engine_path.read_bytes()
+
+        # Bind the device *before* anything that creates CUDA resources.
+        # ``create_execution_context()`` attaches the context to whatever device
+        # is current at that moment, so setting the device afterwards would
+        # allocate buffers on one GPU for a context living on another.
+        self._cuda.set_device(self.device_index)
+
+        # Engines exported with an NMS/end-to-end head embed TensorRT plugins
+        # (EfficientNMS_TRT); deserialization fails without them registered.
+        init_plugins = getattr(trt, "init_libnvinfer_plugins", None)
+        if init_plugins is not None:  # pragma: no branch - always present in TRT
+            init_plugins(self._trt_logger, "")
+
+        # Keep the blob alive for the lifetime of the engine: cheap insurance
+        # against bindings that do not take ownership on deserialize.
+        self._serialized = self.engine_path.read_bytes()
         self._trt_runtime = trt.Runtime(self._trt_logger)
-        engine = self._trt_runtime.deserialize_cuda_engine(serialized)
+        engine = self._trt_runtime.deserialize_cuda_engine(self._serialized)
         if engine is None:
             raise RuntimeError(
-                f"failed to deserialize {self.engine_path}; the engine was probably "
-                "built for a different TensorRT version or GPU architecture"
+                f"failed to deserialize {self.engine_path}; the engine was built for a "
+                "different TensorRT version or GPU architecture, or it needs a plugin "
+                "(e.g. EfficientNMS_TRT) that is not available to this runtime"
             )
         self._engine = engine
         context = engine.create_execution_context()
@@ -169,7 +209,6 @@ class TensorRTEngine:
             raise RuntimeError(f"failed to create an execution context for {self.engine_path}")
         self._context = context
 
-        self._cuda.set_device(self.device_index)
         self._stream = self._cuda.stream_create(non_blocking=True)
 
         self._setup_io()
@@ -178,12 +217,16 @@ class TensorRTEngine:
         LOGGER.debug("%s", self.describe())
 
     def _setup_io(self) -> None:
-        """Read tensor metadata, resolve dynamic shapes, allocate device memory."""
+        """Read tensor metadata and resolve dynamic shapes through the context.
+
+        No allocation happens here: output shapes of a dynamic engine are only
+        knowable *after* every input shape has been set, which is why the two
+        steps are split (see :meth:`_allocate_buffers`).
+        """
         trt = self._trt
         engine = self._engine
         context = self._context
 
-        resolved_inputs: dict[str, tuple[int, ...]] = {}
         for index in range(engine.num_io_tensors):
             name = engine.get_tensor_name(index)
             is_input = engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
@@ -192,8 +235,16 @@ class TensorRTEngine:
 
             if is_input:
                 shape = self._resolve_input_shape(name, shape)
-                context.set_input_shape(name, shape)
-                resolved_inputs[name] = shape
+                # TRT >= 8.5 returns False (instead of raising) when the shape is
+                # outside the built optimization profile. Carrying on would size
+                # the buffers from an unresolved output shape, i.e. overflow the
+                # device allocation during the D2H copy.
+                if context.set_input_shape(name, shape) is False:
+                    raise RuntimeError(
+                        f"engine rejected input shape {tuple(shape)} for {name!r}; "
+                        "the shape must fit the optimization profile the engine "
+                        "was built with"
+                    )
                 self.inputs[name] = TensorInfo(name, True, dtype, shape)
             else:
                 if any(d < 0 for d in shape):
@@ -254,8 +305,8 @@ class TensorRTEngine:
         """Run one inference for a single-input engine.
 
         Returns the output tensors in engine order. Unless ``copy=True`` they
-        are views into the pinned host buffers and are invalidated by the next
-        call.
+        are views into the pinned host buffers: overwritten by the next call and
+        released by :meth:`close`.
         """
         info = self.single_input
         outputs = self.infer_named({info.name: input_array}, copy=copy)
@@ -264,7 +315,14 @@ class TensorRTEngine:
     def infer_named(
         self, inputs: Mapping[str, np.ndarray], *, copy: bool = False
     ) -> dict[str, np.ndarray]:
-        """Run one inference with explicit input tensors."""
+        """Run one inference with explicit input tensors.
+
+        Each input must match :attr:`inputs` exactly in both dtype and shape --
+        there is no implicit batch or layout coercion. Buffers are reused
+        between calls: the returned arrays are views into host memory, are
+        overwritten by the next call and become invalid once :meth:`close`
+        releases the buffers. Pass ``copy=True`` to get owned arrays.
+        """
         if not self._loaded:
             raise RuntimeError("engine is not loaded")
 
@@ -282,10 +340,9 @@ class TensorRTEngine:
                     f"input {name!r} expects {info.dtype}{info.shape}, "
                     f"got {array.dtype}{tuple(array.shape)}"
                 )
-            np.copyto(
-                self._host_input_views[name].reshape(-1),
-                np.ascontiguousarray(array).reshape(-1),
-            )
+            # No reshape/cast dance needed: dtype and shape were validated above,
+            # and ``copyto`` accepts a non-contiguous source.
+            np.copyto(self._host_input_views[name], array, casting="no")
             self._cuda.memcpy_async(
                 dst=self._device_buffers[name].ptr,
                 src=self._host_inputs[name].ptr,
@@ -313,10 +370,19 @@ class TensorRTEngine:
 
     # -------------------------------------------------------------- teardown
     def close(self) -> None:
-        """Free every buffer and destroy the context/stream."""
-        if not self._loaded:
-            return
+        """Free every buffer and destroy the context/stream (idempotent).
+
+        The execution context is dropped *before* the buffers it points at.
+        This is only safe because :meth:`infer_named` synchronizes the stream
+        before returning, so no work is in flight here -- revisit this ordering
+        if the engine ever gains an overlapped/pipelined path.
+        """
         self._loaded = False
+        self._teardown()
+
+    def _teardown(self) -> None:
+        """Release every CUDA resource this engine owns; safe to call twice."""
+        self._context = None
         for name, buffer in self._device_buffers.items():
             try:
                 buffer.free()
@@ -332,9 +398,9 @@ class TensorRTEngine:
         self._host_outputs.clear()
         self._host_input_views.clear()
         self._host_output_views.clear()
-        self._context = None
         self._engine = None
         self._trt_runtime = None
+        self._serialized = b""
         if self._stream:
             try:
                 self._cuda.stream_destroy(self._stream)
@@ -362,9 +428,33 @@ class TensorRTEngine:
 
 
 def engine_input_names(engine_path: str | Path) -> tuple[str, ...]:
-    """Convenience helper: input tensor names of an engine file."""
-    engine = TensorRTEngine(engine_path)
-    try:
-        return engine.input_names
-    finally:
-        engine.close()
+    """Input tensor names of an engine file.
+
+    Deserializes the engine only: no execution context, no device buffers and
+    therefore no CUDA device required. Use :class:`TensorRTEngine` when you
+    actually want to infer.
+    """
+    path = Path(engine_path)
+    if not path.exists():
+        raise FileNotFoundError(f"engine not found: {path}")
+
+    import tensorrt as trt  # lazy, as in TensorRTEngine.load
+
+    logger = trt.Logger(trt.Logger.WARNING)
+    init_plugins = getattr(trt, "init_libnvinfer_plugins", None)
+    if init_plugins is not None:
+        init_plugins(logger, "")
+    runtime = trt.Runtime(logger)
+    engine = runtime.deserialize_cuda_engine(path.read_bytes())
+    if engine is None:
+        raise RuntimeError(
+            f"failed to deserialize {path}; the engine was built for a different "
+            "TensorRT version or GPU architecture, or it needs a plugin that is "
+            "not available to this runtime"
+        )
+    names: list[str] = []
+    for index in range(engine.num_io_tensors):
+        name = engine.get_tensor_name(index)
+        if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+            names.append(name)
+    return tuple(names)
