@@ -190,7 +190,7 @@ source install/setup.bash
   ```bash
   cd ws
   source install/setup.bash
-  ros2 run yolocar yolocar_node
+  ros2 run yolocar_ros yolocar_node
   ```
 
 ---
@@ -307,26 +307,24 @@ type only at the very end.
 
 ## Current State & Known Issues
 
-* **`ws/` is a bare scaffold, no node yet.** `ws/src/yolocar` is an untouched
-  `ament_python` package (`ros2 pkg create --build-type ament_python yolocar`):
-  empty `yolocar/__init__.py`, template `package.xml` with `TODO` description and
-  licence, only the stock `test_{copyright,flake8,pep257}.py`. It has been built
-  with `--symlink-install` (`ws/install`, `ws/build`, `ws/log` are gitignored), but
-  it publishes/subscribes nothing, so the `ros-short` condition in
-  `bench/scenarios.json` is still a disabled placeholder. Next step:
-  `ws/src/yolocar_ros` emitting the `records.jsonl` / `summary.json` contract
-  above (and carrying `seq` + capture timestamp through the graph so latency is
-  measured across nodes instead of around a callback).
-* **The scaffold shadows the monolith package.** Both the ROS package and the
-  pipeline project import as `yolocar`, and `~/.bashrc` sources
-  `ws/install/setup.bash`, so in any bash session
-  `import yolocar` resolves to
-  `ws/install/yolocar/lib/python3.12/site-packages/yolocar/__init__.py` -- the
-  empty scaffold, not `monolith/yolocar/src/yolocar/` (verified). Only commands
-  that set `PYTHONPATH=monolith/yolocar/src` explicitly (as both `bench`
-  conditions do) reach the real code. Rename the ROS package to `yolocar_ros`
-  (import name `yolocar_ros`) before writing the node, per *Repository
-  Architecture*, rather than papering over it with `PYTHONPATH` ordering.
+* **`ws/` is a bare scaffold, no node yet.** `ws/src/yolocar_ros` is an
+  `ament_python` package created from the `ros2 pkg create` template with only the
+  name changed: empty `yolocar_ros/__init__.py`, `TODO` description and licence in
+  `package.xml`, stock `test_{copyright,flake8,pep257}.py`, no node, no launch
+  file. It builds with `--symlink-install` (`ws/install`, `ws/build`, `ws/log` are
+  gitignored), but publishes/subscribes nothing, so the `ros-short` condition in
+  `bench/scenarios.json` is still a disabled placeholder. Next step: implement the
+  node emitting the `records.jsonl` / `summary.json` contract above (carrying
+  `seq` + capture timestamp through the graph so latency is measured across nodes
+  instead of around a callback).
+* **Never name a ROS package `yolocar`.** The scaffold was originally created as
+  `yolocar`, which shares the import name of `monolith/yolocar/src/yolocar`, and
+  because `~/.bashrc` sources `ws/install/setup.bash` the empty scaffold shadowed
+  the real package in every bash session (`import yolocar` resolved to
+  `ws/install/yolocar/lib/python3.12/site-packages/yolocar/__init__.py`). Renaming
+  to `yolocar_ros` fixed it: `import yolocar_ros` works and `import yolocar` now
+  correctly needs `PYTHONPATH=monolith/yolocar/src`, as the `bench` conditions
+  already do. Keep wrapper packages `<name>_ros`.
 * **The clip is stored upside down: use `--rotate 180`.** `CAP_PROP_ORIENTATION_META`
   reports 270 for `assets/video/0000f77c-6257be58.mov`, which is wrong -- do not
   auto-apply the container flag.
