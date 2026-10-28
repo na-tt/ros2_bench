@@ -131,7 +131,8 @@ skips itself when no device, bindings or engine is available. It looks for
    page-locked host buffers; `execute_async_v3`.
 4. **NMS** — `nms()` / `multiclass_nms()`, greedy, per class (or agnostic).
 5. **domain filter** — only `config.target_class_ids`
-   (default `ROAD_CLASS_IDS` = person, bicycle, car, motorcycle, bus, truck).
+   (default `ROAD_CLASS_IDS` = person, bicycle, car, motorcycle, bus, train,
+   truck, traffic light, stop sign, parking meter).
    Applied *before* NMS so non-road candidates never reach the suppression step.
 6. **coordinate adaptation** — `LetterboxInfo.to_source()` undoes scale/pad and
    clips to the original frame.

@@ -6,7 +6,7 @@ Pipeline stages (see ``AGENTS.md``):
 2. preprocessing   -- :func:`letterbox` + :func:`to_tensor` (RGB, 1x3xHxW, fp16/32)
 3. inference       -- TensorRT engine, see :mod:`yolocar.engine`
 4. NMS             -- :func:`nms`, greedy, per class
-5. domain filter   -- only ``config.target_class_ids`` (road objects)
+5. domain filter   -- only ``config.target_class_ids`` (road users + infrastructure)
 6. coordinate adaptation -- letterboxed input space -> original frame pixels
 
 Everything here is front-end agnostic: the standalone benchmark and the ROS 2

@@ -89,9 +89,10 @@ COCO_CLASS_NAMES: tuple[str, ...] = (
     "toothbrush",
 )
 
-#: COCO ids that count as "road objects"/road users for this pipeline.
-#: person, bicycle, car, motorcycle, bus, truck
-ROAD_CLASS_IDS: tuple[int, ...] = (0, 1, 2, 3, 5, 7)
+#: COCO ids kept by the domain filter: road users + road infrastructure.
+#: person, bicycle, car, motorcycle, bus, train, truck, traffic light,
+#: stop sign, parking meter
+ROAD_CLASS_IDS: tuple[int, ...] = (0, 1, 2, 3, 5, 6, 7, 9, 11, 12)
 
 #: Default input name of an Ultralytics exported engine.
 DEFAULT_INPUT_NAME = "images"
@@ -153,7 +154,8 @@ class YoloCarConfig:
     max_detections: int = 300
     #: Cap candidates before NMS (matches the ultralytics default).
     max_candidates: int = 30_000
-    #: COCO ids kept by the domain filter (road objects by default).
+    #: COCO ids kept by the domain filter (road users + road infrastructure
+    #: by default; see ``ROAD_CLASS_IDS``).
     target_class_ids: tuple[int, ...] = ROAD_CLASS_IDS
     #: Letterbox padding value (ultralytics uses 114).
     pad_value: int = 114

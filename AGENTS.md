@@ -131,5 +131,5 @@ Road objects video detection with yolo on dashcam footage.
 - (2) **preprocessing:** image conditioning to expected input characteristics. rgb image, 1×3×640×640, float/uint8 per model
 - (3) **inference:** run yolo and produce candidate detection boxes.
 - (4) **NMS:** perform Non Maximum Supression to reduce detections.
-- (5) **domain filter:** filter to only class ids corresponding to road objects
+- (5) **domain filter:** filter to only class ids corresponding to road objects (default set: `yolocar.config.ROAD_CLASS_IDS`)
 - (6) **coordinate adaptation:** boxes translated to input frame coordinates.
