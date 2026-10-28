@@ -20,7 +20,10 @@ ws/log/
 # Benchmark assets (weights / footage kept out of git)
 assets/models/*
 assets/videos/*
+assets/video/*
 assets/images/*
 !assets/models/.gitkeep
 !assets/videos/.gitkeep
+!assets/video/.gitkeep
 !assets/images/.gitkeep
+
