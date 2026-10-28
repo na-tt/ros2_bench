@@ -3,22 +3,18 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "monolith"
-version = "0.1.0"
-description = "Single-process CV pipelines benchmarked against their ROS 2 counterparts"
+name = "yolocar"
+dynamic = ["version"]
+description = "YOLO road-object detection pipeline (TensorRT), benchmarked against its ROS 2 counterpart"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = []
-
-[project.optional-dependencies]
-# Runtime deps of the yolocar pipeline. TensorRT itself ships with JetPack and
-# is imported lazily (yolocar.engine); the CUDA runtime is reached through
-# ctypes, so neither pycuda nor cuda-python is required.
-yolocar = [
+dependencies = [
     "numpy>=1.26",
     "opencv-python>=4.10",
 ]
+
+[project.optional-dependencies]
 # Only needed to (re)export the ONNX model that the .engine is built from.
 export = [
     "ultralytics>=8.3",
@@ -31,8 +27,11 @@ dev = [
 [project.scripts]
 yolocar = "yolocar.main:main"
 
+[tool.setuptools.dynamic]
+version = { attr = "yolocar.__version__" }
+
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 include = ["yolocar*"]
 
 [tool.setuptools.package-data]

@@ -59,9 +59,21 @@ except ImportError as exc:  # pragma: no cover - depends on the host
 
 pytestmark = pytest.mark.hardware
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]  # monolith/yolocar
+
+
+def _find_assets_dir(start: Path) -> Path:
+    """Nearest ancestor holding the repository-shared ``assets/`` directory."""
+    for candidate in (start, *start.parents):
+        assets = candidate / "assets"
+        if assets.is_dir():
+            return assets
+    return start / "assets"
+
+
+ASSETS_DIR = _find_assets_dir(PROJECT_ROOT)
 ENGINE_PATH = Path(
-    os.environ.get("YOLOCAR_ENGINE", REPO_ROOT / "assets/models/yolov8n_fp16.engine")
+    os.environ.get("YOLOCAR_ENGINE", ASSETS_DIR / "models/yolov8n_fp16.engine")
 ).expanduser()
 IMAGE_SIZE = 640
 TARGET_IDS = frozenset(ROAD_CLASS_IDS)

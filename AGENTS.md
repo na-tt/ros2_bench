@@ -4,32 +4,62 @@
 This repository benchmarks single-process Python computer vision (CV) pipelines against equivalent ROS 2 (`rclpy`) node implementations to evaluate overhead, latency, and throughput.
 
 ## Repository Architecture
-The repository uses a split structure between shared Python logic and the ROS 2 workspace:
+`monolith/` is a **container directory**, not a package. Each pipeline inside it is an
+independent, separately installable Python project (its own `pyproject.toml`, `src/`,
+`tests/`, `README.md`). The ROS 2 workspace wraps those projects without duplicating logic.
 
+```
 ros2_bench/
-├── monolith/                    # Shared CV logic & standalone benchmarks
-│   ├── pyproject.toml           # Setuptools package configuration
-│   ├── pipelineA/               # Pipeline A module (e.g., pipelineA/processor.py, main.py)
-│   ├── pipelineB/               # Pipeline B module
-│   └── pipelineC/               # Pipeline C module
+├── monolith/                    # Container only: no pyproject.toml here
+│   ├── README.md                # Index of pipeline projects
+│   └── yolocar/                 # Independent project ("yolocar")
+│       ├── pyproject.toml       # name = "yolocar", src layout
+│       ├── README.md
+│       ├── src/yolocar/         # importable package (ALL pipeline logic)
+│       │   ├── __init__.py
+│       │   ├── config.py
+│       │   ├── processor.py
+│       │   ├── main.py
+│       │   ├── cuda.py
+│       │   ├── engine.py
+│       │   └── py.typed
+│       └── tests/               # pytest suite of this project
+│
+├── assets/                      # Shared benchmark inputs (models, videos, images)
 │
 └── ws/                          # ROS 2 Colcon Workspace
     └── src/
-        ├── pipeline_a_ros/      # ROS 2 wrapper package for Pipeline A
-        ├── pipeline_b_ros/      # ROS 2 wrapper package for Pipeline B
-        └── pipeline_c_ros/      # ROS 2 wrapper package for Pipeline C
+        └── yolocar_ros/         # ROS 2 wrapper for `yolocar`
+```
+
+New pipelines follow the same shape: `monolith/<name>/` with `pyproject.toml`
+(`name = "<name>"`), `src/<name>/`, `tests/` and a `ws/src/<name>_ros/` wrapper.
 
 ## Key Architectural Rules
 
-1. **Core Logic Single Source of Truth**:
-   * ALL image processing functions, algorithms, models, or data structures must be implemented inside `monolith/pipelineX/`.
-   * ROS 2 nodes inside `ws/src/pipeline_x_ros/` must **never** re-implement CV logic. They should only handle ROS 2 boilerplate (node initialization, sub/pub, `cv_bridge` conversions) and call the corresponding function imported from `pipelineX`.
+1. **One project per pipeline directory**:
+   * `monolith/` itself has **no** `pyproject.toml`, no `__init__.py` and no shared
+     package metadata; it only groups the pipeline projects.
+   * Each `monolith/<name>/` declares its own project name (`name = "<name>"`), its
+     own dependencies/extras, and its own `[tool.pytest.ini_options]`.
+   * Never add cross-project Python imports (e.g. `from monolith...`); importing a
+     pipeline package is always `import <name>`.
 
-2. **Package Linking**:
-   * `monolith` is treated as a local Python package installed in editable mode (`pip install -e ./monolith`).
-   * Python code inside `ws/src/` imports directly from `monolith` modules (e.g., `from pipelineA.processor import process_frame`).
+2. **Core Logic Single Source of Truth**:
+   * ALL image processing functions, algorithms, models, or data structures must be implemented inside `monolith/<name>/src/<name>/`.
+   * ROS 2 nodes inside `ws/src/<name>_ros/` must **never** re-implement CV logic. They should only handle ROS 2 boilerplate (node initialization, sub/pub, `cv_bridge` conversions) and call the corresponding function imported from `<name>` (e.g. `from yolocar.processor import process_frame`).
 
-3. **Workspace Isolation**:
+3. **Package Linking**:
+   * Every pipeline project is installed in editable mode into the active Python environment, individually: `pip install -e ./monolith/<name>`.
+   * Python code inside `ws/src/` imports directly from those installed packages.
+
+4. **Benchmark Assets**:
+   * Weights, footage and frames are shared by all pipelines and live in the
+     repository-root `assets/` (not inside the individual projects).
+   * Default paths in configs are relative (`assets/models/...`), so run commands
+     from the repository root.
+
+5. **Workspace Isolation**:
    * The ROS 2 workspace lives entirely within `ws/`.
    * Never run `colcon build` outside the `ws/` directory.
 
@@ -40,11 +70,11 @@ ros2_bench/
 When working in this workspace, follow this exact setup sequence:
 
 ### 1. Environment Setup & Dependency Installation
-Before building or running nodes, ensure `monolith` is installed in editable mode within the active Python environment:
+Before building or running nodes, install the pipeline project(s) you touch in editable mode within the active Python environment:
 
 ```bash
-cd /path/to/ros2_bench/monolith
-pip install -e .
+pip install -e ./monolith/yolocar          # runtime deps included
+pip install -e "./monolith/yolocar[dev]"   # + pytest
 ```
 
 ### 2. Building the ROS 2 Workspace
@@ -58,16 +88,21 @@ source install/setup.bash
 
 ### 3. Running Benchmarks
 
-* **To run a standalone single-process benchmark**:
+* **To run a standalone single-process benchmark** (from the repository root):
   ```bash
-  python3 monolith/pipelineA/main.py
+  python3 -m yolocar.main --source assets/videos/clip.mp4
+  ```
+
+* **To run the tests of one pipeline project**:
+  ```bash
+  pytest monolith/yolocar          # or: cd monolith/yolocar && pytest
   ```
 
 * **To run a ROS 2 implementation**:
   ```bash
   cd ws
   source install/setup.bash
-  ros2 run pipeline_a_ros pipeline_a_node
+  ros2 run yolocar_ros yolocar_node
   ```
 
 ---
@@ -75,11 +110,16 @@ source install/setup.bash
 ## Instructions for AI Agents
 
 * **Adding a New Pipeline**:
-  1. Create `monolith/pipelineX/` with `__init__.py`, `processor.py`, and `main.py`.
-  2. Ensure `monolith/pyproject.toml` includes `pipelineX*` under setuptools package discovery if explicit pattern matching is used.
-  3. Create `ws/src/pipeline_x_ros/` as an `ament_python` package with a node importing from `pipelineX.processor`.
+  1. Create `monolith/<name>/` as an independent project: `pyproject.toml`
+     (`name = "<name>"`, `[tool.setuptools.packages.find] where = ["src"]`),
+     `src/<name>/` (`__init__.py`, `processor.py`, `main.py`, ...), `tests/` and
+     `README.md`. Copy `monolith/yolocar/` as the reference.
+  2. Do **not** touch a repository-level `pyproject.toml` — there is none; each
+     project discovers its own package under `src/`.
+  3. Create `ws/src/<name>_ros/` as an `ament_python` package with a node
+     importing from `<name>.processor`.
 * **Modifying CV Logic**:
-  * Modify code **only** inside `monolith/pipelineX/`. Because `monolith` is installed with `-e` and `colcon` uses `--symlink-install`, changes take effect immediately across both standalone scripts and ROS 2 nodes without needing reinstallations.
+  * Modify code **only** inside `monolith/<name>/src/<name>/`. Because the project is installed with `-e` and `colcon` uses `--symlink-install`, changes take effect immediately across both standalone scripts and ROS 2 nodes without needing reinstallations.
 
 ## Pipelines
 ### yolocar

@@ -3,7 +3,7 @@
 Design notes
 ------------
 * TensorRT is imported lazily so ``import yolocar`` works on machines without
-  the TensorRT Python bindings (e.g. CI linting the monolith package).
+  the TensorRT Python bindings (e.g. CI linting the yolocar package).
 * Memory is managed through :mod:`yolocar.cuda` (ctypes -> libcudart), so only
   ``tensorrt`` + ``numpy`` are required.
 * Host buffers are page-locked and copies are issued asynchronously on one
