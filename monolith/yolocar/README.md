@@ -15,19 +15,26 @@ monolith/yolocar/
 ├── pyproject.toml       # name = "yolocar", src layout
 ├── README.md
 ├── src/yolocar/
-│   ├── __init__.py      # lazy re-exports
-│   ├── config.py        # tunables + COCO class table (no logic)
-│   ├── cuda.py          # ctypes -> libcudart (buffers, stream, copies)
-│   ├── engine.py        # TensorRT deserialize, buffers, infer
-│   ├── processor.py     # letterbox, NMS, domain filter, coord adaptation, draw
-│   ├── main.py          # standalone CLI / benchmark
+│   ├── __init__.py        # lazy re-exports
+│   ├── config.py          # tunables + COCO class table (no logic)
+│   ├── cuda.py            # ctypes -> libcudart (buffers, stream, copies)
+│   ├── engine.py          # TensorRT deserialize, buffers, infer
+│   ├── acquisition.py     # stage 1: sources + rotation correction
+│   ├── preprocessing.py   # stage 2: letterbox + BGR->RGB NCHW tensor
+│   ├── inference.py       # stage 3: engine call + detect-head decoding
+│   ├── postprocessing.py  # stages 4-6: NMS, domain filter, coord adaptation
+│   ├── render.py          # optional: annotation + frame sinks
+│   ├── processor.py       # facade: owns the engine, wires stages 2-6
+│   ├── main.py            # standalone CLI / benchmark
 │   └── py.typed
 └── tests/
-    ├── test_package.py           # import/wiring smoke tests
-    ├── test_yolocar_pipeline.py  # letterbox / NMS / postprocess unit tests
-    ├── test_yolocar_cuda.py      # CUDA bindings with fakes
-    ├── test_yolocar_engine.py    # TensorRT glue with fakes
-    └── test_yolocar_hardware.py  # real driver/engine, skips when unavailable
+    ├── test_package.py             # import/wiring smoke tests
+    ├── test_yolocar_pipeline.py    # acquisition / preprocessing / inference / facade
+    ├── test_yolocar_postprocessing.py  # stages 4-6 + frozen golden output
+    ├── test_yolocar_cuda.py        # CUDA bindings with fakes
+    ├── test_yolocar_engine.py      # TensorRT glue with fakes
+    ├── test_yolocar_hardware.py    # real driver/engine, skips when unavailable
+    └── golden/postprocess.json     # pre-split detection output (refactor safety net)
 ```
 
 ## Install
@@ -90,7 +97,20 @@ python3 -m yolocar.main --source assets/videos/clip.mp4 --output /tmp/out.mp4
 ```
 
 Useful flags: `--classes 2,3,5,7` (domain filter), `--conf`, `--iou`,
-`--max-frames`, `--warmup`, `--no-pinned`, `--trt-log-level`, `--rotate`.
+`--max-frames`, `--no-pinned`, `--trt-log-level`, `--rotate`.
+
+Run-length flags for long measurements:
+
+* `--loops N` — replay the source N times instead of re-encoding longer video.
+  Each frame carries its replay index, so drift between early and late replays
+  stays visible. Replays seek back to the first keyframe (no decoder re-init);
+  if the backend cannot rewind, the replay stops rather than silently idling.
+* `--duration S` — stop after S seconds of *measurement* time. The clock starts
+  once the engine is loaded, so startup does not eat into the budget.
+* `--records PATH` — write one JSON object per frame (JSONL): `seq`, `loop`,
+  `t_mono`, `acq_ms`, `pre_ms`, `infer_ms`, `post_ms`, `present_ms`,
+  `latency_ms`, `n_det`. Nothing is discarded at runtime; the steady-state
+  window is chosen afterwards, per run.
 
 `--rotate {0,90,180,270}` rotates every frame clockwise at acquisition. It is
 needed for clips whose container rotation flag the decoder ignores: OpenCV
@@ -101,8 +121,44 @@ numbers. Both front-ends share the setting through `YoloCarConfig.rotate`, so
 the ROS 2 node can apply the same correction.
 
 The summary reports throughput plus a per-stage latency breakdown
-(`preprocess / inference / postprocess`) so the ROS 2 overhead can be compared
-against the same pipeline pieces.
+(`acquisition / preprocess / inference / postprocess`) so the ROS 2 overhead can
+be compared against the same pipeline pieces. `latency_ms` covers stages 2-6
+only; `acquisition` is reported separately because it is decoder cost (frame
+grab + rotation), not pipeline cost, and a ROS 2 acquisition node pays it in a
+different place.
+
+Annotation is **debug only**. `--draw` / `--output` cost real wall-clock time
+(drawing plus video encoding), which no node in the measured chain performs, so
+that work is timed into `stage_ms.presentation` and subtracted from the reported
+throughput:
+
+* `fps` — the benchmark figure, presentation excluded; use this one.
+* `fps_wall` — raw wall-clock rate including annotation/encoding.
+* `benchmark_time_s` vs `wall_time_s` — the same split for total time.
+
+To benchmark, either omit `--output`/`--draw` or just read `fps`: both are
+correct, and annotating a run no longer changes the number you compare.
+
+### Measurement policy
+
+There is no warmup stage and no runtime discard. `processor.warmup()` exists for
+interactive use but the benchmark never calls it: startup and settling are
+recorded (`events` in the summary, the first frames in the record stream) and
+the steady-state window is selected during analysis. Engine load time is
+reported as `startup` and excluded from both latency and throughput.
+
+Clocks are not pinned, the garbage collector is not touched and the desktop
+session keeps running, so the machine's natural noise floor is part of the
+measurement. That means **compare conditions with interleaved trials**
+(A/B/A/B), not back-to-back blocks: with unpinned DVFS a thermal or clock drift
+inside the run lands on whichever condition ran second. In a 120 s run of this
+pipeline the per-replay median already moves from 16.7 ms to 18.1 ms (~8%), the
+same order as the run-to-run spread, so a sequential A-then-B comparison would
+be measuring the drift rather than the difference.
+
+The summary also carries `provenance` (python/opencv/numpy versions, git sha,
+board, CPU governor, engine size/mtime) so two runs can be checked for
+comparability before their numbers are compared.
 
 ## Tests
 
@@ -120,23 +176,45 @@ skips itself when no device, bindings or engine is available. It looks for
 
 ## Pipeline
 
-`YoloCarProcessor` implements the stages from `AGENTS.md`:
+Each stage of the `AGENTS.md` spec lives in its own module, and every
+postprocessing stage is a pure function so a ROS 2 chain can either call them
+back to back (short chain) or put a node between them (long chain).
 
-1. **acquisition** — `yolocar.main.open_source` (video, image, image dir, camera),
-   with an optional clockwise `rotate` applied per frame (`--rotate`).
-2. **preprocessing** — `letterbox()` (aspect ratio preserved, pad 114,
-   `INTER_LINEAR`) + `to_tensor()` (BGR→RGB, `1x3xHxW`, dtype/scale taken from
-   the engine input).
-3. **inference** — `TensorRTEngine.infer()` on a non-blocking stream with
-   page-locked host buffers; `execute_async_v3`.
-4. **NMS** — `nms()` / `multiclass_nms()`, greedy, per class (or agnostic).
-5. **domain filter** — only `config.target_class_ids`
-   (default `ROAD_CLASS_IDS` = person, bicycle, car, motorcycle, bus, train,
-   truck, traffic light, stop sign, parking meter).
-   Applied *before* NMS so non-road candidates never reach the suppression step.
-6. **coordinate adaptation** — `LetterboxInfo.to_source()` undoes scale/pad and
-   clips to the original frame.
+1. **acquisition** — `yolocar.acquisition`: `open_source()` (video, image, image
+   dir, camera) yields BGR frames; an optional clockwise `rotate` (`--rotate`)
+   is applied here, because it corrects a decoder defect rather than the
+   model's input contract. `rotate_frame()` is exported for nodes that receive
+   frames from elsewhere. Note that detections are therefore expressed in the
+   *rotated* frame's pixels.
+2. **preprocessing** — `yolocar.preprocessing.preprocess()`: `letterbox()`
+   (aspect ratio preserved, pad 114, `INTER_LINEAR`) + `to_tensor()` (BGR→RGB,
+   `1x3xHxW`, dtype/scale taken from the engine input). Returns
+   `(tensor, LetterboxInfo)` — the two things the downstream stages need.
+3. **inference** — `yolocar.inference`: `infer()` runs
+   `TensorRTEngine.infer()` on a non-blocking stream with page-locked host
+   buffers; `decode_predictions()` splits the raw head into `(4, N)` boxes and
+   `(nc, N)` class scores. Kept separate on purpose: the raw head is ~2.8 MB
+   per frame, the decoded candidates a few kB, so the ROS 2 topic boundary can
+   sit on either side of the decode.
+4. **NMS** — `yolocar.postprocessing.nms()`: greedy, per class (or agnostic),
+   capped by `max_detections`. Runs on *all* classes, before the domain filter.
+5. **domain filter** — `yolocar.postprocessing.domain_filter()`: keeps only
+   `config.target_class_ids` (default `ROAD_CLASS_IDS` = person, bicycle, car,
+   motorcycle, bus, train, truck, traffic light, stop sign, parking meter).
+   Order matters and follows the spec: with `--agnostic-nms` a high-scoring
+   non-road box can suppress an overlapping road box before being dropped.
+6. **coordinate adaptation** —
+   `yolocar.postprocessing.coordinate_adaptation()`: `LetterboxInfo.to_source()`
+   undoes scale/pad and clips to the original frame.
 
-`process_frame(frame, processor)` is the module-level entry point; the four
-stages are also exposed separately (`preprocess`, `infer`, `postprocess`) so
-callers can time them individually.
+Stages 4-6 exchange `yolocar.postprocessing.Candidates` (parallel numpy arrays:
+boxes, scores, class ids) instead of a list of objects, so slicing stays
+vectorised and the batch maps onto `vision_msgs/Detection2DArray` when the long
+chain needs to serialise it. `to_detections()` converts to the presentation
+type as the last step.
+
+`YoloCarProcessor` (`yolocar.processor`) is the single-process facade: it owns
+the engine and calls the stage functions. `postprocess()` in that module is
+nothing but `nms → domain_filter → coordinate_adaptation` in a row;
+`process_frame(frame, processor)` is the module-level entry point. The stage
+functions can be called and timed individually.

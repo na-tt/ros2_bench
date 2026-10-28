@@ -2,14 +2,34 @@
 
 Usage examples::
 
-    python -m yolocar.main --source assets/videos/clip.mp4
+    python -m yolocar.main --source assets/video/0000f77c-6257be58.mov --rotate 180
     python -m yolocar.main --source 0 --draw
-    python -m yolocar.main --source assets/images --json /tmp/yolocar.json
-    yolocar --source assets/videos/clip.mp4 --output /tmp/annotated.mp4
+    python -m yolocar.main --source assets/video --loops 10 --duration 600 \\
+        --records results/monolith.jsonl --json results/monolith.json
 
 This script is the "monolith" baseline: one process, no middleware, no image
-serialisation. The ROS 2 node in ``ws/src/yolocar_ros`` reuses
-:class:`yolocar.processor.YoloCarProcessor` and only adds transport.
+serialisation. It contains no pipeline logic -- sources come from
+:mod:`yolocar.acquisition`, stages from :mod:`yolocar.processor`, annotation
+from :mod:`yolocar.render`. Only the CLI, the timing loop and the summary live
+here.
+
+Measurement policy
+------------------
+Nothing is discarded at runtime. Every frame is written to ``--records`` as one
+JSON object, tagged with its monotonic timestamp, replay index (``loop``) and
+per-stage duration; the steady-state window is chosen afterwards from that
+stream. There is deliberately no warmup gate: startup and settling are visible
+in the records (``events`` in the summary) instead of being assumed away.
+
+Clocks are not pinned, the garbage collector is not touched and the desktop
+session keeps running: the machine's natural noise floor is part of what is
+being measured. Compare conditions with interleaved trials, not back-to-back
+blocks, or DVFS/thermal drift will be attributed to whichever ran second.
+
+Annotation (``--draw``, ``--output``) is **debug only**. Drawing and video
+encoding are wall-clock work that no node in the measured chain performs, so the
+presentation layer is timed into its own bucket and subtracted from the
+reported throughput (``fps``). ``fps_wall`` keeps the raw figure.
 """
 
 from __future__ import annotations
@@ -17,235 +37,102 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import platform
+import subprocess
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Sequence
 
 import cv2
 import numpy as np
 
-from .config import ROAD_CLASS_IDS, YoloCarConfig
-from .processor import Detection, YoloCarProcessor, draw_detections
+from .acquisition import FrameSource, open_source
+from .config import DEFAULT_OUTPUT_FPS, ROAD_CLASS_IDS, YoloCarConfig
+from .postprocessing import Detection
+from .processor import YoloCarProcessor
+from .render import draw_detections, open_sink
 
 LOGGER = logging.getLogger("yolocar")
 
-IMAGE_SUFFIXES = frozenset(
-    {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".ppm"}
-)
-VIDEO_SUFFIXES = frozenset({".mp4", ".avi", ".mov", ".mkv", ".m4v", ".mpg", ".mpeg", ".webm"})
-DEFAULT_OUTPUT_FPS = 30.0
 PROGRESS_EVERY = 50
 
+#: Stages that make up the measured pipeline latency (acquisition excluded).
+PIPELINE_STAGES = ("preprocess", "inference", "postprocess")
 
-# ------------------------------------------------------------------- sources
-@dataclass
-class FrameSource:
-    """Thin iterator wrapper so ``main`` can report fps/size and release."""
-
-    kind: str
-    frames: Iterator[np.ndarray]
-    fps: float
-    size: tuple[int, int] | None  # (width, height)
-    description: str
-    release: Callable[[], None] | None = None
-
-    def __iter__(self) -> Iterator[np.ndarray]:
-        return self.frames
-
-    def close(self) -> None:
-        if self.release is not None:
-            self.release()
-            self.release = None
+_SENTINEL = object()
 
 
-def _iter_video(capture: "cv2.VideoCapture") -> Iterator[np.ndarray]:
-    while True:
-        ok, frame = capture.read()
-        if not ok or frame is None:
-            return
-        yield frame
-
-
-def _iter_images(paths: Sequence[Path]) -> Iterator[np.ndarray]:
-    for path in paths:
-        image = cv2.imread(str(path))
-        if image is None:
-            LOGGER.warning("skipping unreadable image: %s", path)
-            continue
-        yield image
-
-
-def _capture_size(capture: "cv2.VideoCapture") -> tuple[int, int] | None:
-    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    return (width, height) if width and height else None
-
-
-def _capture_fps(capture: "cv2.VideoCapture") -> float:
-    fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
-    return fps if fps and np.isfinite(fps) and fps > 0 else DEFAULT_OUTPUT_FPS
-
-
-#: Rotation code per supported clockwise angle; ``0`` means "leave as is".
-_ROTATE_CODES: dict[int, int | None] = {
-    0: None,
-    90: cv2.ROTATE_90_CLOCKWISE,
-    180: cv2.ROTATE_180,
-    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
-}
-
-
-def _normalize_rotation(rotate: int) -> int:
-    """Validate a clockwise rotation angle and return it in ``[0, 360)``."""
-    angle = int(rotate) % 360
-    if angle not in _ROTATE_CODES:
-        raise ValueError(
-            f"unsupported rotation {rotate!r}; expected one of 0, 90, 180, 270"
-        )
-    return angle
-
-
-def _rotate_frames(
-    frames: Iterator[np.ndarray], rotate: int
-) -> Iterator[np.ndarray]:
-    code = _ROTATE_CODES[rotate]
-    for frame in frames:
-        yield frame if code is None else cv2.rotate(frame, code)
-
-
-def _rotated(source: FrameSource, rotate: int) -> FrameSource:
-    """Wrap ``source`` so that every frame is rotated clockwise by ``rotate``."""
-    if rotate == 0:
-        return source
-    size = source.size
-    if size is not None and rotate in (90, 270):
-        size = (size[1], size[0])
-    return FrameSource(
-        kind=source.kind,
-        frames=_rotate_frames(source.frames, rotate),
-        fps=source.fps,
-        size=size,
-        description=source.description,
-        release=source.release,
-    )
-
-
-def open_source(source: Path | str, rotate: int = 0) -> FrameSource:
-    """Open a video file, an image (directory), or a camera index.
-
-    ``rotate`` (clockwise degrees: 0, 90, 180 or 270) is applied to every frame
-    as it is read, i.e. inside the acquisition stage. Use it for clips whose
-    container rotation flag the decoder ignores -- OpenCV exposes it as
-    ``CAP_PROP_ORIENTATION_META`` but does not apply it for every backend, so
-    frames can arrive upside down (which also degrades detection quality).
-    """
-    angle = _normalize_rotation(rotate)
-    return _rotated(_open_raw_source(source), angle)
-
-
-def _open_raw_source(source: Path | str) -> FrameSource:
-    """Open the source without applying any rotation."""
-    text = str(source)
-    path = Path(text).expanduser()
-
-    if path.is_dir():
-        paths = sorted(
-            p for p in path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
-        )
-        if not paths:
-            raise FileNotFoundError(f"no images found in {path}")
-        return FrameSource(
-            kind="images",
-            frames=_iter_images(paths),
-            fps=DEFAULT_OUTPUT_FPS,
-            size=None,
-            description=f"{path} ({len(paths)} images)",
-        )
-
-    if path.is_file():
-        suffix = path.suffix.lower()
-        if suffix in IMAGE_SUFFIXES:
-            return FrameSource(
-                kind="images",
-                frames=_iter_images([path]),
-                fps=DEFAULT_OUTPUT_FPS,
-                size=None,
-                description=str(path),
-            )
-        capture = cv2.VideoCapture(str(path))
-        if not capture.isOpened():
-            raise RuntimeError(f"could not open video: {path}")
-        return FrameSource(
-            kind="video",
-            frames=_iter_video(capture),
-            fps=_capture_fps(capture),
-            size=_capture_size(capture),
-            description=str(path),
-            release=capture.release,
-        )
-
+# ---------------------------------------------------------------- provenance
+def _read_text(path: str) -> str | None:
     try:
-        index = int(text)
-    except ValueError:
-        raise FileNotFoundError(f"source not found: {source}") from None
-
-    capture = cv2.VideoCapture(index)
-    if not capture.isOpened():
-        raise RuntimeError(f"could not open camera index {index}")
-    return FrameSource(
-        kind="camera",
-        frames=_iter_video(capture),
-        fps=_capture_fps(capture),
-        size=_capture_size(capture),
-        description=f"camera:{index}",
-        release=capture.release,
-    )
+        return Path(path).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
 
 
-# ------------------------------------------------------------------- writers
-class _VideoWriter:
-    def __init__(self, path: Path, fps: float, size: tuple[int, int]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self._writer = cv2.VideoWriter(str(path), fourcc, fps, size)
-        if not self._writer.isOpened():
-            raise RuntimeError(f"could not open video writer for {path}")
+def _git_commit() -> str | None:
+    """Short HEAD sha of the checkout this module was imported from, if any."""
+    for directory in (Path.cwd(), Path(__file__).resolve().parents[4]):
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(directory), "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    return None
+
+
+def _file_identity(path: Path) -> dict[str, object] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {"path": str(path), "bytes": stat.st_size, "mtime": stat.st_mtime}
+
+
+def _provenance(config: YoloCarConfig) -> dict[str, object]:
+    """Enough context to tell whether two runs are comparable at all."""
+    return {
+        "python": platform.python_version(),
+        "opencv": cv2.__version__,
+        "numpy": np.__version__,
+        "git_commit": _git_commit(),
+        "board": _read_text("/proc/device-tree/model"),
+        "cpu_governor": _read_text(
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+        ),
+        "engine": _file_identity(Path(config.model_path)),
+        "source": str(config.source),
+    }
+
+
+# ------------------------------------------------------------------- records
+class _RecordWriter:
+    """One JSON object per frame (JSONL); a no-op when no path was given."""
+
+    def __init__(self, path: Path | None) -> None:
         self.path = path
+        self._file = None
 
-    def write(self, frame: np.ndarray) -> None:
-        self._writer.write(frame)
+    def __enter__(self) -> "_RecordWriter":
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._file = self.path.open("w", encoding="utf-8")
+        return self
 
-    def close(self) -> None:
-        self._writer.release()
+    def write(self, record: dict[str, object]) -> None:
+        if self._file is not None:
+            self._file.write(json.dumps(record) + "\n")
 
-
-class _ImageWriter:
-    def __init__(self, directory: Path) -> None:
-        directory.mkdir(parents=True, exist_ok=True)
-        self.directory = directory
-        self.count = 0
-
-    def write(self, frame: np.ndarray) -> None:
-        target = self.directory / f"frame_{self.count:06d}.jpg"
-        cv2.imwrite(str(target), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-        self.count += 1
-
-    def close(self) -> None:
-        return None
-
-
-def _open_writer(config: YoloCarConfig, source: FrameSource):
-    if config.output_path is None:
-        return None
-    target = Path(config.output_path)
-    if source.kind == "images" and target.suffix.lower() not in VIDEO_SUFFIXES:
-        return _ImageWriter(target)
-    size = source.size
-    if size is None:
-        LOGGER.warning("frame size unknown; pass a video/camera source to write a video")
-        return _ImageWriter(target)
-    return _VideoWriter(target, source.fps or DEFAULT_OUTPUT_FPS, size)
+    def __exit__(self, *exc_info: object) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
 
 # ----------------------------------------------------------------- benchmark
@@ -277,117 +164,207 @@ def _detection_summary(
 
 def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
     """Run the full pipeline over ``config.source`` and return summary stats."""
-    source = open_source(config.source, config.rotate)
+    source: FrameSource = open_source(
+        config.source, config.rotate, loops=config.loops
+    )
     LOGGER.info(
-        "source: %s (kind=%s, fps=%.1f, rotate=%d)",
+        "source: %s (kind=%s, fps=%.1f, rotate=%d, loops=%d)",
         source.description,
         source.kind,
         source.fps,
         config.rotate,
+        config.loops,
     )
 
     processor = YoloCarProcessor(config)
-    writer = _open_writer(config, source)
+    sink = (
+        None
+        if config.output_path is None
+        else open_sink(
+            Path(config.output_path),
+            source.fps or DEFAULT_OUTPUT_FPS,
+            source.size,
+            image_source=source.kind == "images",
+        )
+    )
     show = bool(config.draw)
 
+    acquisition_ms: list[float] = []
     preprocess_ms: list[float] = []
     inference_ms: list[float] = []
     postprocess_ms: list[float] = []
+    presentation_ms: list[float] = []
     frame_ms: list[float] = []
     detections_per_frame: list[int] = []
     detections_by_class: dict[str, int] = {}
     frames = 0
+    replays = 0
     interrupted = False
+    events: dict[str, float] = {}
+    records = _RecordWriter(config.records_path)
 
-    try:
-        processor.load()
-        processor.warmup()
+    t_start = time.monotonic()
+    events["start"] = t_start
 
-        start = time.perf_counter()
-        for frame in source:
-            if config.max_frames is not None and frames >= config.max_frames:
-                break
+    with records:
+        try:
+            processor.load()
+            events["engine_loaded"] = time.monotonic()
+            # The measurement clock starts when the engine is ready: startup is
+            # reported separately and must not shrink a --duration budget.
+            t_measure_start = events["engine_loaded"]
 
-            t0 = time.perf_counter()
-            preprocessed = processor.preprocess(frame)
-            t1 = time.perf_counter()
-            outputs = processor.infer(preprocessed)
-            t2 = time.perf_counter()
-            detections: list[Detection] = processor.postprocess(outputs, preprocessed)
-            t3 = time.perf_counter()
+            iterator = iter(source)
+            while True:
+                if config.max_frames is not None and frames >= config.max_frames:
+                    break
+                if (
+                    config.duration_s is not None
+                    and (time.monotonic() - t_measure_start) >= config.duration_s
+                ):
+                    break
 
-            preprocess_ms.append((t1 - t0) * 1e3)
-            inference_ms.append((t2 - t1) * 1e3)
-            postprocess_ms.append((t3 - t2) * 1e3)
-            frame_ms.append((t3 - t0) * 1e3)
+                # Stage 1 (including the rotation correction) is timed
+                # separately: it is the decoder's cost, not the pipeline's.
+                t_acq = time.monotonic()
+                frame = next(iterator, _SENTINEL)
+                if frame is _SENTINEL:
+                    break
+                t0 = time.monotonic()
+                if frames == 0:
+                    events["first_frame"] = t0
+                replays = frame.loop + 1
 
-            detections_per_frame.append(len(detections))
-            for detection in detections:
-                detections_by_class[detection.class_name] = (
-                    detections_by_class.get(detection.class_name, 0) + 1
+                tensor, letterbox = processor.preprocess(frame.image)
+                t1 = time.monotonic()
+                outputs = processor.infer(tensor)
+                t2 = time.monotonic()
+                detections: list[Detection] = processor.postprocess(outputs, letterbox)
+                t3 = time.monotonic()
+
+                present = 0.0
+                if sink is not None or show:
+                    t_present = time.monotonic()
+                    annotated = (
+                        frame.image if not detections else draw_detections(frame.image, detections)
+                    )
+                    if sink is not None:
+                        sink.write(annotated)
+                    if show:
+                        try:
+                            cv2.imshow("yolocar", annotated)
+                            if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                                LOGGER.info("display: quitting on user request")
+                                break
+                        except cv2.error as exc:  # headless environment
+                            LOGGER.warning(
+                                "cannot show frames (%s); disabling display", exc
+                            )
+                            show = False
+                    present = (time.monotonic() - t_present) * 1e3
+                    presentation_ms.append(present)
+
+                acquired = (t0 - t_acq) * 1e3
+                preprocessed = (t1 - t0) * 1e3
+                inferred = (t2 - t1) * 1e3
+                postprocessed = (t3 - t2) * 1e3
+
+                acquisition_ms.append(acquired)
+                preprocess_ms.append(preprocessed)
+                inference_ms.append(inferred)
+                postprocess_ms.append(postprocessed)
+                frame_ms.append(preprocessed + inferred + postprocessed)
+
+                detections_per_frame.append(len(detections))
+                for detection in detections:
+                    detections_by_class[detection.class_name] = (
+                        detections_by_class.get(detection.class_name, 0) + 1
+                    )
+                frames += 1
+
+                records.write(
+                    {
+                        "seq": frame.seq,
+                        "loop": frame.loop,
+                        "t_mono": round(t_acq, 6),
+                        "acq_ms": round(acquired, 4),
+                        "pre_ms": round(preprocessed, 4),
+                        "infer_ms": round(inferred, 4),
+                        "post_ms": round(postprocessed, 4),
+                        "present_ms": round(present, 4),
+                        "latency_ms": round(preprocessed + inferred + postprocessed, 4),
+                        "n_det": len(detections),
+                    }
                 )
-            frames += 1
 
-            if writer is not None or show:
-                annotated = (
-                    frame
-                    if not detections
-                    else draw_detections(frame, detections)
-                )
-                if writer is not None:
-                    writer.write(annotated)
-                if show:
-                    try:
-                        cv2.imshow("yolocar", annotated)
-                        if cv2.waitKey(1) & 0xFF in (27, ord("q")):
-                            LOGGER.info("display: quitting on user request")
-                            break
-                    except cv2.error as exc:  # headless environment
-                        LOGGER.warning("cannot show frames (%s); disabling display", exc)
-                        show = False
+                if frames % PROGRESS_EVERY == 0:
+                    LOGGER.info(
+                        "frame %d (loop %d): %.1f ms (acq %.1f / pre %.1f / infer %.1f / post %.1f), %d dets",
+                        frames,
+                        frame.loop,
+                        frame_ms[-1],
+                        acquisition_ms[-1],
+                        preprocess_ms[-1],
+                        inference_ms[-1],
+                        postprocess_ms[-1],
+                        len(detections),
+                    )
+            wall_time = time.monotonic() - t_measure_start
+        except KeyboardInterrupt:
+            LOGGER.warning("interrupted by user; reporting partial results")
+            interrupted = True
+            wall_time = float("nan")
+        finally:
+            events["end"] = time.monotonic()
+            source.close()
+            if sink is not None:
+                sink.close()
+            processor.close()
+            if show:
+                try:
+                    cv2.destroyAllWindows()
+                except cv2.error:
+                    pass
 
-            if frames % PROGRESS_EVERY == 0:
-                LOGGER.info(
-                    "frame %d: %.1f ms (pre %.1f / infer %.1f / post %.1f), %d dets",
-                    frames,
-                    frame_ms[-1],
-                    preprocess_ms[-1],
-                    inference_ms[-1],
-                    postprocess_ms[-1],
-                    len(detections),
-                )
-        wall_time = time.perf_counter() - start
-    except KeyboardInterrupt:
-        LOGGER.warning("interrupted by user; reporting partial results")
-        interrupted = True
-        wall_time = float("nan")
-    finally:
-        source.close()
-        if writer is not None:
-            writer.close()
-        processor.close()
-        if show:
-            try:
-                cv2.destroyAllWindows()
-            except cv2.error:
-                pass
+    presentation_time_s = sum(presentation_ms) / 1e3
+    benchmark_time_s = (
+        max(wall_time - presentation_time_s, 0.0)
+        if np.isfinite(wall_time)
+        else float("nan")
+    )
 
     summary: dict[str, object] = {
         "pipeline": "yolocar",
         "model": str(config.model_path),
         "source": source.description,
         "frames": frames,
-        "warmup_iterations": config.warmup_iterations,
+        #: Replay cap from the config, and how many replays actually completed.
+        "loops": config.loops,
+        "replays": replays,
+        "duration_s": config.duration_s,
         "interrupted": interrupted,
         "wall_time_s": wall_time,
-        "fps": (frames / wall_time) if frames and wall_time > 0 else 0.0,
+        #: Wall time with the debug-only presentation layer removed: the figure
+        #: to compare across front-ends.
+        "benchmark_time_s": benchmark_time_s,
+        "fps": (frames / benchmark_time_s) if frames and benchmark_time_s > 0 else 0.0,
+        #: Raw wall-clock rate, i.e. including annotation/encoding.
+        "fps_wall": (frames / wall_time) if frames and wall_time > 0 else 0.0,
         "latency_ms": _latency_stats(frame_ms),
         "stage_ms": {
+            "acquisition": _latency_stats(acquisition_ms),
             "preprocess": _latency_stats(preprocess_ms),
             "inference": _latency_stats(inference_ms),
             "postprocess": _latency_stats(postprocess_ms),
+            #: Debug only: annotation + encoding, excluded from ``fps``.
+            "presentation": _latency_stats(presentation_ms),
         },
+        #: Monotonic timestamps (seconds, same clock as the records): startup and
+        #: settling are observed afterwards, never declared up front.
+        "events": {name: round(value, 6) for name, value in events.items()},
         "detections": _detection_summary(frames, detections_per_frame, detections_by_class),
+        "provenance": _provenance(config),
+        "records": None if config.records_path is None else str(config.records_path),
         "config": {
             "conf_threshold": config.conf_threshold,
             "iou_threshold": config.iou_threshold,
@@ -396,6 +373,7 @@ def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
             "agnostic_nms": config.agnostic_nms,
             "device": config.device,
             "rotate": config.rotate,
+            "max_frames": config.max_frames,
         },
     }
     LOGGER.info("\n%s", format_summary(summary))
@@ -412,24 +390,41 @@ def format_summary(summary: dict[str, object]) -> str:
     latency = summary.get("latency_ms") or {}
     stages = summary.get("stage_ms") or {}
     detections = summary.get("detections") or {}
+    events = summary.get("events") or {}
+    replays = int(summary.get("replays") or 1)
+    frames_line = f"frames   {summary.get('frames')}"
+    if replays > 1:
+        frames_line += f" ({replays} replays)"
     lines = [
         "=" * 62,
         f"yolocar  model={summary.get('model')}",
         f"source   {summary.get('source')}",
-        f"frames   {summary.get('frames')} (warmup {summary.get('warmup_iterations')})",
-        f"throughput {float(summary.get('fps') or 0.0):.2f} fps",
+        frames_line,
+        f"throughput {float(summary.get('fps') or 0.0):.2f} fps"
+        f" (benchmark window {float(summary.get('benchmark_time_s') or 0.0):.1f} s)",
     ]
     if latency:
         lines.append(
             "latency  mean {mean:.2f} ms | median {median:.2f} | p95 {p95:.2f} "
             "| min {min:.2f} | max {max:.2f}".format(**latency)  # type: ignore[arg-type]
         )
-    for stage in ("preprocess", "inference", "postprocess"):
+    acquisition = stages.get("acquisition") or {}
+    if acquisition:
+        lines.append(
+            f"  {'acquisition':<11} mean {acquisition['mean']:.2f} ms "
+            "(decoder cost, excluded from latency)"
+        )
+    for stage in PIPELINE_STAGES:
         stats = stages.get(stage) or {}
         if stats:
-            lines.append(
-                f"  {stage:<11} mean {stats['mean']:.2f} ms ({stats['mean'] / max(latency.get('mean', 1.0), 1e-9) * 100:.1f}%)"
-            )
+            share = stats["mean"] / max(latency.get("mean", 1.0), 1e-9) * 100
+            lines.append(f"  {stage:<11} mean {stats['mean']:.2f} ms ({share:.1f}%)")
+    presentation = stages.get("presentation") or {}
+    if presentation:
+        lines.append(
+            f"  {'presentation':<11} mean {presentation['mean']:.2f} ms "
+            f"(debug only, excluded from throughput; wall-clock {float(summary.get('fps_wall') or 0.0):.2f} fps)"
+        )
     if detections:
         lines.append(
             f"detections  {detections.get('total')} total, "
@@ -441,6 +436,11 @@ def format_summary(summary: dict[str, object]) -> str:
                 "  by class  "
                 + ", ".join(f"{name}={count}" for name, count in by_class.items())
             )
+    if events.get("engine_loaded"):
+        startup = events["engine_loaded"] - events["start"]
+        lines.append(f"startup  engine loaded after {startup:.2f} s")
+    if summary.get("records"):
+        lines.append(f"records  {summary['records']}")
     lines.append("=" * 62)
     return "\n".join(lines)
 
@@ -476,10 +476,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-det", type=int, default=YoloCarConfig.max_detections)
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument(
-        "--warmup",
+        "--loops",
         type=int,
-        default=YoloCarConfig.warmup_iterations,
-        help="dummy inferences before measuring",
+        default=YoloCarConfig.loops,
+        help="replay the source this many times (long runs from a short clip)",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="stop after this many seconds of wall time",
+    )
+    parser.add_argument(
+        "--records",
+        type=Path,
+        default=None,
+        help="write one JSON object per frame here (JSONL)",
     )
     parser.add_argument("--draw", action="store_true", help="annotate and show frames")
     parser.add_argument(
@@ -511,11 +523,13 @@ def config_from_args(args: argparse.Namespace) -> YoloCarConfig:
         model_path=Path(args.model),
         device=int(args.device),
         image_size=int(args.imgsz),
-        warmup_iterations=int(args.warmup),
         pinned_host_memory=not args.no_pinned,
         trt_log_level=args.trt_log_level,
         source=args.source,
         max_frames=args.max_frames,
+        loops=int(args.loops),
+        duration_s=args.duration,
+        records_path=Path(args.records) if args.records else None,
         draw=bool(args.draw),
         output_path=Path(args.output) if args.output else None,
         json_path=Path(args.json) if args.json else None,
@@ -530,12 +544,16 @@ def config_from_args(args: argparse.Namespace) -> YoloCarConfig:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     logging.basicConfig(
         level=str(args.log_level).upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    config = config_from_args(args)
+    try:
+        config = config_from_args(args)
+    except ValueError as exc:  # e.g. a class id outside the COCO range
+        parser.error(str(exc))
     LOGGER.debug("config: %s", config)
     run_benchmark(config)
     return 0

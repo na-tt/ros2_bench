@@ -370,15 +370,15 @@ def test_full_pipeline_invariants_on_synthetic_frames(
 
 def test_preprocess_matches_the_engine_contract(processor: YoloCarProcessor) -> None:
     info = processor.engine.single_input
-    preprocessed = processor.preprocess(_frames()[0])
+    tensor, letterbox = processor.preprocess(_frames()[0])
 
-    assert preprocessed.tensor.shape == info.shape
-    assert preprocessed.tensor.dtype == info.dtype
-    assert preprocessed.tensor.flags["C_CONTIGUOUS"]
-    if preprocessed.tensor.dtype != np.dtype(np.uint8):
-        assert 0.0 <= float(preprocessed.tensor.min())
-        assert float(preprocessed.tensor.max()) <= 1.0
-    assert preprocessed.letterbox.input_shape == (info.shape[2], info.shape[3])
+    assert tensor.shape == info.shape
+    assert tensor.dtype == info.dtype
+    assert tensor.flags["C_CONTIGUOUS"]
+    if tensor.dtype != np.dtype(np.uint8):
+        assert 0.0 <= float(tensor.min())
+        assert float(tensor.max()) <= 1.0
+    assert letterbox.input_shape == (info.shape[2], info.shape[3])
 
 
 def test_pipeline_accepts_grayscale_strided_and_fortran_frames(
@@ -403,6 +403,7 @@ def test_cli_benchmark_end_to_end(tmp_path: Path) -> None:
 
     json_path = tmp_path / "summary.json"
     annotated = tmp_path / "annotated"
+    records = tmp_path / "records.jsonl"
 
     code = yolocar_main(
         [
@@ -416,8 +417,8 @@ def test_cli_benchmark_end_to_end(tmp_path: Path) -> None:
             str(annotated),
             "--max-frames",
             "2",
-            "--warmup",
-            "1",
+            "--records",
+            str(records),
             "--max-det",
             "50",
             "--log-level",
@@ -429,17 +430,111 @@ def test_cli_benchmark_end_to_end(tmp_path: Path) -> None:
     summary = json.loads(json_path.read_text(encoding="utf-8"))
     assert summary["pipeline"] == "yolocar"
     assert summary["frames"] == 2
-    assert summary["warmup_iterations"] == 1
+    assert summary["records"] == str(records)
     assert summary["config"]["target_class_ids"] == list(ROAD_CLASS_IDS)
     assert summary["config"]["image_size"] == IMAGE_SIZE
     assert summary["config"]["device"] == 0
     assert set(summary["latency_ms"]) == {"mean", "std", "median", "p95", "min", "max"}
-    assert set(summary["stage_ms"]) == {"preprocess", "inference", "postprocess"}
+    assert set(summary["stage_ms"]) == {
+        "acquisition",
+        "preprocess",
+        "inference",
+        "postprocess",
+        "presentation",
+    }
     for stage in ("preprocess", "inference", "postprocess"):
         assert summary["stage_ms"][stage]["mean"] > 0.0
+    # acquisition is a decoder cost and may legitimately round to ~0 for images
+    assert summary["stage_ms"]["acquisition"]["mean"] >= 0.0
+    # --output was passed, so the debug-only presentation bucket is populated
+    # and must be excluded from the reported throughput.
+    assert summary["stage_ms"]["presentation"]["mean"] > 0.0
+    assert summary["benchmark_time_s"] <= summary["wall_time_s"]
+    assert summary["fps"] >= summary["fps_wall"]
     assert summary["detections"]["total"] >= 0
     assert summary["detections"]["per_frame_max"] >= 0
     assert summary["fps"] >= 0.0
 
     written = sorted(annotated.glob("*.jpg"))
     assert len(written) == 2, f"expected 2 annotated frames, got {written}"
+
+    # Every frame is recorded, nothing is discarded at runtime.
+    lines = [
+        json.loads(line)
+        for line in records.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [record["seq"] for record in lines] == [0, 1]
+    assert [record["loop"] for record in lines] == [0, 0]
+    for record in lines:
+        assert set(record) == {
+            "seq",
+            "loop",
+            "t_mono",
+            "acq_ms",
+            "pre_ms",
+            "infer_ms",
+            "post_ms",
+            "present_ms",
+            "latency_ms",
+            "n_det",
+        }
+        assert record["latency_ms"] > 0.0
+        assert record["present_ms"] > 0.0  # --output was passed
+    # Monotonic timestamps let an external sampler align with the frames.
+    assert lines[0]["t_mono"] < lines[1]["t_mono"]
+    assert summary["events"]["start"] < summary["events"]["engine_loaded"]
+    assert summary["events"]["engine_loaded"] <= summary["events"]["first_frame"]
+    assert summary["events"]["first_frame"] < summary["events"]["end"]
+    assert summary["provenance"]["python"]
+    assert summary["provenance"]["engine"]["bytes"] > 0
+
+
+def test_cli_replays_the_source_and_keeps_loop_indices(tmp_path: Path) -> None:
+    source = tmp_path / "frames"
+    source.mkdir()
+    for index, frame in enumerate(_frames()):
+        assert cv2.imwrite(str(source / f"frame_{index:03d}.jpg"), frame)
+
+    json_path = tmp_path / "summary.json"
+    records = tmp_path / "records.jsonl"
+
+    code = yolocar_main(
+        [
+            "--model",
+            str(ENGINE_PATH),
+            "--source",
+            str(source),
+            "--json",
+            str(json_path),
+            "--records",
+            str(records),
+            "--loops",
+            "3",
+            "--max-det",
+            "20",
+            "--log-level",
+            "WARNING",
+        ]
+    )
+    assert code == 0
+
+    summary = json.loads(json_path.read_text(encoding="utf-8"))
+    per_loop = len(_frames())
+    assert summary["frames"] == per_loop * 3
+    assert summary["loops"] == 3
+
+    lines = [
+        json.loads(line)
+        for line in records.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(lines) == per_loop * 3
+    assert [record["loop"] for record in lines] == [
+        loop for loop in range(3) for _ in range(per_loop)
+    ]
+    assert [record["seq"] for record in lines] == list(range(per_loop * 3))
+    # the replay must reproduce the same work, not drift into a different clip
+    assert [record["n_det"] for record in lines[:per_loop]] == [
+        record["n_det"] for record in lines[per_loop : 2 * per_loop]
+    ]

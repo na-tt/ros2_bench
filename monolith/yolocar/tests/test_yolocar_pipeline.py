@@ -1,4 +1,5 @@
-"""Unit tests for the yolocar pipeline that do not need a GPU or an engine."""
+"""Tests for stages 1-3 (acquisition helpers, preprocessing, inference decode)
+plus the single-process facade, none needing a GPU or an engine."""
 
 from __future__ import annotations
 
@@ -8,30 +9,24 @@ import pytest
 pytest.importorskip("cv2")
 
 from yolocar.config import COCO_CLASS_NAMES, YoloCarConfig  # noqa: E402
-from yolocar.processor import (  # noqa: E402
+from yolocar.inference import InputSpec, decode_predictions, first_output  # noqa: E402
+from yolocar.preprocessing import (  # noqa: E402
     LetterboxInfo,
-    PreprocessedFrame,
-    YoloCarProcessor,
-    decode_predictions,
+    as_bgr_frame,
     letterbox,
-    multiclass_nms,
-    nms,
+    preprocess,
     to_tensor,
-    xywh_to_xyxy,
 )
+from yolocar.processor import YoloCarProcessor  # noqa: E402
 
 NUM_CLASSES = len(COCO_CLASS_NAMES)
 CAR = 2
 AIRPLANE = 4
-TRUCK = 7
 
 
-def _letterboxed(height: int = 720, width: int = 1280) -> LetterboxInfo:
-    _, info = letterbox(np.zeros((height, width, 3), dtype=np.uint8), (640, 640))
-    return info
-
-
-def _raw_output(anchors: list[tuple[float, float, float, float, int, float]], total: int = 16) -> np.ndarray:
+def _raw_output(
+    anchors: list[tuple[float, float, float, float, int, float]], total: int = 16
+) -> np.ndarray:
     """Build a (1, 4+nc, N) detect-head tensor from (cx, cy, w, h, cls, score)."""
     head = np.zeros((1, 4 + NUM_CLASSES, total), dtype=np.float32)
     for index, (cx, cy, width, height, class_id, score) in enumerate(anchors):
@@ -43,6 +38,7 @@ def _raw_output(anchors: list[tuple[float, float, float, float, int, float]], to
     return head
 
 
+# ------------------------------------------------------------------ preprocessing
 def test_letterbox_preserves_aspect_ratio() -> None:
     padded, info = letterbox(np.zeros((720, 1280, 3), dtype=np.uint8), (640, 640))
     assert padded.shape == (640, 640, 3)
@@ -54,17 +50,10 @@ def test_letterbox_preserves_aspect_ratio() -> None:
 
 
 def test_letterbox_inverse_maps_boxes_back() -> None:
-    info = _letterboxed()
+    _, info = letterbox(np.zeros((720, 1280, 3), dtype=np.uint8), (640, 640))
     boxes = np.array([[288.0, 304.0, 352.0, 336.0]], dtype=np.float32)
     mapped = info.to_source(boxes)
     np.testing.assert_allclose(mapped, [[576.0, 328.0, 704.0, 392.0]], rtol=0, atol=1e-4)
-
-
-def test_letterbox_clips_to_frame_bounds() -> None:
-    info = _letterboxed()
-    boxes = np.array([[-100.0, -100.0, 5000.0, 5000.0]], dtype=np.float32)
-    mapped = info.to_source(boxes)
-    np.testing.assert_allclose(mapped, [[0.0, 0.0, 1280.0, 720.0]])
 
 
 def test_to_tensor_layout_and_scale() -> None:
@@ -75,58 +64,82 @@ def test_to_tensor_layout_and_scale() -> None:
     assert float(tensor.max()) == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize(
+    ("frame", "shape"),
+    [
+        (np.zeros((64, 64), dtype=np.uint8), (64, 64, 3)),  # grayscale promoted
+        (np.zeros((32, 32, 3), dtype=np.float32), (32, 32, 3)),  # cast to uint8
+        (np.zeros((8, 12, 3), dtype=np.uint8)[::2, ::2], (4, 6, 3)),  # strided
+    ],
+)
+def test_as_bgr_frame_normalises_inputs(frame: np.ndarray, shape: tuple[int, ...]) -> None:
+    converted = as_bgr_frame(frame)
+    assert converted.shape == shape
+    assert converted.dtype == np.uint8
+
+
+def test_as_bgr_frame_rejects_wrong_channel_count() -> None:
+    with pytest.raises(ValueError, match="HxWx3"):
+        as_bgr_frame(np.zeros((10, 10, 4), dtype=np.uint8))
+
+
+def test_preprocess_returns_tensor_and_geometry() -> None:
+    tensor, info = preprocess(
+        np.zeros((720, 1280, 3), dtype=np.uint8), (640, 640), np.dtype(np.float16)
+    )
+    assert tensor.shape == (1, 3, 640, 640)
+    assert tensor.dtype == np.float16
+    assert tensor.flags["C_CONTIGUOUS"]
+    assert isinstance(info, LetterboxInfo)
+    assert info.original_shape == (720, 1280)
+
+
+# -------------------------------------------------------------------- inference
 @pytest.mark.parametrize("transposed", [False, True])
 def test_decode_predictions_accepts_both_layouts(transposed: bool) -> None:
     raw = _raw_output([(320.0, 320.0, 64.0, 32.0, CAR, 0.9)])
-    if transposed:
-        raw = np.ascontiguousarray(raw.transpose(0, 2, 1))
-    boxes, scores = decode_predictions(raw, NUM_CLASSES)
-    assert boxes.shape == (4, raw.shape[-1] if not transposed else raw.shape[1])
+    payload = np.ascontiguousarray(raw.transpose(0, 2, 1)) if transposed else raw
+    boxes, scores = decode_predictions(payload, NUM_CLASSES)
+    assert boxes.shape[0] == 4
     assert scores.shape[1] == boxes.shape[1]
     assert scores[CAR, 0] == pytest.approx(0.9)
 
 
-def test_nms_suppresses_overlapping_boxes() -> None:
-    boxes = np.array(
-        [
-            [0.0, 0.0, 10.0, 10.0],
-            [1.0, 1.0, 11.0, 11.0],  # heavy overlap with box 0
-            [100.0, 100.0, 110.0, 110.0],
-        ],
-        dtype=np.float32,
-    )
-    scores = np.array([0.9, 0.8, 0.7], dtype=np.float32)
-    keep = nms(boxes, scores, 0.45)
-    assert keep.tolist() == [0, 2]
+def test_decode_predictions_rejects_wrong_channel_count() -> None:
+    with pytest.raises(ValueError, match="does not match"):
+        decode_predictions(np.zeros((1, 4 + NUM_CLASSES + 1, 8), dtype=np.float32), NUM_CLASSES)
 
 
-def test_multiclass_nms_keeps_boxes_of_different_classes() -> None:
-    boxes = np.array(
-        [
-            [0.0, 0.0, 10.0, 10.0],
-            [0.0, 0.0, 10.0, 10.0],  # identical, other class -> kept
-            [1.0, 1.0, 11.0, 11.0],  # overlaps box 0 -> dropped
-        ],
-        dtype=np.float32,
-    )
-    scores = np.array([0.9, 0.85, 0.8], dtype=np.float32)
-    classes = np.array([CAR, TRUCK, CAR], dtype=np.int64)
-    keep = multiclass_nms(boxes, scores, classes, 0.45, agnostic=False, max_detections=300)
-    assert sorted(keep.tolist()) == [0, 1]
+def test_first_output_accepts_sequences_and_mappings() -> None:
+    raw = _raw_output([(320.0, 320.0, 64.0, 32.0, CAR, 0.9)])
+    assert first_output([raw]) is raw
+    assert first_output({"output0": raw}) is raw
+    with pytest.raises(ValueError, match="no outputs"):
+        first_output([])
 
 
-def test_xywh_to_xyxy() -> None:
-    converted = xywh_to_xyxy(np.array([[50.0, 60.0, 20.0, 10.0]], dtype=np.float32))
-    np.testing.assert_allclose(converted, [[40.0, 55.0, 60.0, 65.0]])
+# -------------------------------------------------------------------- facade
+def test_processor_constructs_with_default_config() -> None:
+    processor = YoloCarProcessor()
+    assert isinstance(processor.config, YoloCarConfig)
+    assert not processor.is_loaded
 
 
-def test_postprocess_maps_to_source_pixels() -> None:
+def test_processor_requires_load_before_inference() -> None:
     processor = YoloCarProcessor(YoloCarConfig())
-    info = _letterboxed()
-    prepped = PreprocessedFrame(tensor=np.zeros((1, 3, 640, 640), np.float16), letterbox=info)
+    with pytest.raises(RuntimeError):
+        processor.process_frame(np.zeros((64, 64, 3), dtype=np.uint8))
+    with pytest.raises(RuntimeError):
+        processor.input_spec
+
+
+def test_processor_postprocess_only_needs_the_letterbox_geometry() -> None:
+    """Stage 6 does not need the tensor, so the facade accepts the geometry alone."""
+    processor = YoloCarProcessor(YoloCarConfig())
+    _, info = letterbox(np.zeros((720, 1280, 3), dtype=np.uint8), (640, 640))
     raw = _raw_output([(320.0, 320.0, 64.0, 32.0, CAR, 0.9)])
 
-    detections = processor.postprocess([raw], prepped)
+    detections = processor.postprocess([raw], info)
 
     assert len(detections) == 1
     detection = detections[0]
@@ -137,31 +150,54 @@ def test_postprocess_maps_to_source_pixels() -> None:
     assert (detection.x_max, detection.y_max) == pytest.approx((704.0, 392.0), abs=1e-3)
 
 
-def test_postprocess_domain_filter_drops_other_classes() -> None:
+def test_processor_domain_filter_drops_other_classes() -> None:
     processor = YoloCarProcessor(YoloCarConfig(target_class_ids=(CAR,)))
-    prepped = PreprocessedFrame(tensor=None, letterbox=_letterboxed())
+    _, info = letterbox(np.zeros((720, 1280, 3), dtype=np.uint8), (640, 640))
     raw = _raw_output([(320.0, 320.0, 64.0, 32.0, AIRPLANE, 0.95)])
 
-    assert processor.postprocess([raw], prepped) == []
+    assert processor.postprocess([raw], info) == []
 
 
-def test_postprocess_respects_confidence_threshold() -> None:
-    processor = YoloCarProcessor(YoloCarConfig(conf_threshold=0.5))
-    prepped = PreprocessedFrame(tensor=None, letterbox=_letterboxed())
-    raw = _raw_output([(320.0, 320.0, 64.0, 32.0, CAR, 0.4)])
+def test_config_rejects_unusable_run_lengths() -> None:
+    with pytest.raises(ValueError, match="loops"):
+        YoloCarConfig(loops=0)
+    with pytest.raises(ValueError, match="duration_s"):
+        YoloCarConfig(duration_s=0.0)
 
-    assert processor.postprocess([raw], prepped) == []
+
+def test_config_rejects_unusable_class_ids() -> None:
+    with pytest.raises(ValueError, match="at least one"):
+        YoloCarConfig(target_class_ids=())
+    with pytest.raises(ValueError, match=r"must be in \[0, 79\]"):
+        YoloCarConfig(target_class_ids=(0, NUM_CLASSES))
 
 
-def test_postprocess_accepts_named_outputs() -> None:
+class _FakeEngine:
+    """Stands in for TensorRTEngine: returns the synthetic head unchanged."""
+
+    def __init__(self, raw: np.ndarray) -> None:
+        self.raw = raw
+        self.seen: list[np.ndarray] = []
+
+    def infer(self, tensor: np.ndarray) -> list[np.ndarray]:
+        self.seen.append(tensor)
+        return [self.raw]
+
+    def close(self) -> None:
+        return None
+
+
+def test_processor_wires_the_stages_without_a_real_engine() -> None:
+    """The facade must hand the letterbox geometry from stage 2 to stage 6."""
     processor = YoloCarProcessor(YoloCarConfig())
-    prepped = PreprocessedFrame(tensor=None, letterbox=_letterboxed())
     raw = _raw_output([(320.0, 320.0, 64.0, 32.0, CAR, 0.9)])
+    processor._engine = _FakeEngine(raw)
+    processor._input_spec = InputSpec(640, 640, np.dtype(np.float16))
 
-    assert len(processor.postprocess({"output0": raw}, prepped)) == 1
+    detections = processor.process_frame(np.zeros((720, 1280, 3), dtype=np.uint8))
 
-
-def test_processor_requires_load_before_inference() -> None:
-    processor = YoloCarProcessor(YoloCarConfig())
-    with pytest.raises(RuntimeError):
-        processor.process_frame(np.zeros((64, 64, 3), dtype=np.uint8))
+    assert processor._engine.seen[0].shape == (1, 3, 640, 640)
+    assert processor._engine.seen[0].dtype == np.float16
+    assert len(detections) == 1
+    # 640-space box (288..352, 304..336) un-letterboxed into 1280x720 pixels
+    assert detections[0].xyxy == pytest.approx((576.0, 328.0, 704.0, 392.0), abs=1e-3)

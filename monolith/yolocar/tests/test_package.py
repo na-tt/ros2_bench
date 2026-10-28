@@ -9,7 +9,8 @@ import pytest
 
 import yolocar
 from yolocar.config import YoloCarConfig
-from yolocar.main import build_parser, open_source
+from yolocar.acquisition import open_source, rotate_frame
+from yolocar.main import build_parser
 from yolocar.processor import YoloCarProcessor
 
 cv2 = pytest.importorskip("cv2")
@@ -50,6 +51,29 @@ def test_processor_constructs_with_default_config() -> None:
     assert isinstance(processor.config, YoloCarConfig)
 
 
+def test_every_exported_name_resolves_through_the_lazy_map() -> None:
+    """Catches typos in ``_LAZY_ATTRIBUTES`` without importing Triton-heavy deps."""
+    for name in yolocar.__all__:
+        assert getattr(yolocar, name) is not None, name
+
+
+def test_stage_modules_expose_their_stage() -> None:
+    """The module boundaries are the ROS 2 node boundaries; keep them named."""
+    from yolocar import acquisition, inference, postprocessing, preprocessing, render
+
+    assert callable(acquisition.open_source)
+    assert callable(acquisition.rotate_frame)
+    assert callable(preprocessing.preprocess)
+    assert callable(preprocessing.letterbox)
+    assert callable(inference.infer)
+    assert callable(inference.decode_predictions)
+    for stage in ("nms", "domain_filter", "coordinate_adaptation"):
+        assert callable(getattr(postprocessing, stage)), stage
+    assert callable(postprocessing.postprocess)
+    assert callable(render.draw_detections)
+    assert callable(render.open_sink)
+
+
 def test_cli_parser_accepts_source() -> None:
     args = build_parser().parse_args(["--source", "assets/videos"])
     assert str(args.source) == "assets/videos"
@@ -77,8 +101,8 @@ def test_open_source_rotates_frames(
     source = open_source(path, rotate=rotate)
     frame = next(iter(source))
     source.close()
-    assert frame.shape[:2] == shape
-    assert _brightness(frame, *corner) > 200.0
+    assert frame.image.shape[:2] == shape
+    assert _brightness(frame.image, *corner) > 200.0
 
 
 def test_open_source_swaps_size_for_quarter_turns(tmp_path: Path) -> None:
@@ -87,6 +111,44 @@ def test_open_source_swaps_size_for_quarter_turns(tmp_path: Path) -> None:
     assert open_source(path).size == (160, 120)
     assert open_source(path, rotate=90).size == (120, 160)
     assert open_source(path, rotate=180).size == (160, 120)
+
+
+def test_rotate_frame_is_a_pure_single_frame_helper() -> None:
+    frame = _marker_frame()
+    rotated = rotate_frame(frame, 90)
+    assert rotated.shape == (160, 120, 3)
+    assert frame.shape == (120, 160, 3)  # source frame untouched
+    assert rotate_frame(frame, 0) is frame
+
+
+def test_open_source_loops_and_tags_replays(tmp_path: Path) -> None:
+    path = tmp_path / "clip.avi"
+    _write_clip(path, [_marker_frame(), _marker_frame()])
+
+    frames = list(open_source(path, loops=3))
+
+    assert [frame.seq for frame in frames] == list(range(6))
+    assert [frame.loop for frame in frames] == [0, 0, 1, 1, 2, 2]
+    assert all(frame.image.shape == (120, 160, 3) for frame in frames)
+
+
+def test_open_source_loop_rewinds_instead_of_reopening(tmp_path: Path) -> None:
+    """A replay must be a seek: the same frames come back in the same order."""
+    path = tmp_path / "clip.avi"
+    _write_clip(path, [_marker_frame(), np.full((120, 160, 3), 40, dtype=np.uint8)])
+
+    frames = list(open_source(path, loops=2))
+
+    assert [float(frame.image.mean()) for frame in frames] == pytest.approx(
+        [float(frame.image.mean()) for frame in frames[:2]] * 2, abs=1e-6
+    )
+
+
+def test_open_source_rejects_invalid_loops(tmp_path: Path) -> None:
+    path = tmp_path / "clip.avi"
+    _write_clip(path, [_marker_frame()])
+    with pytest.raises(ValueError, match="loops"):
+        open_source(path, loops=0)
 
 
 def test_open_source_rejects_unsupported_rotation() -> None:
