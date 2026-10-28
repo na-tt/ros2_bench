@@ -90,11 +90,57 @@ New pipelines follow the same shape: `monolith/<name>/` with `pyproject.toml`
    * The ROS 2 workspace lives entirely within `ws/`.
    * Never run `colcon build` outside the `ws/` directory.
 
+7. **Canonical shell is bash, never fish**:
+   * **Every** command that touches this project -- build, test, benchmark, ROS 2,
+     pip, git, file inspection -- must run through `bash`. Fish is only the
+     operator's interactive shell (and the shell the coding agent happens to run
+     in); it is *not* part of the project and must not leak into it.
+   * Reason: this is a custom machine. Fish's environment puts Homebrew in front
+     of `/usr/bin` (`python3` resolves to `/home/linuxbrew/.linuxbrew/bin/python3`,
+     not the Jetson's `/usr/bin/python3` with numpy/opencv/tensorrt), and it does
+     **no** ROS 2 setup at all. Commands run under fish therefore fail or, worse,
+     silently use the wrong interpreter.
+   * `~/.bashrc` is the single source of truth for this project's environment: it
+     sources `/opt/ros/jazzy/setup.bash` and
+     `~/Memoria/ros2_bench/ws/install/setup.bash`.
+   * Never `brew install` a project dependency and never `pip install` into the
+     Homebrew interpreter. The project's Python is `/usr/bin/python3`.
+
 ---
 
 ## Developer & Agent Workflow Setup
 
 When working in this workspace, follow this exact setup sequence:
+
+### 0. Get a bash environment (always first)
+Do this before any other step, from any tool or terminal:
+
+```bash
+env -i HOME="$HOME" TERM=dumb \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  bash -ic 'cd ~/Memoria/ros2_bench && <your command>'
+```
+
+* `bash -c` alone is **not** enough: `.bashrc` starts with
+  `case $- in *i*) ;; *) return ;; esac`, so a non-interactive bash skips the ROS
+  `source` lines and inherits whatever `PATH` its parent had (under fish: Homebrew
+  first, no `ROS_DISTRO`). `-i` is what loads `.bashrc`.
+* The explicit clean `PATH` is required because an interactive bash still inherits
+  the parent's `PATH`; `~/.bashrc` only *prepends* `~/.local/bin`, it does not
+  remove Homebrew. Drop the `PATH=` assignment and `python3` silently becomes the
+  Homebrew one.
+* `env -i` keeps the agent's own pollution (`PYTHONPATH`, `VIRTUAL_ENV`,
+  `LD_LIBRARY_PATH`, brew vars) out of the measurement. Re-add only what a step
+  genuinely needs, in front of the command, e.g.
+  `env -i ... bash -ic 'cd ... && PYTHONPATH=monolith/yolocar/src python3 -m yolocar.main --help'`.
+* Verify once per session, expecting `ROS_DISTRO=jazzy` and `/usr/bin/python3`:
+  ```bash
+  env -i HOME="$HOME" TERM=dumb \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    bash -ic 'echo $ROS_DISTRO; command -v python3'
+  ```
+* "It worked in fish" is not evidence. If a command has not been run this way,
+  it has not been run.
 
 ### 1. Environment Setup & Dependency Installation
 Before building or running nodes, install the pipeline project(s) you touch in editable mode within the active Python environment:
@@ -139,11 +185,12 @@ source install/setup.bash
   bench/analyze.py --from 30 --to 270 --md results/report.md --json results/report.json
   ```
 
-* **To run a ROS 2 implementation** (not written yet, see *Current State*):
+* **To run a ROS 2 implementation** (no node yet, only the empty scaffold -- see
+  *Current State*):
   ```bash
   cd ws
   source install/setup.bash
-  ros2 run yolocar_ros yolocar_node
+  ros2 run yolocar yolocar_node
   ```
 
 ---
@@ -159,6 +206,9 @@ source install/setup.bash
      project discovers its own package under `src/`.
   3. Create `ws/src/<name>_ros/` as an `ament_python` package with a node
      importing from `<name>.processor` (facade) or from the per-stage modules.
+* **Running anything**: route every command through the bash wrapper in
+  *Step 0* above (clean `PATH` + `bash -ic`), never through fish and never through
+  a plain inherited-environment `bash -c`.
 * **Modifying CV Logic**:
   * Modify code **only** inside `monolith/<name>/src/<name>/`. Because the project is installed with `-e` and `colcon` uses `--symlink-install`, changes take effect immediately across both standalone scripts and ROS 2 nodes without needing reinstallations.
 
@@ -257,11 +307,26 @@ type only at the very end.
 
 ## Current State & Known Issues
 
-* **`ws/` does not exist yet.** No ROS 2 package has been written, so the
-  `ros-short` condition in `bench/scenarios.json` is a disabled placeholder.
-  Next step: `ws/src/yolocar_ros` emitting the `records.jsonl` / `summary.json`
-  contract above (and carrying `seq` + capture timestamp through the graph so
-  latency is measured across nodes instead of around a callback).
+* **`ws/` is a bare scaffold, no node yet.** `ws/src/yolocar` is an untouched
+  `ament_python` package (`ros2 pkg create --build-type ament_python yolocar`):
+  empty `yolocar/__init__.py`, template `package.xml` with `TODO` description and
+  licence, only the stock `test_{copyright,flake8,pep257}.py`. It has been built
+  with `--symlink-install` (`ws/install`, `ws/build`, `ws/log` are gitignored), but
+  it publishes/subscribes nothing, so the `ros-short` condition in
+  `bench/scenarios.json` is still a disabled placeholder. Next step:
+  `ws/src/yolocar_ros` emitting the `records.jsonl` / `summary.json` contract
+  above (and carrying `seq` + capture timestamp through the graph so latency is
+  measured across nodes instead of around a callback).
+* **The scaffold shadows the monolith package.** Both the ROS package and the
+  pipeline project import as `yolocar`, and `~/.bashrc` sources
+  `ws/install/setup.bash`, so in any bash session
+  `import yolocar` resolves to
+  `ws/install/yolocar/lib/python3.12/site-packages/yolocar/__init__.py` -- the
+  empty scaffold, not `monolith/yolocar/src/yolocar/` (verified). Only commands
+  that set `PYTHONPATH=monolith/yolocar/src` explicitly (as both `bench`
+  conditions do) reach the real code. Rename the ROS package to `yolocar_ros`
+  (import name `yolocar_ros`) before writing the node, per *Repository
+  Architecture*, rather than papering over it with `PYTHONPATH` ordering.
 * **The clip is stored upside down: use `--rotate 180`.** `CAP_PROP_ORIENTATION_META`
   reports 270 for `assets/video/0000f77c-6257be58.mov`, which is wrong -- do not
   auto-apply the container flag.
