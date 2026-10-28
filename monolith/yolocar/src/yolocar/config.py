@@ -140,6 +140,9 @@ class YoloCarConfig:
     output_path: Path | None = None
     #: Dump the benchmark summary as JSON here.
     json_path: Path | None = None
+    #: Clockwise rotation (0/90/180/270) applied to every frame at acquisition.
+    #: Needed for clips whose container rotation flag the decoder ignores.
+    rotate: int = 0
 
     # --- post-processing ------------------------------------------------
     conf_threshold: float = 0.25

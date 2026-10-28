@@ -90,7 +90,15 @@ python3 -m yolocar.main --source assets/videos/clip.mp4 --output /tmp/out.mp4
 ```
 
 Useful flags: `--classes 2,3,5,7` (domain filter), `--conf`, `--iou`,
-`--max-frames`, `--warmup`, `--no-pinned`, `--trt-log-level`.
+`--max-frames`, `--warmup`, `--no-pinned`, `--trt-log-level`, `--rotate`.
+
+`--rotate {0,90,180,270}` rotates every frame clockwise at acquisition. It is
+needed for clips whose container rotation flag the decoder ignores: OpenCV
+exposes it as `CAP_PROP_ORIENTATION_META` but does not apply it for every
+backend, so frames can arrive upside down. Feeding the detector upside-down
+frames measurably hurts recall, so rotate them upright before comparing
+numbers. Both front-ends share the setting through `YoloCarConfig.rotate`, so
+the ROS 2 node can apply the same correction.
 
 The summary reports throughput plus a per-stage latency breakdown
 (`preprocess / inference / postprocess`) so the ROS 2 overhead can be compared
@@ -114,7 +122,8 @@ skips itself when no device, bindings or engine is available. It looks for
 
 `YoloCarProcessor` implements the stages from `AGENTS.md`:
 
-1. **acquisition** — `yolocar.main.open_source` (video, image, image dir, camera).
+1. **acquisition** — `yolocar.main.open_source` (video, image, image dir, camera),
+   with an optional clockwise `rotate` applied per frame (`--rotate`).
 2. **preprocessing** — `letterbox()` (aspect ratio preserved, pad 114,
    `INTER_LINEAR`) + `to_tensor()` (BGR→RGB, `1x3xHxW`, dtype/scale taken from
    the engine input).

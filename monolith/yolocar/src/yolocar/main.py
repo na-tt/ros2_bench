@@ -87,8 +87,65 @@ def _capture_fps(capture: "cv2.VideoCapture") -> float:
     return fps if fps and np.isfinite(fps) and fps > 0 else DEFAULT_OUTPUT_FPS
 
 
-def open_source(source: Path | str) -> FrameSource:
-    """Open a video file, an image (directory), or a camera index."""
+#: Rotation code per supported clockwise angle; ``0`` means "leave as is".
+_ROTATE_CODES: dict[int, int | None] = {
+    0: None,
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
+def _normalize_rotation(rotate: int) -> int:
+    """Validate a clockwise rotation angle and return it in ``[0, 360)``."""
+    angle = int(rotate) % 360
+    if angle not in _ROTATE_CODES:
+        raise ValueError(
+            f"unsupported rotation {rotate!r}; expected one of 0, 90, 180, 270"
+        )
+    return angle
+
+
+def _rotate_frames(
+    frames: Iterator[np.ndarray], rotate: int
+) -> Iterator[np.ndarray]:
+    code = _ROTATE_CODES[rotate]
+    for frame in frames:
+        yield frame if code is None else cv2.rotate(frame, code)
+
+
+def _rotated(source: FrameSource, rotate: int) -> FrameSource:
+    """Wrap ``source`` so that every frame is rotated clockwise by ``rotate``."""
+    if rotate == 0:
+        return source
+    size = source.size
+    if size is not None and rotate in (90, 270):
+        size = (size[1], size[0])
+    return FrameSource(
+        kind=source.kind,
+        frames=_rotate_frames(source.frames, rotate),
+        fps=source.fps,
+        size=size,
+        description=source.description,
+        release=source.release,
+    )
+
+
+def open_source(source: Path | str, rotate: int = 0) -> FrameSource:
+    """Open a video file, an image (directory), or a camera index.
+
+    ``rotate`` (clockwise degrees: 0, 90, 180 or 270) is applied to every frame
+    as it is read, i.e. inside the acquisition stage. Use it for clips whose
+    container rotation flag the decoder ignores -- OpenCV exposes it as
+    ``CAP_PROP_ORIENTATION_META`` but does not apply it for every backend, so
+    frames can arrive upside down (which also degrades detection quality).
+    """
+    angle = _normalize_rotation(rotate)
+    return _rotated(_open_raw_source(source), angle)
+
+
+def _open_raw_source(source: Path | str) -> FrameSource:
+    """Open the source without applying any rotation."""
     text = str(source)
     path = Path(text).expanduser()
 
@@ -220,8 +277,14 @@ def _detection_summary(
 
 def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
     """Run the full pipeline over ``config.source`` and return summary stats."""
-    source = open_source(config.source)
-    LOGGER.info("source: %s (kind=%s, fps=%.1f)", source.description, source.kind, source.fps)
+    source = open_source(config.source, config.rotate)
+    LOGGER.info(
+        "source: %s (kind=%s, fps=%.1f, rotate=%d)",
+        source.description,
+        source.kind,
+        source.fps,
+        config.rotate,
+    )
 
     processor = YoloCarProcessor(config)
     writer = _open_writer(config, source)
@@ -332,6 +395,7 @@ def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
             "target_class_ids": list(config.target_class_ids),
             "agnostic_nms": config.agnostic_nms,
             "device": config.device,
+            "rotate": config.rotate,
         },
     }
     LOGGER.info("\n%s", format_summary(summary))
@@ -422,6 +486,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", type=Path, default=None, help="write annotated frames here"
     )
     parser.add_argument("--json", type=Path, default=None, help="write summary JSON here")
+    parser.add_argument(
+        "--rotate",
+        type=int,
+        default=YoloCarConfig.rotate,
+        choices=(0, 90, 180, 270),
+        help="clockwise rotation (degrees) applied to every frame at acquisition",
+    )
     parser.add_argument("--no-pinned", action="store_true", help="disable page-locked host memory")
     parser.add_argument(
         "--trt-log-level",
@@ -448,6 +519,7 @@ def config_from_args(args: argparse.Namespace) -> YoloCarConfig:
         draw=bool(args.draw),
         output_path=Path(args.output) if args.output else None,
         json_path=Path(args.json) if args.json else None,
+        rotate=int(args.rotate),
         conf_threshold=float(args.conf),
         iou_threshold=float(args.iou),
         agnostic_nms=bool(args.agnostic_nms),
