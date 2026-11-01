@@ -81,8 +81,8 @@ def letterbox(
     scale = min(new_h / height, new_w / width)
     if not scaleup:
         scale = min(scale, 1.0)
-    resized_w = max(1, int(round(width * scale)))
-    resized_h = max(1, int(round(height * scale)))
+    resized_w = max(1, round(width * scale))
+    resized_h = max(1, round(height * scale))
     # Recompute from the rounded size so to_source() is exact.
     scale = min(resized_w / width, resized_h / height)
 

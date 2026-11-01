@@ -30,7 +30,7 @@ import ctypes
 import ctypes.util
 import logging
 import threading
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 
@@ -83,7 +83,7 @@ def _load_library() -> ctypes.CDLL:
 class CudaRuntime:
     """Thin wrapper over the handful of libcudart entry points we need."""
 
-    def __init__(self, library: Optional[ctypes.CDLL] = None) -> None:
+    def __init__(self, library: ctypes.CDLL | None = None) -> None:
         self._lib = library if library is not None else _load_library()
         self._bind()
 
@@ -269,7 +269,7 @@ class CudaRuntime:
         self.check_last_error("asynchronous kernel execution")
 
 
-_RUNTIME: Optional[CudaRuntime] = None
+_RUNTIME: CudaRuntime | None = None
 _RUNTIME_LOCK = threading.Lock()
 
 
@@ -322,7 +322,7 @@ def _flat_view(pointer: int, nbytes: int, owner: Any = None) -> np.ndarray:
 class DeviceBuffer:
     """Owned device allocation."""
 
-    __slots__ = ("ptr", "nbytes", "_runtime", "_freed")
+    __slots__ = ("_freed", "_runtime", "nbytes", "ptr")
 
     def __init__(self, runtime: CudaRuntime, nbytes: int) -> None:
         self._runtime = runtime
@@ -365,7 +365,7 @@ class HostBuffer:
       pointers into freed memory: do not keep them across ``close()``.
     """
 
-    __slots__ = ("ptr", "nbytes", "pinned", "_runtime", "_owner", "_flat", "_closed")
+    __slots__ = ("_closed", "_flat", "_owner", "_runtime", "nbytes", "pinned", "ptr")
 
     def __init__(
         self, runtime: CudaRuntime, nbytes: int, pinned: bool = True
@@ -374,7 +374,7 @@ class HostBuffer:
         self.nbytes = int(nbytes)
         self.pinned = bool(pinned)
         self._closed = False
-        self._owner: Optional[np.ndarray] = None
+        self._owner: np.ndarray | None = None
         self.ptr = 0
         if self.pinned:
             try:

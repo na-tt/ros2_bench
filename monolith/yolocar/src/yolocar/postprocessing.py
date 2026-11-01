@@ -22,8 +22,9 @@ This module needs numpy only: no OpenCV, no TensorRT.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -47,7 +48,7 @@ class Candidates:
     class_ids: np.ndarray  # (N,) int32
 
     @classmethod
-    def empty(cls) -> "Candidates":
+    def empty(cls) -> Candidates:
         return cls(
             boxes=np.empty((0, 4), dtype=np.float32),
             scores=np.empty(0, dtype=np.float32),
@@ -57,7 +58,7 @@ class Candidates:
     def __len__(self) -> int:
         return int(self.boxes.shape[0])
 
-    def take(self, indices: np.ndarray) -> "Candidates":
+    def take(self, indices: np.ndarray) -> Candidates:
         """Subset in the given order (used by every filtering stage)."""
         if len(self) == 0 or np.asarray(indices).size == 0:
             return Candidates.empty()

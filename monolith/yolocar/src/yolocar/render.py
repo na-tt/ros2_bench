@@ -9,8 +9,9 @@ no CV logic lives here.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Protocol
 
 import cv2
 import numpy as np
@@ -56,11 +57,11 @@ def draw_detections(
     if not detections:
         return canvas
     if thickness is None:
-        thickness = max(1, int(round(min(canvas.shape[:2]) / 480)))
+        thickness = max(1, round(min(canvas.shape[:2]) / 480))
 
     for detection in detections:
         color = CLASS_COLORS[detection.class_id % len(CLASS_COLORS)]
-        x1, y1, x2, y2 = (int(round(v)) for v in detection.xyxy)
+        x1, y1, x2, y2 = (round(v) for v in detection.xyxy)
         cv2.rectangle(canvas, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
 
         label = f"{detection.class_name} {detection.confidence:.2f}"

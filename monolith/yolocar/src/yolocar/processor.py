@@ -22,9 +22,10 @@ front-end agnostic -- no transport, no file formats.
 from __future__ import annotations
 
 import logging
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
+from typing_extensions import Self
 
 from . import inference, postprocessing, preprocessing
 from .config import YoloCarConfig
@@ -123,7 +124,7 @@ class YoloCarProcessor:
             self.process_frame(dummy)
         LOGGER.debug("warmup finished (%d iterations)", count)
 
-    def __enter__(self) -> "YoloCarProcessor":
+    def __enter__(self) -> Self:
         self.load()
         return self
 

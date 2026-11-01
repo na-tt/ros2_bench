@@ -21,9 +21,10 @@ Design notes
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence, Optional
+from typing import Any
 
 import numpy as np
 
@@ -35,6 +36,7 @@ from .cuda import (
     HostBuffer,
     get_runtime,
 )
+from typing_extensions import Self
 
 LOGGER = logging.getLogger(__name__)
 
@@ -77,7 +79,7 @@ class TensorRTEngine:
         input_shapes: Mapping[str, Sequence[int]] | None = None,
         pinned_host_memory: bool = True,
         log_level: str = "warning",
-        cuda: Optional[CudaRuntime] = None,
+        cuda: CudaRuntime | None = None,
     ) -> None:
         self.engine_path = Path(engine_path)
         self.device_index = int(device_index)
@@ -408,7 +410,7 @@ class TensorRTEngine:
                 LOGGER.warning("destroying the CUDA stream failed: %s", exc)
             self._stream = 0
 
-    def __enter__(self) -> "TensorRTEngine":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc_info: object) -> None:

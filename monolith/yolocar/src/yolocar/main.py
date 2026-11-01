@@ -44,6 +44,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from typing_extensions import Self
 
 from .acquisition import FrameSource, open_source
 from .config import DEFAULT_OUTPUT_FPS, ROAD_CLASS_IDS, YoloCarConfig
@@ -119,7 +120,7 @@ class _RecordWriter:
         self.path = path
         self._file = None
 
-    def __enter__(self) -> "_RecordWriter":
+    def __enter__(self) -> Self:
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._file = self.path.open("w", encoding="utf-8")

@@ -27,9 +27,9 @@ the same correction without going through a :class:`FrameSource`.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Sequence
 
 import cv2
 import numpy as np
@@ -77,7 +77,7 @@ def _validate_loops(loops: int) -> int:
     return count
 
 
-def iter_video(capture: "cv2.VideoCapture", loops: int = 1) -> Iterator[Frame]:
+def iter_video(capture: cv2.VideoCapture, loops: int = 1) -> Iterator[Frame]:
     """Yield decoded frames, rewinding the file ``loops`` times.
 
     Rewinding seeks back to the first keyframe instead of reopening the
@@ -118,13 +118,13 @@ def iter_images(paths: Sequence[Path], loops: int = 1) -> Iterator[Frame]:
             seq += 1
 
 
-def capture_size(capture: "cv2.VideoCapture") -> tuple[int, int] | None:
+def capture_size(capture: cv2.VideoCapture) -> tuple[int, int] | None:
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     return (width, height) if width and height else None
 
 
-def capture_fps(capture: "cv2.VideoCapture") -> float:
+def capture_fps(capture: cv2.VideoCapture) -> float:
     fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
     return fps if fps and np.isfinite(fps) and fps > 0 else DEFAULT_OUTPUT_FPS
 
