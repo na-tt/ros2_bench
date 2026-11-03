@@ -307,10 +307,11 @@ def _fps_hint(condition: dict[str, object], scenario: dict[str, object]) -> floa
     """Best available guess of this cell's frame rate, only ever used to size a box.
 
     Order: an explicit per-cell override, the scenario's chain/model table scaled
-    by the resolution, then a flat default. Under-estimating is harmless (the
-    trial runs a little longer than needed); over-estimating truncates the
-    analysis window, so the table is deliberately pessimistic and the report
-    says so when a window came up short.
+    by the resolution, then a flat default. The table should be a *measured* rate
+    with a little taken off: over-estimating shortens the time ceiling until the
+    window comes up short (``analyze.py`` warns), while under-estimating only
+    costs a few seconds of extra run. See ``trial_budget`` for why a wrong hint
+    also puts the frame cap in the wrong place.
     """
     if condition.get("fps_hint"):
         return float(condition["fps_hint"])  # type: ignore[arg-type]
