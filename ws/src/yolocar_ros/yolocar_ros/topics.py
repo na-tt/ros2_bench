@@ -17,6 +17,9 @@ INPUT_TOPIC = 'yolocar/input'            # preprocessing -> inference
 #: The first node still reads FRAME_TOPIC and the last still writes INPUT_TOPIC,
 #: so the rest of the graph cannot tell how deep the stage was split.
 FILTER_TOPIC_PREFIX = 'yolocar/filter'
+#: Stage 4-6 hops when the stage is split: ``yolocar/post_0``, ... Same naming
+#: rule as the stage-2 hops (an ``_`` suffix may follow a digit, a ``/`` may not).
+POST_TOPIC_PREFIX = 'yolocar/post'
 CANDIDATES_TOPIC = 'yolocar/candidates'  # inference -> postprocessing
 ACK_TOPIC = 'yolocar/ack'                # postprocessing -> acquisition
 STOP_TOPIC = 'yolocar/stop'              # acquisition -> postprocessing
