@@ -182,8 +182,8 @@ source install/setup.bash
 
 * **To run a full measurement** (interleaved passes + telemetry, see
   *Measurement Protocol* below). Cells are `<chain>-<resolution>-<model>`, so a
-  run selects them explicitly; `--settle`/`--analysis-frames` override the
-  trial budget only for smoke runs:
+  run selects them explicitly; `--settle`/`--analysis-frames` override the trial
+  budget only for smoke runs:
   ```bash
   bench/run.py --repeats 3 --conditions monolith-720p-n,ros-4node-720p-n
   bench/analyze.py --md results/report.md --json results/report.json
@@ -355,7 +355,8 @@ type only at the very end.
   corresponding `yolocar` function and adds only ROS 2 boilerplate. The
   acquisition node publishes one frame and waits for the terminal node's ack, so
   the graph is demand-driven like the monolith (one frame in flight, no silent
-  drops). `bench/scenarios.json` (`ros-4node`) drives it through
+  drops). `bench/scenarios.json` (the `ros-4node` chain, i.e. every
+  `ros-4node-*` cell) drives it through
   `launch/bench.launch.py`; any node exiting shuts the launch down.
 * **Compare `infer + post` as one block in the ROS chain.** The inference node
   publishes decoded/thresholded `Candidates` instead of the raw
@@ -387,7 +388,7 @@ type only at the very end.
   paths are relative, and `yolocar` must be on `PYTHONPATH`
   (`PYTHONPATH=monolith/yolocar/src:$PYTHONPATH`) because there is no `pip` on
   the Jetson's `/usr/bin/python3` and the pipeline project is not installed
-  into the ROS workspace. The bench `ros-4node` condition does both.
+  into the ROS workspace. The bench `ros-4node-*` cells do both.
 * **Never name a ROS package `yolocar`.** The scaffold was originally created as
   `yolocar`, which shares the import name of `monolith/yolocar/src/yolocar`, and
   because `~/.bashrc` sources `ws/install/setup.bash` the empty scaffold shadowed

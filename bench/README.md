@@ -99,7 +99,8 @@ Cheap and it catches a moved engine, a stale workspace or a broken topic before
 you spend half an hour:
 
 ```bash
-bench/run.py --repeats 1 --duration 8 --gap 2 --out results/smoke \
+bench/run.py --repeats 1 --gap 2 --out results/smoke \
+  --settle 3 --analysis-frames 200 \
   --conditions monolith-720p-n,ros-4node-720p-n
 bench/analyze.py --dir results/smoke
 rm -rf results/smoke          # gitignored, but do not let it be read as data
@@ -116,9 +117,9 @@ bench/run.py --repeats 3 --gap 5 --out results/bench \
 ```
 
 A matrix run is `--conditions` on a subset, not always the whole product; see
-*The matrix* for the axes and pruning recipes. Wall clock per trial is
-`--duration` plus engine load (~1.5 s for `yolov8n`, tens of seconds for
-`yolov8x`) plus `--gap` between trials; 9 trials at 180 s ran 1690 s here.
+*The matrix* for the axes and pruning recipes. Wall clock per trial is the cell's
+computed time ceiling (*Trial budget*) plus engine load (~1.5 s for `yolov8n`,
+tens of seconds for `yolov8x`) plus `--gap`.
 Re-running into the same `--out` **overwrites** `<out>/<condition>/r<N>/`, so
 give each session its own directory if you want to keep the old numbers
 (`--out results/bench-$(date +%m%d-%H%M)`).
@@ -128,8 +129,9 @@ Long runs: detach it and poll, so a dropped terminal does not kill the trial:
 ```bash
 nohup env -i HOME="$HOME" TERM=dumb \
   PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-  bash -ic 'cd ~/Memoria/ros2_bench && python3 bench/run.py --repeats 3 --duration 180 \
-    --gap 5 --out results/bench' > results/full-run.log 2>&1 &
+  bash -ic 'cd ~/Memoria/ros2_bench && python3 bench/run.py --repeats 3 --gap 5 \
+    --out results/bench \
+    --conditions monolith-720p-n,ros-4node-720p-n' > results/full-run.log 2>&1 &
 tail -f results/full-run.log
 ```
 
@@ -221,7 +223,7 @@ Common variants:
 ```bash
 bench/run.py --dry-run                                  # what would be launched
 bench/run.py --conditions monolith-720p-n,ros-4node-720p-n --repeats 4  # headline pair
-bench/run.py --repeats 1 --duration 60                   # quick look
+bench/run.py --repeats 1 --settle 5 --analysis-frames 500  # quick look
 ```
 
 ### 5. Running one front-end by hand (no harness, no sampler)
