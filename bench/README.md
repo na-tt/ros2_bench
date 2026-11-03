@@ -11,7 +11,7 @@ bench/
 ├── run.py          # orchestrator: interleaved trials + sampler + artefacts (+ --demo)
 ├── sampler.py      # board (tegrastats) + workload (/proc) telemetry -> CSV
 ├── analyze.py      # trials -> markdown/JSON report, window chosen here
-└── scenarios.json  # conditions: command templates (+ an `artifacts` block)
+└── scenarios.json  # factors x design -> cells, + an `artifacts` (demo) block
 ```
 
 ## Policy (deliberate, not accidental)
@@ -25,13 +25,12 @@ bench/
 * **Interleaved trials.** Clocks are unpinned, so a run drifts by several
   percent as the machine warms (measured: ~8 % between the first and third
   replay of a 120 s run, in *either* direction). Running all of A and then all
-  of B would attribute that drift to B. `run.py` rotates the condition order
-  every repeat.
-* **A control condition.** `monolith-ctrl` is a byte-identical clone of
-  `monolith` under a different label. The difference between the two is the
-  noise floor; a ROS-vs-monolith delta is only meaningful if it clears it. It is
-  an A/A test (it measures the measurement), not a third treatment — see
-  *Conditions* below.
+  of B would attribute that drift to B. `run.py` orders trials so no cell is
+  systematically first (see *Trial order*).
+* **An anchor cell.** One cell is repeated in every pass, so a comparison is a
+  per-pass delta rather than two means measured hours apart. The duplicate
+  control cell that used to serve this purpose is now only a demo artifact — see
+  *Calibration*.
 
 ## Running a measurement
 
@@ -76,25 +75,28 @@ Cheap and it catches a moved engine, a stale workspace or a broken topic before
 you spend half an hour:
 
 ```bash
-bench/run.py --repeats 1 --duration 8 --gap 2 --out results/smoke
+bench/run.py --repeats 1 --duration 8 --gap 2 --out results/smoke \
+  --conditions monolith-720p-n,ros-4node-720p-n
 bench/analyze.py --dir results/smoke
 rm -rf results/smoke          # gitignored, but do not let it be read as data
 ```
 
-Expect `3/3 trials ok`; if a trial exits non-zero, read
+Expect `2/2 trials ok`; if a trial exits non-zero, read
 `results/smoke/<condition>/r1/workload.log`.
 
-### 3. The full run (3 conditions x 3 x 180 s ≈ 28 min)
+### 3. The full run (3 cells x 3 passes x 180 s ≈ 28 min)
 
 ```bash
 bench/run.py --repeats 3 --duration 180 --gap 5 --out results/bench
 ```
 
-Wall clock per trial is `--duration` plus ~1.5 s for the monolith and ~4.5 s for
-the ROS chain (TensorRT engine load), plus `--gap` between trials; 9 trials at
-180 s ran 1690 s here. Re-running into the same `--out` **overwrites**
-`<out>/<condition>/r<N>/`, so give each session its own directory if you want to
-keep the old numbers (`--out results/bench-$(date +%m%d-%H%M)`).
+A matrix run is `--conditions` on a subset, not always the whole product; see
+*The matrix* for the axes and pruning recipes. Wall clock per trial is
+`--duration` plus engine load (~1.5 s for `yolov8n`, tens of seconds for
+`yolov8x`) plus `--gap` between trials; 9 trials at 180 s ran 1690 s here.
+Re-running into the same `--out` **overwrites** `<out>/<condition>/r<N>/`, so
+give each session its own directory if you want to keep the old numbers
+(`--out results/bench-$(date +%m%d-%H%M)`).
 
 Long runs: detach it and poll, so a dropped terminal does not kill the trial:
 
@@ -129,8 +131,8 @@ rendered demo videos to the report when any exist.
 
 | flag | applies to | effect |
 |---|---|---|
-| `--conditions a,b` | `run.py` | subset by name from `scenarios.json` |
-| `--repeats N` | `run.py` | trials per condition (rotation needs ≥ `len(conditions)` for a balanced design) |
+| `--conditions a,b` | `run.py` | subset by cell name (`monolith-720p-n`, ...) |
+| `--repeats N` | `run.py` | passes over the selected cells (see *Trial order*) |
 | `--duration S` | `run.py` | measurement seconds; the clock starts once the engine is loaded |
 | `--gap S` | `run.py` | idle seconds between trials (default 5) |
 | `--out DIR` | `run.py` | artefact root (default `results/bench`) |
@@ -183,7 +185,7 @@ Common variants:
 
 ```bash
 bench/run.py --dry-run                                  # what would be launched
-bench/run.py --conditions monolith,ros-4node --repeats 5 # drop the control, add repeats
+bench/run.py --conditions monolith-720p-n,ros-4node-720p-n --repeats 4  # headline pair
 bench/run.py --repeats 1 --duration 60                   # quick look
 ```
 
@@ -259,22 +261,76 @@ end-to-end — never per pipeline stage. `tegrastats` lines carry a 1-second
 wall-clock prefix, so the sampler timestamps the line when it reads it; a board
 column can be up to one interval (default 100 ms) older than its `t_mono`.
 
-## Conditions
+## The matrix (factors + design)
 
-* `monolith` — the single-process baseline.
-* `monolith-ctrl` — a byte-identical clone of it with a different label and
-  output directory (an A/A test). It is not a third condition: it measures the
-  *measurement*, so the ROS-vs-monolith delta can be compared against a real
-  number instead of a guess. It also catches harness bugs that key off the
-  condition (output paths, env merge, process-group discovery) and a broken
-  rotation, neither of which shows up as within-condition spread. With
-  `--conditions monolith,ros-4node` you can trade it for extra repeats.
-* `ros-4node` — the four-node chain (acquisition → preprocessing → inference →
-  postprocessing), one process per node, paced by an ack from the terminal
-  node. It needs the ROS 2 workspace to be built
-  (`cd ws && colcon build --symlink-install`) and `yolocar` importable via
-  `PYTHONPATH`; the shell condition in `scenarios.json` sources the workspace
-  and sets `PYTHONPATH`. See `ws/src/yolocar_ros/README.md`.
+The experiment is written once as **factors** and a **design** list, not as N
+hand-copied command templates:
+
+```
+factors.resolution  720p | 360p | 180p   -> source file, rotate, clip_frames
+factors.model       n    | m    | x      -> TensorRT engine path
+factors.chain       monolith | ros-4node -> cmd / shell template
+```
+
+A cell is `<chain>-<resolution>-<model>` (`monolith-720p-n`,
+`ros-4node-180p-x`). `design.cells` is the list of combos that actually exist
+(the full factorial is 2 x 3 x 3 = 18); leave the list out and `run.py`
+generates the full product.
+
+What each axis can and cannot move (all three engines take FLOAT
+`(1,3,640,640)` and emit FLOAT `(1,84,8400)`, so `imgsz` and `input_dtype` are
+constant across the matrix):
+
+| axis | image topic | tensor topic | inference | acquisition |
+|---|---|---|---|---|
+| resolution | 2.76 → 0.69 → 0.17 MB | unchanged (4.92 MB) | unchanged | 3 decode sizes |
+| model | unchanged | unchanged | conv compute only | unchanged |
+| chain | hops per frame | hops per frame | unchanged | unchanged |
+
+The resolution axis is therefore a **transport** probe with a modest compute
+side-effect: the letterboxed 640x640 tensor dominates the wire either way, so
+720p→180p removes ~34 % of the bytes, not ~22x. If the four-node chain is
+bandwidth-bound, `xport` should land near 45-50 ms at 180p against ~67 ms at
+720p; a much larger collapse would mean transport is scheduling-bound, not
+bandwidth-bound.
+
+### Pruning
+
+18 cells x 3 passes is a full working day. `--conditions` selects by cell name:
+
+```bash
+bench/run.py --dry-run --conditions monolith-720p-n,ros-4node-720p-n
+bench/run.py --conditions monolith-720p-n,monolith-360p-n,monolith-180p-n,ros-4node-720p-n,ros-4node-360p-n,ros-4node-180p-n
+```
+
+A design that answers one factor beats a design that answers none: keep the
+anchor cell in every `design` (see *Calibration*), then add the cells needed for
+the axis under test.
+
+## Calibration
+
+The measured design has no duplicate control cell. `monolith-ctrl` survives only
+in the `artifacts` (demo) block, where two visually identical videos are worth
+having. The noise floor it used to measure is now carried by repeating the
+**anchor** cell in every pass: the std of the per-pass deltas is the number a
+ROS-vs-monolith difference has to clear, measured on the same clock as the
+comparison instead of once, months ago, on a different session. Run the A/A pair
+on demand when the harness itself changes (`--conditions` with a throwaway
+scenario), because a control cell mostly caught harness bugs keyed off the
+condition name -- output paths, env merge, process-group discovery.
+
+## Adding an axis or a cell
+
+* **New axis value** (another resolution, another model): add an entry to the
+  matching `factors` table and list the cells in `design`. Nothing else changes.
+* **New axis** (e.g. chain length): add a `factors.<name>` table, extend the
+  cells to `[chain, resolution, model, <name>]`, and reference `{<name>}` in the
+  chain templates.
+
+`cmd` is an argv template, `shell` is for things that need
+`source install/setup.bash`. Placeholders: `{python}`, `{repo}`, `{source}`,
+`{model}`, `{rotate}`, `{loops}`, `{duration}`, `{out}`, `{condition}`,
+`{repeat}`.
 
 ## Adding a condition
 

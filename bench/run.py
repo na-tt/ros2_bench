@@ -39,6 +39,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -97,6 +98,71 @@ def build_argv(condition: dict[str, object], context: dict[str, str]) -> list[st
         raise SystemExit("condition needs either 'cmd' or 'shell'")
     expanded = expand(list(cmd), context)  # type: ignore[arg-type]
     return [str(part) for part in expanded]
+
+
+def matrix_conditions(
+    scenario: dict[str, object],
+) -> list[tuple[str, dict[str, object]]]:
+    """Expand ``factors`` x ``design`` into ``(cell name, condition)`` pairs.
+
+    A cell inherits the command template of its chain and gets the resolution's
+    source/rotation and the model's engine path injected as ``source`` /
+    ``rotate`` / ``model``. Those are the same placeholders a hand-written
+    condition already uses, so everything downstream is unchanged -- the matrix
+    only decides *which* combinations exist and what their assets are.
+    """
+    factors = scenario.get("factors") or {}
+    if not factors:
+        return []  # legacy flat `conditions` scenario
+    resolutions = factors.get("resolution") or {}  # type: ignore[union-attr]
+    models = factors.get("model") or {}  # type: ignore[union-attr]
+    chains = factors.get("chain") or {}  # type: ignore[union-attr]
+    if not (resolutions and models and chains):
+        raise SystemExit("factors needs 'chain', 'resolution' and 'model' tables")
+
+    design = scenario.get("design") or {}
+    cells = design.get("cells") if isinstance(design, dict) else design
+    if not cells:
+        cells = [
+            [chain, resolution, model]
+            for chain in chains
+            for resolution in resolutions
+            for model in models
+        ]
+
+    out: list[tuple[str, dict[str, object]]] = []
+    seen: set[str] = set()
+    for cell in cells:  # type: ignore[union-attr]
+        if not isinstance(cell, (list, tuple)) or len(cell) != 3:
+            raise SystemExit(f"design cell must be [chain, resolution, model]: {cell!r}")
+        chain_name, resolution_name, model_name = (str(part) for part in cell)
+        for label, table, value in (
+            ("chain", chains, chain_name),
+            ("resolution", resolutions, resolution_name),
+            ("model", models, model_name),
+        ):
+            if value not in table:  # type: ignore[operator]
+                raise SystemExit(f"design cell names unknown {label}: {value!r}")
+
+        name = f"{chain_name}-{resolution_name}-{model_name}"
+        if name in seen:
+            raise SystemExit(f"design lists {name} twice")
+        seen.add(name)
+
+        resolution_spec = resolutions[resolution_name]  # type: ignore[index]
+        model_spec = models[model_name]  # type: ignore[index]
+        condition = dict(chains[chain_name])  # type: ignore[index]
+        condition["rotate"] = resolution_spec.get("rotate", 0)  # type: ignore[union-attr]
+        condition["source"] = resolution_spec.get(  # type: ignore[union-attr]
+            "source", scenario.get("source", "")
+        )
+        condition["model"] = model_spec.get("model", scenario.get("model", ""))  # type: ignore[union-attr]
+        if resolution_spec.get("clip_frames"):  # type: ignore[union-attr]
+            condition["clip_frames"] = resolution_spec["clip_frames"]  # type: ignore[index]
+        if model_spec.get("note"):
+            condition["note"] = model_spec["note"]  # type: ignore[index]
+        out.append((name, condition))
+    return out
 
 
 # ----------------------------------------------------------------------- demo
@@ -160,7 +226,14 @@ def run_demo(scenario: dict[str, object], args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         else:
-            context = {**base_context, "condition": "compare", "out": str(out_root)}
+            # The composite renders the same footage as the panels it merges.
+            anchor_spec = conditions.get(required[0]) if required else None  # type: ignore[union-attr]
+            context = {
+                **base_context,
+                "condition": "compare",
+                "out": str(out_root),
+                "rotate": str(_rotate_of(anchor_spec or {}, scenario)),
+            }
             steps.append(("compare:render", render_spec, context, out_root / "compare.log"))
 
     if not steps:
@@ -281,13 +354,31 @@ def main(argv: list[str] | None = None) -> int:
 
     wanted = [name.strip() for name in (args.conditions or "").split(",") if name.strip()]
     conditions: list[tuple[str, dict[str, object]]] = []
-    for name, condition in (scenario.get("conditions") or {}).items():
+    generated = matrix_conditions(scenario)
+    pool: Iterable[tuple[str, dict[str, object]]] = (
+        generated
+        if generated
+        else [
+            (str(name), condition)  # type: ignore[misc]
+            for name, condition in (scenario.get("conditions") or {}).items()  # type: ignore[union-attr]
+        ]
+    )
+    known: set[str] = set()
+    for name, condition in pool:
+        known.add(name)
         if wanted and name not in wanted:
             continue
         if not condition.get("enabled", True):
             print(f"skip {name}: disabled in scenario", file=sys.stderr)
             continue
         conditions.append((name, condition))
+    if wanted:
+        missing = [name for name in wanted if name not in known]
+        if missing:
+            raise SystemExit(
+                f"unknown condition(s): {', '.join(missing)} "
+                f"(known: {', '.join(sorted(known))})"
+            )
     if not conditions:
         raise SystemExit("no runnable conditions")
 
@@ -310,7 +401,8 @@ def main(argv: list[str] | None = None) -> int:
             context = {
                 "python": sys.executable,
                 "repo": str(REPO),
-                "source": source,
+                "source": str(condition.get("source", source)),
+                "model": str(condition.get("model", "")),
                 "rotate": str(_rotate_of(condition, scenario)),
                 "duration": f"{duration:g}",
                 "out": str(trial_dir),

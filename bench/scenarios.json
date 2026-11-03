@@ -1,43 +1,80 @@
 {
+  "note": "Conditions are generated from `factors` x `design`, so the experiment is written down once instead of as N hand-copied command templates. A cell is named <chain>-<resolution>-<model> (e.g. `ros-4node-360p-m`). `--conditions` still selects a subset by cell name. If `factors` is absent the older flat `conditions` block is used instead.",
   "source": "assets/video/0000f77c-6257be58.mov",
   "rotate": 180,
   "duration_s": 120,
   "loops": 1000,
   "repeats": 3,
   "out_dir": "results/bench",
-  "conditions": {
-    "monolith": {
-      "note": "single-process baseline",
-      "cmd": [
-        "{python}", "-m", "yolocar.main",
-        "--source", "{source}",
-        "--rotate", "{rotate}",
-        "--loops", "{loops}",
-        "--duration", "{duration}",
-        "--records", "{out}/records.jsonl",
-        "--json", "{out}/summary.json",
-        "--log-level", "WARNING"
-      ],
-      "env": {"PYTHONPATH": "{repo}/monolith/yolocar/src"}
+  "factors": {
+    "resolution": {
+      "note": "Three re-encodes of the same clip at the same CRF, so bitrate (and therefore decode cost) scales with resolution. They are stored upright: ffmpeg baked the rotation into the pixels and cleared the display matrix, hence rotate 0. `clip_frames` is what makes the replay count exact instead of a 1000-loop fudge.",
+      "720p": {
+        "source": "assets/video/0000f77c-6257be58_720p.mov",
+        "rotate": 0,
+        "clip_frames": 1211
+      },
+      "360p": {
+        "source": "assets/video/0000f77c-6257be58_360p.mov",
+        "rotate": 0,
+        "clip_frames": 1211
+      },
+      "180p": {
+        "source": "assets/video/0000f77c-6257be58_180p.mov",
+        "rotate": 0,
+        "clip_frames": 1211
+      }
     },
-    "monolith-ctrl": {
-      "note": "byte-identical clone of `monolith`: the noise-floor control",
-      "cmd": [
-        "{python}", "-m", "yolocar.main",
-        "--source", "{source}",
-        "--rotate", "{rotate}",
-        "--loops", "{loops}",
-        "--duration", "{duration}",
-        "--records", "{out}/records.jsonl",
-        "--json", "{out}/summary.json",
-        "--log-level", "WARNING"
-      ],
-      "env": {"PYTHONPATH": "{repo}/monolith/yolocar/src"}
+    "model": {
+      "note": "All three engines take FLOAT (1,3,640,640) and produce FLOAT (1,84,8400), so imgsz and input_dtype are constant across the matrix and the model axis moves zero bytes on the wire.",
+      "n": {"model": "assets/models/yolov8n_fp16.engine"},
+      "m": {"model": "assets/models/yolov8m_fp16.engine"},
+      "x": {"model": "assets/models/yolov8x_fp16.engine"}
     },
-    "ros-4node": {
-      "note": "four-node chain (acquisition -> preprocessing -> inference -> postprocessing), one process each. The inference node owns the decode/threshold step, so compare `infer + post` against the monolith's two buckets. Prerequisite: `cd ws && colcon build --symlink-install`.",
-      "shell": "source {repo}/ws/install/setup.bash && PYTHONPATH={repo}/monolith/yolocar/src:$PYTHONPATH ros2 launch yolocar_ros bench.launch.py duration:={duration} loops:={loops} source:={source} rotate:={rotate} records:={out}/records.jsonl summary:={out}/summary.json log_level:=WARNING"
+    "chain": {
+      "monolith": {
+        "note": "single-process baseline",
+        "cmd": [
+          "{python}", "-m", "yolocar.main",
+          "--model", "{model}",
+          "--source", "{source}",
+          "--rotate", "{rotate}",
+          "--loops", "{loops}",
+          "--duration", "{duration}",
+          "--records", "{out}/records.jsonl",
+          "--json", "{out}/summary.json",
+          "--log-level", "WARNING"
+        ],
+        "env": {"PYTHONPATH": "{repo}/monolith/yolocar/src"}
+      },
+      "ros-4node": {
+        "note": "four-node chain (acquisition -> preprocessing -> inference -> postprocessing), one process each. The inference node owns the decode/threshold step, so compare `infer + post` against the monolith's two buckets. Prerequisite: `cd ws && colcon build --symlink-install`.",
+        "shell": "source {repo}/ws/install/setup.bash && PYTHONPATH={repo}/monolith/yolocar/src:$PYTHONPATH ros2 launch yolocar_ros bench.launch.py model:={model} duration:={duration} loops:={loops} source:={source} rotate:={rotate} records:={out}/records.jsonl summary:={out}/summary.json log_level:=WARNING"
+      }
     }
+  },
+  "design": {
+    "note": "The full factorial is 2 x 3 x 3 = 18 cells. It is listed in full so the file states the truth rather than a wish; `bench/README.md` has the cost per cell and the pruning recipes (`--conditions`, or a shorter `design`).",
+    "cells": [
+      ["monolith", "720p", "n"],
+      ["monolith", "720p", "m"],
+      ["monolith", "720p", "x"],
+      ["monolith", "360p", "n"],
+      ["monolith", "360p", "m"],
+      ["monolith", "360p", "x"],
+      ["monolith", "180p", "n"],
+      ["monolith", "180p", "m"],
+      ["monolith", "180p", "x"],
+      ["ros-4node", "720p", "n"],
+      ["ros-4node", "720p", "m"],
+      ["ros-4node", "720p", "x"],
+      ["ros-4node", "360p", "n"],
+      ["ros-4node", "360p", "m"],
+      ["ros-4node", "360p", "x"],
+      ["ros-4node", "180p", "n"],
+      ["ros-4node", "180p", "m"],
+      ["ros-4node", "180p", "x"]
+    ]
   },
   "artifacts": {
     "note": "Demo material, NOT measurement: `bench/run.py --demo` runs each condition once through one full replay of the clip with the detections sidecar on, then renders it offline with `yolocar.demo`. Nothing here touches the measured trials, so the measured commands above stay byte-identical.",
