@@ -4,6 +4,14 @@ Everything here is a sink for pixels, never part of the measured pipeline: the
 benchmark can run headless and the ROS 2 short chain can skip it entirely. It
 depends on :mod:`yolocar.postprocessing` only for the :class:`Detection` type;
 no CV logic lives here.
+
+Two consumers, deliberately separated:
+
+* the measured front-ends may call :func:`draw_detections` while they run
+  (``--draw``/``--output``, debug only, timed into ``present_ms``);
+* :mod:`yolocar.demo` renders a *finished* run offline from its detections
+  sidecar, which is how the ROS 2 chain gets a picture without a fifth node.
+  :func:`draw_hud` exists for that path.
 """
 
 from __future__ import annotations
@@ -88,6 +96,61 @@ def draw_detections(
             cv2.LINE_AA,
         )
     return canvas
+
+
+# ------------------------------------------------------------------------ hud
+HUD_FONT = cv2.FONT_HERSHEY_SIMPLEX
+HUD_COLOR = (240, 240, 240)
+HUD_BACKING = 0.45
+
+
+def draw_hud(
+    frame: np.ndarray,
+    lines: Sequence[str],
+    font_scale: float = 0.45,
+    margin: int = 8,
+    padding: int = 5,
+) -> np.ndarray:
+    """Draw status lines on a translucent backing **in place**.
+
+    Used by the offline renderer so a recording documents itself (stage
+    timings, frame index, transport cost) instead of needing a caption. Kept
+    out of the measured pipeline: :func:`draw_detections` copies, this one does
+    not, because the caller already owns a scratch frame.
+    """
+    text_lines = [line for line in lines if line]
+    if not text_lines:
+        return frame
+    thickness = max(1, round(min(frame.shape[:2]) / 720))
+    measured = [
+        cv2.getTextSize(line, HUD_FONT, font_scale, thickness) for line in text_lines
+    ]
+    text_w = max(size[0][0] for size in measured)
+    line_h = max(size[0][1] + size[1] for size in measured) + 2
+
+    x0, y0 = margin, margin
+    x1 = min(frame.shape[1] - 1, x0 + text_w + 2 * padding)
+    y1 = min(frame.shape[0] - 1, y0 + line_h * len(text_lines) + 2 * padding)
+
+    region = frame[y0:y1, x0:x1]
+    if region.size:
+        cv2.addWeighted(
+            np.zeros_like(region), HUD_BACKING, region, 1.0 - HUD_BACKING, 0.0, region
+        )
+
+    for index, line in enumerate(text_lines):
+        baseline = y0 + padding + line_h * index + measured[index][0][1]
+        cv2.putText(
+            frame,
+            line,
+            (x0 + padding, baseline),
+            HUD_FONT,
+            font_scale,
+            HUD_COLOR,
+            thickness,
+            cv2.LINE_AA,
+        )
+    return frame
 
 
 # ---------------------------------------------------------------------- sinks

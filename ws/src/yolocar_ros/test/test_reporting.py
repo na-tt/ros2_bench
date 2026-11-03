@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from yolocar.config import ROAD_CLASS_IDS, YoloCarConfig
+from yolocar.detections import build_header, DetectionLog, iter_records
+from yolocar.postprocessing import Detection
 
 from yolocar_ros.reporting import (
     build_summary,
@@ -64,6 +66,72 @@ def test_record_writer_without_path_is_a_no_op() -> None:
     writer = RecordWriter(None)
     writer.write({'seq': 0})
     writer.close()
+
+
+def test_detections_sidecar_stays_in_lockstep_with_records(tmp_path: Path) -> None:
+    """Both files the postprocessing node writes must agree on seq."""
+    records = RecordWriter(tmp_path / 'records.jsonl')
+    detections = DetectionLog(
+        tmp_path / 'detections.jsonl',
+        header=build_header(
+            source='assets/video/clip.mov',
+            rotate=180,
+            model='engine',
+            image_size=640,
+            conf_threshold=0.25,
+            iou_threshold=0.45,
+            agnostic_nms=False,
+            class_ids=ROAD_CLASS_IDS,
+            producer='ros-4node',
+        ),
+    ).open_file()
+    found = Detection(
+        x_min=1.0, y_min=2.0, x_max=3.0, y_max=4.0,
+        confidence=0.5, class_id=2, class_name='car',
+    )
+    try:
+        for seq in range(5):
+            records.write({'seq': seq, 'n_det': 1})
+            detections.write(seq=seq, loop=0, t_mono=1.0 + seq, detections=[found])
+    finally:
+        records.close()
+        detections.close()
+
+    stored = [record.seq for record in iter_records(tmp_path / 'detections.jsonl')]
+    logged = [
+        json.loads(line)['seq']
+        for line in (tmp_path / 'records.jsonl').read_text(encoding='utf-8').splitlines()
+    ]
+    assert stored == logged == list(range(5))
+
+
+def test_build_summary_records_the_detections_sidecar_path(tmp_path: Path) -> None:
+    config = _config()
+    common = {
+        'config': config,
+        'source': 'assets/video/clip.mov',
+        'frames': 1,
+        'replays': 1,
+        'events': {'start': 1.0, 'end': 2.0},
+        'interrupted': False,
+        'wall_time_s': 1.0,
+        'latency_ms': [10.0],
+        'acquisition_ms': [8.0],
+        'preprocess_ms': [3.0],
+        'inference_ms': [6.0],
+        'postprocess_ms': [1.0],
+        'transport_ms': [0.0],
+        'detections_per_frame': [1],
+        'detections_by_class': {'car': 1},
+    }
+    without = build_summary(**common, records_path=None)  # type: ignore[arg-type]
+    assert without['detections_log'] is None
+
+    path = tmp_path / 'detections.jsonl'
+    with_it = build_summary(  # type: ignore[arg-type]
+        **common, records_path=None, detections_path=path
+    )
+    assert with_it['detections_log'] == str(path)
 
 
 def test_build_summary_matches_the_monolith_contract(tmp_path: Path) -> None:

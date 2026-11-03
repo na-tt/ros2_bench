@@ -48,6 +48,7 @@ from typing_extensions import Self
 
 from .acquisition import FrameSource, open_source
 from .config import DEFAULT_OUTPUT_FPS, ROAD_CLASS_IDS, YoloCarConfig
+from .detections import DetectionLog, build_header
 from .postprocessing import Detection
 from .processor import YoloCarProcessor
 from .render import draw_detections, open_sink
@@ -203,11 +204,27 @@ def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
     interrupted = False
     events: dict[str, float] = {}
     records = _RecordWriter(config.records_path)
+    # Per-frame detections, so this run can be rendered afterwards. A no-op
+    # unless --detections was given: it is a side artifact, not a stage.
+    detections_log = DetectionLog(
+        config.detections_path,
+        header=build_header(
+            source=source.description,
+            rotate=config.rotate,
+            model=config.model_path,
+            image_size=config.image_size,
+            conf_threshold=config.conf_threshold,
+            iou_threshold=config.iou_threshold,
+            agnostic_nms=config.agnostic_nms,
+            class_ids=config.target_class_ids,
+            producer="monolith",
+        ),
+    )
 
     t_start = time.monotonic()
     events["start"] = t_start
 
-    with records:
+    with records, detections_log:
         try:
             processor.load()
             events["engine_loaded"] = time.monotonic()
@@ -282,6 +299,13 @@ def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
                         detections_by_class.get(detection.class_name, 0) + 1
                     )
                 frames += 1
+
+                detections_log.write(
+                    seq=frame.seq,
+                    loop=frame.loop,
+                    t_mono=t_acq,
+                    detections=detections,
+                )
 
                 records.write(
                     {
@@ -366,6 +390,10 @@ def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
         "detections": _detection_summary(frames, detections_per_frame, detections_by_class),
         "provenance": _provenance(config),
         "records": None if config.records_path is None else str(config.records_path),
+        #: Side artifact (final detections per frame) for rendering afterwards.
+        "detections_log": (
+            None if config.detections_path is None else str(config.detections_path)
+        ),
         "config": {
             "conf_threshold": config.conf_threshold,
             "iou_threshold": config.iou_threshold,
@@ -494,6 +522,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="write one JSON object per frame here (JSONL)",
     )
+    parser.add_argument(
+        "--detections",
+        type=Path,
+        default=None,
+        help=(
+            "write the final detections of every frame here (JSONL sidecar; "
+            "render it later with `python -m yolocar.demo`)"
+        ),
+    )
     parser.add_argument("--draw", action="store_true", help="annotate and show frames")
     parser.add_argument(
         "--output", type=Path, default=None, help="write annotated frames here"
@@ -531,6 +568,7 @@ def config_from_args(args: argparse.Namespace) -> YoloCarConfig:
         loops=int(args.loops),
         duration_s=args.duration,
         records_path=Path(args.records) if args.records else None,
+        detections_path=Path(args.detections) if args.detections else None,
         draw=bool(args.draw),
         output_path=Path(args.output) if args.output else None,
         json_path=Path(args.json) if args.json else None,

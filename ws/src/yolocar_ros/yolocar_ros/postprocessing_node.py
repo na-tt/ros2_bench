@@ -24,6 +24,7 @@ from rclpy.node import Node
 from std_msgs.msg import Empty
 
 from yolocar.config import ROAD_CLASS_IDS, YoloCarConfig
+from yolocar.detections import build_header, DetectionLog
 from yolocar.postprocessing import (
     coordinate_adaptation,
     domain_filter,
@@ -60,6 +61,7 @@ class PostprocessingNode(Node):
         class_ids = tuple(int(value) for value in classes.split(',') if value.strip())
         records = str(self.declare_parameter('records', '').value)
         summary = str(self.declare_parameter('summary', '').value)
+        detections = str(self.declare_parameter('detections', '').value)
         model = str(
             self.declare_parameter(
                 'model', 'assets/models/yolov8n_fp16.engine'
@@ -80,6 +82,7 @@ class PostprocessingNode(Node):
             loops=int(self.declare_parameter('loops', 1).value),
             duration_s=None if duration <= 0.0 else duration,
             records_path=Path(records) if records else None,
+            detections_path=Path(detections) if detections else None,
             json_path=Path(summary) if summary else None,
             rotate=int(self.declare_parameter('rotate', 0).value),
             conf_threshold=float(self.declare_parameter('conf', 0.25).value),
@@ -94,6 +97,23 @@ class PostprocessingNode(Node):
         )
 
         self.records = RecordWriter(self.config.records_path)
+        #: Side artifact, not part of the contract: one line per frame with the
+        #: final detections, so this run can be rendered afterwards. A no-op
+        #: unless the `detections` parameter was set.
+        self.detections_log = DetectionLog(
+            self.config.detections_path,
+            header=build_header(
+                source=self.config.source,
+                rotate=self.config.rotate,
+                model=self.config.model_path,
+                image_size=self.config.image_size,
+                conf_threshold=self.config.conf_threshold,
+                iou_threshold=self.config.iou_threshold,
+                agnostic_nms=self.config.agnostic_nms,
+                class_ids=self.config.target_class_ids,
+                producer='ros-4node',
+            ),
+        ).open_file()
 
         self.ack_publisher = self.create_publisher(
             FrameAck, topics.ACK_TOPIC, qos.control()
@@ -171,6 +191,12 @@ class PostprocessingNode(Node):
                 self._detections_by_class.get(detection.class_name, 0) + 1
             )
 
+        self.detections_log.write(
+            seq=int(meta.seq),
+            loop=int(meta.loop),
+            t_mono=float(meta.t_mono),
+            detections=detections,
+        )
         self.records.write(
             {
                 'seq': int(meta.seq),
@@ -246,6 +272,7 @@ class PostprocessingNode(Node):
             detections_per_frame=self._detections_per_frame,
             detections_by_class=self._detections_by_class,
             records_path=self.config.records_path,
+            detections_path=self.config.detections_path,
         )
         write_summary(self.config.json_path, summary)
 
@@ -262,6 +289,7 @@ class PostprocessingNode(Node):
 
     def close(self) -> None:
         self.records.close()
+        self.detections_log.close()
 
 
 def main(argv: list[str] | None = None) -> int:

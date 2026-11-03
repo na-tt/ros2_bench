@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 yolocar = "yolocar.main:main"
+yolocar-demo = "yolocar.demo:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "yolocar.__version__" }

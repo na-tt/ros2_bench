@@ -23,7 +23,9 @@ monolith/yolocar/
 │   ├── preprocessing.py   # stage 2: letterbox + BGR->RGB NCHW tensor
 │   ├── inference.py       # stage 3: engine call + detect-head decoding
 │   ├── postprocessing.py  # stages 4-6: NMS, domain filter, coord adaptation
-│   ├── render.py          # optional: annotation + frame sinks
+│   ├── detections.py      # per-frame detections sidecar (JSONL artefact)
+│   ├── render.py          # optional: annotation, HUD + frame sinks
+│   ├── demo.py            # offline renderer: sidecar + clip -> video
 │   ├── processor.py       # facade: owns the engine, wires stages 2-6
 │   ├── main.py            # standalone CLI / benchmark
 │   └── py.typed
@@ -31,6 +33,8 @@ monolith/yolocar/
     ├── test_package.py             # import/wiring smoke tests
     ├── test_yolocar_pipeline.py    # acquisition / preprocessing / inference / facade
     ├── test_yolocar_postprocessing.py  # stages 4-6 + frozen golden output
+    ├── test_yolocar_detections.py  # detections sidecar writer/reader
+    ├── test_yolocar_demo.py        # renderer: join, timing, composite
     ├── test_yolocar_cuda.py        # CUDA bindings with fakes
     ├── test_yolocar_engine.py      # TensorRT glue with fakes
     ├── test_yolocar_hardware.py    # real driver/engine, skips when unavailable
@@ -138,6 +142,76 @@ throughput:
 
 To benchmark, either omit `--output`/`--draw` or just read `fps`: both are
 correct, and annotating a run no longer changes the number you compare.
+
+For showing what the pipeline found — in the monolith *or* in the ROS 2 chain —
+use the sidecar + offline renderer below instead: it costs the run nothing and
+is the only route that also works for the four-node chain.
+
+## Seeing a run (demo material)
+
+A run can write its final detections next to `records.jsonl`:
+
+```bash
+python3 -m yolocar.main --source assets/video/0000f77c-6257be58.mov \
+    --rotate 180 --loops 1 \
+    --records results/demo/monolith/records.jsonl \
+    --detections results/demo/monolith/detections.jsonl \
+    --json results/demo/monolith/summary.json
+```
+
+`detections.jsonl` is one header line plus one line per frame:
+
+```json
+{"kind":"detections","v":1,"source":"assets/video/...","rotate":180,"model":"...","imgsz":640,"conf":0.25,"iou":0.45,"agnostic":false,"classes":[0,1,2,...],"producer":"monolith"}
+{"seq":0,"loop":0,"t_mono":12345.678,"det":[[96.4,412.9,180.2,512.0,0.87,2]]}
+```
+
+Rows are `[x1, y1, x2, y2, score, class_id]` of the *final* detections, in the
+original frame's pixels — exactly what a presentation stage would draw. The
+header is validated by the renderer, so a stale file or a rotation mismatch is
+an error instead of a picture with wrong boxes. Writing it costs ~0.01 ms per
+frame (it is a side artifact, not a stage: `records.jsonl` and `summary.json`
+are unchanged, and a front-end that never writes one is still compliant).
+
+Rendering happens **offline**, which matters: encoding a 1280x720 frame with
+`mp4v` costs ~16 ms on this board, i.e. about the whole pipeline.
+
+```bash
+# one run -> one video, with a HUD (stage timings, frame index, transport cost)
+python3 -m yolocar.demo \
+    --source assets/video/0000f77c-6257be58.mov --rotate 180 \
+    --detections results/demo/monolith/detections.jsonl \
+    --records    results/demo/monolith/records.jsonl \
+    --out        results/demo/monolith.mp4 --timing wall --hud
+
+# two runs -> one composite, each panel at its own pace
+python3 -m yolocar.demo --source assets/video/0000f77c-6257be58.mov --rotate 180 \
+    --compare monolith=results/demo/monolith/detections.jsonl,results/demo/monolith/records.jsonl \
+              ros-4node=results/demo/ros-4node/detections.jsonl,results/demo/ros-4node/records.jsonl \
+    --out results/demo/compare.mp4 --timing wall --hud
+
+# watch a finished run at its real pace (no file, no viewer node needed)
+python3 -m yolocar.demo ... --play
+```
+
+Key options:
+
+* `--timing wall` (default) — quantised VFR: CFR at `--base-fps` (120) with each
+  frame repeated by its own duration, so the video lasts as long as the run did.
+  A run at 9 fps therefore produces a video ~4x longer than one at 37 fps, which
+  is the point: the overhead becomes visible. `--timing source` writes CFR at the
+  clip's rate instead (shorter, hides the pacing) for slide decks.
+* `--align wall|seq` (compare mode) — `wall` shows each panel at its own clock
+  (the slower one stutters and keeps going after the faster one has finished);
+  `seq` puts both on the same clip frame (detection-quality comparison, CFR).
+* `--until S` — cut the *output* timeline after S seconds; handy to show the
+  divergence without the freeze that follows.
+* `--loop N`, `--max-frames N`, `--scale F`, `--no-hud`.
+
+The join is `seq`, never a timestamp: a file source re-decodes in the same order,
+so `seq` identifies the frame exactly. Camera sources cannot be re-decoded, so
+their sidecars are refused (a frame tap would be the follow-up if that is ever
+needed).
 
 ### Measurement policy
 

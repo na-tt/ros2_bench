@@ -38,5 +38,50 @@
       "note": "four-node chain (acquisition -> preprocessing -> inference -> postprocessing), one process each. The inference node owns the decode/threshold step, so compare `infer + post` against the monolith's two buckets. Prerequisite: `cd ws && colcon build --symlink-install`.",
       "shell": "source {repo}/ws/install/setup.bash && PYTHONPATH={repo}/monolith/yolocar/src:$PYTHONPATH ros2 launch yolocar_ros bench.launch.py duration:={duration} loops:={loops} source:={source} rotate:={rotate} records:={out}/records.jsonl summary:={out}/summary.json log_level:=WARNING"
     }
+  },
+  "artifacts": {
+    "note": "Demo material, NOT measurement: `bench/run.py --demo` runs each condition once through one full replay of the clip with the detections sidecar on, then renders it offline with `yolocar.demo`. Nothing here touches the measured trials, so the measured commands above stay byte-identical.",
+    "out_dir": "results/demo",
+    "loops": 1,
+    "conditions": {
+      "monolith": {
+        "run": {
+          "cmd": ["{python}", "-m", "yolocar.main", "--source", "{source}", "--rotate", "{rotate}", "--loops", "{loops}", "--records", "{out}/records.jsonl", "--detections", "{out}/detections.jsonl", "--json", "{out}/summary.json", "--log-level", "WARNING"],
+          "env": {"PYTHONPATH": "{repo}/monolith/yolocar/src"}
+        },
+        "render": {
+          "cmd": ["{python}", "-m", "yolocar.demo", "--source", "{source}", "--rotate", "{rotate}", "--detections", "{out}/detections.jsonl", "--records", "{out}/records.jsonl", "--out", "{demo}/monolith.mp4", "--timing", "wall", "--hud", "--log-level", "WARNING"],
+          "env": {"PYTHONPATH": "{repo}/monolith/yolocar/src"}
+        }
+      },
+      "monolith-ctrl": {
+        "note": "Same as `monolith`: two visually identical control videos are the noise floor, made visible.",
+        "run": {
+          "cmd": ["{python}", "-m", "yolocar.main", "--source", "{source}", "--rotate", "{rotate}", "--loops", "{loops}", "--records", "{out}/records.jsonl", "--detections", "{out}/detections.jsonl", "--json", "{out}/summary.json", "--log-level", "WARNING"],
+          "env": {"PYTHONPATH": "{repo}/monolith/yolocar/src"}
+        },
+        "render": {
+          "cmd": ["{python}", "-m", "yolocar.demo", "--source", "{source}", "--rotate", "{rotate}", "--detections", "{out}/detections.jsonl", "--records", "{out}/records.jsonl", "--out", "{demo}/monolith-ctrl.mp4", "--timing", "wall", "--hud", "--log-level", "WARNING"],
+          "env": {"PYTHONPATH": "{repo}/monolith/yolocar/src"}
+        }
+      },
+      "ros-4node": {
+        "run": {
+          "shell": "source {repo}/ws/install/setup.bash && PYTHONPATH={repo}/monolith/yolocar/src:$PYTHONPATH ros2 launch yolocar_ros bench.launch.py loops:={loops} duration:=-1 source:={source} rotate:={rotate} records:={out}/records.jsonl detections:={out}/detections.jsonl summary:={out}/summary.json log_level:=WARNING"
+        },
+        "render": {
+          "cmd": ["{python}", "-m", "yolocar.demo", "--source", "{source}", "--rotate", "{rotate}", "--detections", "{out}/detections.jsonl", "--records", "{out}/records.jsonl", "--out", "{demo}/ros-4node.mp4", "--timing", "wall", "--hud", "--log-level", "WARNING"],
+          "env": {"PYTHONPATH": "{repo}/monolith/yolocar/src"}
+        }
+      }
+    },
+    "compare": {
+      "note": "Side-by-side, each panel at its own pace (`--align wall`): the ROS panel stutters and the composite lasts as long as the slower run.",
+      "requires": ["monolith", "ros-4node"],
+      "render": {
+        "cmd": ["{python}", "-m", "yolocar.demo", "--source", "{source}", "--rotate", "{rotate}", "--compare", "monolith={demo}/monolith/detections.jsonl,{demo}/monolith/records.jsonl", "ros-4node={demo}/ros-4node/detections.jsonl,{demo}/ros-4node/records.jsonl", "--out", "{demo}/compare-monolith-vs-ros-4node.mp4", "--timing", "wall", "--hud", "--log-level", "WARNING"],
+        "env": {"PYTHONPATH": "{repo}/monolith/yolocar/src"}
+      }
+    }
   }
 }

@@ -24,6 +24,7 @@ Usage::
     bench/analyze.py                       # whole trials
     bench/analyze.py --from 30 --to 240    # steady-state window
     bench/analyze.py --md results/report.md --json results/report.json
+    bench/analyze.py --timeline-out results/report/timeline
 """
 
 from __future__ import annotations
@@ -367,6 +368,153 @@ def to_markdown(report: dict[str, dict[str, Any]], window: str) -> str:
     return "\n".join(out) + "\n"
 
 
+# ------------------------------------------------------------------ timeline
+#: Stage stack, bottom to top. Acquisition is deliberately separate: it is the
+#: decoder's cost and is excluded from the latency headline.
+_TIMELINE_STAGES = (
+    ("pre_ms", "preprocess"),
+    ("infer_ms", "inference"),
+    ("post_ms", "postprocess"),
+    ("transport_ms", "transport (ROS only)"),
+)
+
+
+def _stack(axes, seconds: list[float], records: list[dict[str, Any]], stages) -> float:
+    """Stack ``stages`` as a step area; returns the top of the stack (ms)."""
+    bottom = np.zeros(len(seconds))
+    for key, label in stages:
+        if not all(key in record for record in records):
+            continue
+        values = np.asarray([record[key] for record in records], dtype=float)
+        axes.fill_between(
+            seconds,
+            bottom,
+            bottom + values,
+            step="post",
+            label=label,
+            linewidth=0.0,
+        )
+        bottom += values
+    return float(bottom.max()) if bottom.size else 0.0
+
+
+def plot_timelines(
+    root: Path,
+    *,
+    from_s: float | None,
+    to_s: float | None,
+    out_dir: Path,
+    records_name: str,
+) -> list[Path]:
+    """One two-panel latency figure per condition (first usable trial).
+
+    This is the figure the numbers cannot replace. Top: the whole per-frame
+    budget (for ROS the transport residual usually dominates, so the node-side
+    work is invisible there). Bottom: the same frame without transport and
+    without acquisition, which is where the stages can actually be compared.
+    Replay boundaries are thin verticals, the analysis window is shaded.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:  # pragma: no cover - matplotlib is present on the board
+        raise SystemExit("--timeline-out needs matplotlib") from None
+
+    written: list[Path] = []
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for condition_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        trial = next(
+            (
+                candidate
+                for candidate in sorted(condition_dir.glob("r*"))
+                if (candidate / records_name).is_file()
+            ),
+            None,
+        )
+        if trial is None:
+            continue
+        records = _rows(trial / records_name)
+        if not records:
+            continue
+
+        origin = records[0]["t_mono"]
+        seconds = [record["t_mono"] - origin for record in records]
+        figure, (top, detail) = plt.subplots(
+            2,
+            1,
+            figsize=(11.0, 5.6),
+            sharex=True,
+            gridspec_kw={"height_ratios": [2, 1]},
+        )
+        try:
+            _stack(top, seconds, records, _TIMELINE_STAGES)
+            _stack(detail, seconds, records, _TIMELINE_STAGES[:3])
+            if all("acq_ms" in record for record in records):
+                detail.plot(
+                    seconds,
+                    [record["acq_ms"] for record in records],
+                    color="0.35",
+                    linewidth=0.7,
+                    linestyle="--",
+                    label="acquisition (excluded from latency)",
+                )
+
+            window_end = seconds[-1] if to_s is None else to_s
+            start = from_s or 0.0
+            if start > 0.0 or to_s is not None:
+                for axes in (top, detail):
+                    axes.axvspan(start, window_end, color="0.9", zorder=0)
+                top.plot([], [], color="0.9", linewidth=6, label="analysis window")
+
+            for position in (
+                seconds[index]
+                for index in range(1, len(records))
+                if records[index].get("loop") != records[index - 1].get("loop")
+            ):
+                for axes in (top, detail):
+                    axes.axvline(position, color="0.2", linewidth=0.4, alpha=0.35)
+
+            top.set_ylabel("ms (whole frame)")
+            detail.set_ylabel("ms (stages only)")
+            detail.set_xlabel("seconds after the first recorded frame")
+            top.set_title(f"{condition_dir.name} ({trial.name}): per-frame stages")
+            detail.set_xlim(0.0, max(seconds[-1], 0.001))
+            top.legend(loc="upper left", fontsize=7, ncols=3, framealpha=0.85)
+            detail.legend(loc="upper left", fontsize=7, ncols=2, framealpha=0.85)
+            for axes in (top, detail):
+                axes.grid(True, axis="y", linewidth=0.3, alpha=0.4)
+            figure.tight_layout()
+            target = out_dir / f"timeline-{condition_dir.name}.png"
+            figure.savefig(target, dpi=130)
+            written.append(target)
+        finally:
+            plt.close(figure)
+    return written
+
+
+def demo_section(demo_dir: Path) -> str | None:
+    """List rendered demo material, when ``bench/run.py --demo`` produced any."""
+    if not demo_dir.is_dir():
+        return None
+    videos = sorted(demo_dir.glob("*.mp4"))
+    if not videos:
+        return None
+    lines = [
+        "",
+        "Demo material (rendered offline from detections.jsonl; not measured)",
+        "",
+    ]
+    for video in videos:
+        try:
+            name = video.relative_to(REPO)
+        except ValueError:  # pragma: no cover - outside the repo
+            name = video
+        lines.append(f"* `{name}` ({video.stat().st_size / 1e6:.0f} MB)")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dir", type=Path, default=REPO / "results/bench")
@@ -382,6 +530,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sampler", default="sampler.csv")
     parser.add_argument("--md", type=Path, default=None)
     parser.add_argument("--json", type=Path, default=None)
+    parser.add_argument(
+        "--timeline-out",
+        type=Path,
+        default=None,
+        help="write one stage-stacked latency figure per condition into this directory",
+    )
+    parser.add_argument(
+        "--demo-dir",
+        type=Path,
+        default=REPO / "results/demo",
+        help="list rendered demo videos from this directory in the report (if any)",
+    )
     args = parser.parse_args(argv)
 
     trials = collect(
@@ -407,7 +567,23 @@ def main(argv: list[str] | None = None) -> int:
         + " after the first frame"
     )
     markdown = to_markdown(report, window)
+    extra = demo_section(args.demo_dir)
+    if extra:
+        markdown += extra + "\n"
     print(markdown)
+
+    if args.timeline_out is not None:
+        written = plot_timelines(
+            args.dir,
+            from_s=args.from_s,
+            to_s=args.to_s,
+            out_dir=args.timeline_out,
+            records_name=args.records,
+        )
+        for path in written:
+            print(f"timeline -> {path}", file=sys.stderr)
+        if not written:
+            print("no trials to plot", file=sys.stderr)
 
     if args.md is not None:
         args.md.parent.mkdir(parents=True, exist_ok=True)

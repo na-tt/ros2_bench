@@ -20,8 +20,12 @@ Modules
     Stage 3: engine invocation and detect-head decoding.
 ``postprocessing``
     Stages 4-6: NMS, domain filter, coordinate adaptation.
+``detections``
+    Per-frame sidecar log of the final detections (artefact, not a stage).
 ``render``
-    Optional presentation: annotation and frame sinks.
+    Optional presentation: annotation, HUD and frame sinks.
+``demo``
+    Offline renderer: replays a run's detections sidecar onto the clip.
 ``processor``
     Facade that owns the engine and wires stages 2-6 together.
 ``main``
@@ -43,6 +47,7 @@ __all__ = [
     "ROAD_CLASS_IDS",
     "Candidates",
     "Detection",
+    "DetectionLog",
     "FrameSource",
     "InputSpec",
     "LetterboxInfo",
@@ -53,6 +58,7 @@ __all__ = [
     "decode_predictions",
     "domain_filter",
     "draw_detections",
+    "draw_hud",
     "letterbox",
     "nms",
     "open_source",
@@ -85,6 +91,8 @@ _LAZY_ATTRIBUTES: dict[str, tuple[str, str]] = {
     "nms": ("yolocar.postprocessing", "nms"),
     "postprocess": ("yolocar.postprocessing", "postprocess"),
     "to_detections": ("yolocar.postprocessing", "to_detections"),
+    "DetectionLog": ("yolocar.detections", "DetectionLog"),
+    "draw_hud": ("yolocar.render", "draw_hud"),
     "draw_detections": ("yolocar.render", "draw_detections"),
     "YoloCarProcessor": ("yolocar.processor", "YoloCarProcessor"),
     "process_frame": ("yolocar.processor", "process_frame"),

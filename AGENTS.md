@@ -226,6 +226,7 @@ never imports pipeline code. Details and the metric dictionary are in
 | layer | file | job |
 | --- | --- | --- |
 | workload | `monolith/<name>/src/<name>/main.py`, later the ROS node | emits per-frame records + summary |
+| demo (optional, never measured) | `bench/run.py --demo` + `python -m yolocar.demo` | one replay per condition, rendered offline from the detections sidecar |
 | sampler | `bench/sampler.py` | `tegrastats` (board) + `/proc` (workload) -> CSV, one clock |
 | orchestrator | `bench/run.py` | interleaved trials, rotates order, drives the sampler |
 | analysis | `bench/analyze.py` | picks the steady-state window, aggregates across trials |
@@ -244,6 +245,9 @@ never imports pipeline code. Details and the metric dictionary are in
   front-end adds `transport`), `events`
   (start/engine_loaded/first_frame/end), `provenance`, `fps`/`fps_wall`.
 * `sampler.csv` is produced by the harness, not by the workload.
+* `detections.jsonl` is an **artifact, not contract**: the final detections per
+  frame, written only when asked for, consumed by `yolocar.demo` to render a run
+  offline. Its presence changes nothing in `records.jsonl`/`summary.json`.
 
 **Non-negotiable policy** -- these are decisions, not defaults to "improve":
 
@@ -305,7 +309,9 @@ One module per upstream/downstream boundary; the facade only wires them.
 | NMS | `yolocar.postprocessing.nms` |
 | domain filter | `yolocar.postprocessing.domain_filter` |
 | coordinate adaptation | `yolocar.postprocessing.coordinate_adaptation` |
-| annotation / sinks (optional) | `yolocar.render` (`draw_detections`, `open_sink`) |
+| annotation / sinks (optional) | `yolocar.render` (`draw_detections`, `draw_hud`, `open_sink`) |
+| detections sidecar (offline artifact) | `yolocar.detections` (`DetectionLog`, `iter_records`, `build_header`) |
+| offline renderer (demo material) | `yolocar.demo` (`python -m yolocar.demo`) |
 | single-process wiring | `yolocar.processor.YoloCarProcessor` |
 
 Stages 4-6 exchange `yolocar.postprocessing.Candidates` (parallel numpy arrays:
@@ -336,6 +342,15 @@ type only at the very end.
   fps, against ~17 ms / ~35 fps for the monolith. Do not reduce it by shrinking
   the measured stages or by inserting queues; that is exactly what the
   benchmark exists to show.
+* **Presentation is offline, never a fifth node.** A run can write
+  `detections.jsonl` next to `records.jsonl` (`--detections` on the monolith,
+  `detections:=` on the launch file) and `python -m yolocar.demo` renders it onto
+  the clip afterwards. This is how the ROS chain gets a picture without a 2.7 MB
+  frame fan-out or a viewer in the ack chain. In-run drawing/encoding stays
+  debug-only (`--draw`/`--output`, ~16 ms/frame with `mp4v`, timed into
+  `present_ms` and subtracted from `fps`). Demo material comes from
+  `bench/run.py --demo`, a separate invocation that runs one replay per
+  condition; measured commands are untouched by it.
 * **`imgsz` and `input_dtype` are launch parameters, not engine facts.** The
   preprocessing node cannot load the engine (that is the inference node's job),
   so the launch file passes both and the inference node validates them against
@@ -367,7 +382,8 @@ type only at the very end.
   pass: a diff there means detection behaviour changed.
 * **`results/` is generated and gitignored.** Keep a run's directory if you want
   to compare against it later; nothing in it is source.
-* Test counts at the end of this session: 109 (`pytest monolith/yolocar`,
-  including 17 hardware tests against the real engine); 20 passed + 1 skipped
-  (`colcon test --packages-select yolocar_ros`, including the ament lint tests
-  and the real-engine stage-split test).
+* Test counts at the end of this session: 147 (`pytest monolith/yolocar`,
+  including 17 hardware tests against the real engine, the detections sidecar
+  and the offline renderer); 22 passed + 1 skipped (`colcon test
+  --packages-select yolocar_ros`, 23 tests: ament lint, the records/summary
+  contract, sidecar/records parity and the real-engine stage-split test).

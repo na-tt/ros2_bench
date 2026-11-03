@@ -8,10 +8,10 @@ launch file configurable in exactly the same way.
 
 ```
 bench/
-├── run.py          # orchestrator: interleaved trials + sampler + artefacts
+├── run.py          # orchestrator: interleaved trials + sampler + artefacts (+ --demo)
 ├── sampler.py      # board (tegrastats) + workload (/proc) telemetry -> CSV
 ├── analyze.py      # trials -> markdown/JSON report, window chosen here
-└── scenarios.json  # conditions: command templates
+└── scenarios.json  # conditions: command templates (+ an `artifacts` block)
 ```
 
 ## Policy (deliberate, not accidental)
@@ -101,11 +101,20 @@ tail -f results/full-run.log
 
 ```bash
 bench/analyze.py --from 30 --to 170 --md results/report.md --json results/report.json
+bench/analyze.py --from 30 --to 170 --timeline-out results/report/timeline
 ```
 
 `--from`/`--to` are seconds after the **first recorded frame**, so startup and
 settling stay in the data and you can re-window without re-measuring (drop
 `--from/--to` to use whole trials). `--dir` points at a different artefact root.
+
+`--timeline-out DIR` writes one figure per condition (`timeline-<condition>.png`)
+from that condition's first usable trial: latency stacked by stage, acquisition
+as a separate dashed line (it is excluded from latency), replay boundaries as
+thin verticals, and the analysis window shaded. It is the figure the table
+cannot replace — per-frame jitter, the stage split, and (for ROS) how much of
+the frame is transport. `--demo-dir` (default `results/demo`) appends a list of
+rendered demo videos to the report when any exist.
 
 ### Options worth knowing
 
@@ -117,12 +126,49 @@ settling stay in the data and you can re-window without re-measuring (drop
 | `--gap S` | `run.py` | idle seconds between trials (default 5) |
 | `--out DIR` | `run.py` | artefact root (default `results/bench`) |
 | `--interval-ms N` | `run.py` | sampler period (default 100) |
+| `--demo` | `run.py` | run the `artifacts` block instead of trials (see *Demo material*) |
 | `--dry-run` | `run.py` | print the expanded commands and exit |
 | `--scenario FILE` | `run.py` | alternate condition set |
 | `--dir` / `--records` / `--sampler` | `analyze.py` | where to read trials from |
+| `--timeline-out DIR` | `analyze.py` | one stage-stacked latency figure per condition |
+| `--demo-dir DIR` | `analyze.py` | list rendered demo videos in the report |
 
 `--loops` lives in `scenarios.json`, not on the CLI: it is what lets a 40 s clip
 drive a 180 s trial.
+
+### Demo material (`bench/run.py --demo`)
+
+Separate mode, separate invocation, never inside a measured trial. For each
+condition in the scenario's `artifacts.conditions` it runs **one full replay** of
+the clip with `--detections` on (no sampler, no repeats), then renders the video
+with `yolocar.demo`. `artifacts.compare` then builds the side-by-side video from
+the per-condition sidecars.
+
+```bash
+bench/run.py --demo                                   # all artifact conditions
+bench/run.py --demo --conditions monolith,ros-4node   # just the headline pair
+bench/run.py --demo --dry-run                         # print the steps
+```
+
+It cannot damage a measurement: the measured commands above are untouched, the
+run length/shape is different by design (one replay, `--loops 1`, no `--duration`),
+and a failure only marks `results/demo/run.json`.
+
+```
+results/demo/
+├── run.json                                   # demo steps + return codes
+├── <condition>/{records,detections,summary}.json[ l]
+├── <condition>.mp4
+└── compare-monolith-vs-ros-4node.mp4          # --align wall: each panel at its own pace
+```
+
+`detections.jsonl` is **not** part of the benchmark contract and is documented in
+`monolith/yolocar/README.md` (*Seeing a run*). A front-end that never writes one
+is still compliant; `records.jsonl`/`summary.json` are unchanged by its presence.
+
+Wall clock for a full `--demo` pass on this board: ~10 min (monolith 34 s run +
+61 s render, control likewise, ROS chain 140 s run + 179 s render, compare
+118 s).
 
 Common variants:
 

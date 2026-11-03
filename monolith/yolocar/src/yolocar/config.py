@@ -153,6 +153,10 @@ class YoloCarConfig:
     #: Write one JSON object per frame here (JSONL). The analysis decides the
     #: steady-state window from this stream; the run itself discards nothing.
     records_path: Path | None = None
+    #: Write the final detections of every frame here (JSONL sidecar). Not part
+    #: of the benchmark contract: it exists so a run can be rendered afterwards
+    #: (see :mod:`yolocar.demo`) without a presentation stage in the pipeline.
+    detections_path: Path | None = None
     #: Show annotated frames in a window (needs ``$DISPLAY``).
     draw: bool = False
     #: Write annotated frames here (``.mp4`` for video sources, a directory for

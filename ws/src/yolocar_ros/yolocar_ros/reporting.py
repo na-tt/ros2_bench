@@ -162,6 +162,7 @@ def build_summary(
     detections_per_frame: list[int],
     detections_by_class: dict[str, int],
     records_path: Path | None,
+    detections_path: Path | None = None,
 ) -> dict[str, object]:
     """Assemble the ``summary.json`` payload (same shape as the monolith)."""
     fps = (frames / wall_time_s) if frames and wall_time_s > 0 else 0.0
@@ -198,6 +199,10 @@ def build_summary(
         ),
         'provenance': provenance(config, source),
         'records': None if records_path is None else str(records_path),
+        #: Side artifact (final detections per frame), renderable offline.
+        'detections_log': (
+            None if detections_path is None else str(detections_path)
+        ),
         'config': {
             'conf_threshold': config.conf_threshold,
             'iou_threshold': config.iou_threshold,

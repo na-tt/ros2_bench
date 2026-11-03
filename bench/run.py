@@ -8,6 +8,12 @@ ran second. Round-robin with alternating order spreads it across conditions,
 and a duplicated *control* condition (same command twice) measures the noise
 floor directly, so any real difference can be quoted against it.
 
+``--demo`` is a separate mode: instead of trials it runs each condition's
+``artifacts`` block once (one replay of the clip, detections sidecar on, no
+sampler) and then renders the videos. Demo material is never produced inside a
+measured trial, so a rendering failure cannot damage a measurement and the
+measured commands stay byte-identical to the published baseline.
+
 Each trial gets its own directory with the workload's artefacts, a
 ``sampler.csv`` (board + workload telemetry, see ``bench/sampler.py``) and a
 ``run.meta.json`` (command, exit code, machine state before/after).
@@ -20,6 +26,7 @@ Usage::
     bench/run.py --repeats 3 --duration 300
     bench/run.py --conditions monolith,monolith-ctrl --dry-run
     bench/run.py --scenario bench/scenarios.json --out results/bench
+    bench/run.py --demo --conditions monolith,ros-4node
 """
 
 from __future__ import annotations
@@ -79,6 +86,140 @@ def build_argv(condition: dict[str, object], context: dict[str, str]) -> list[st
     return [str(part) for part in expanded]
 
 
+# ----------------------------------------------------------------------- demo
+def run_demo(scenario: dict[str, object], args: argparse.Namespace) -> int:
+    """Run each condition's artefact pass once, then render the videos.
+
+    Command templates only: this module never imports pipeline code, exactly
+    like the trial loop. The steps are ``run`` (one replay + detections
+    sidecar) then ``render`` (``yolocar.demo``), per condition, plus an
+    optional ``compare`` template for the side-by-side video.
+    """
+    artifacts = scenario.get("artifacts") or {}
+    conditions = artifacts.get("conditions") or {}  # type: ignore[union-attr]
+    if not conditions:
+        raise SystemExit("scenario has no 'artifacts.conditions' block")
+
+    out_root = Path(args.out or artifacts.get("out_dir") or (REPO / "results/demo"))  # type: ignore[union-attr]
+    if not out_root.is_absolute():
+        out_root = (REPO / out_root).resolve()
+
+    wanted = [name.strip() for name in (args.conditions or "").split(",") if name.strip()]
+    base_context = {
+        "python": sys.executable,
+        "repo": str(REPO),
+        "source": str(scenario.get("source", "")),
+        "rotate": str(scenario.get("rotate", 0)),
+        "loops": str(artifacts.get("loops", 1)),  # type: ignore[union-attr]
+        "demo": str(out_root),
+    }
+
+    steps: list[tuple[str, dict[str, object], dict[str, str], Path]] = []
+    for name, condition in conditions.items():  # type: ignore[union-attr]
+        if wanted and name not in wanted:
+            continue
+        if not condition.get("enabled", True):
+            print(f"skip {name}: disabled in scenario", file=sys.stderr)
+            continue
+        directory = out_root / name
+        context = {**base_context, "condition": name, "out": str(directory)}
+        for phase in ("run", "render"):
+            spec = condition.get(phase)
+            if spec:
+                steps.append((f"{name}:{phase}", spec, context, directory / f"{phase}.log"))
+
+    compare = artifacts.get("compare") or {}  # type: ignore[union-attr]
+    render_spec = compare.get("render") if isinstance(compare, dict) else None
+    if render_spec:
+        # The composite consumes the other conditions' artefacts: only build it
+        # when every input condition was actually selected in this invocation.
+        required = list(compare.get("requires") or [])  # type: ignore[union-attr]
+        missing = [name for name in required if name not in dict(
+            (step[0].split(":")[0], True) for step in steps
+        )]
+        if missing:
+            print(
+                f"skip compare: needs {', '.join(missing)} (not selected / disabled)",
+                file=sys.stderr,
+            )
+        else:
+            context = {**base_context, "condition": "compare", "out": str(out_root)}
+            steps.append(("compare:render", render_spec, context, out_root / "compare.log"))
+
+    if not steps:
+        raise SystemExit("nothing to do: no matching artefact conditions")
+
+    if args.dry_run:
+        for label, spec, context, _log in steps:
+            print(f"[dry-run] {label}: {shlex.join(build_argv(spec, context))}", file=sys.stderr)
+        return 0
+
+    out_root.mkdir(parents=True, exist_ok=True)
+    results: list[dict[str, object]] = []
+    failed = 0
+    failed_conditions: set[str] = set()
+    for label, spec, context, log_path in steps:
+        condition_name = label.split(":")[0]
+        if condition_name == "compare" and failed_conditions:
+            print(
+                f"skip {label}: {', '.join(sorted(failed_conditions))} did not complete",
+                file=sys.stderr,
+            )
+            continue
+        command = build_argv(spec, context)
+        env = os.environ.copy()
+        env.update(
+            {
+                str(key): str(expand(str(value), context))
+                for key, value in (spec.get("env") or {}).items()  # type: ignore[union-attr]
+            }
+        )
+        cwd = spec.get("cwd")
+        cwd_path = str((REPO / str(cwd)).resolve()) if cwd else str(REPO)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"--- {label} -> {shlex.join(command)}", file=sys.stderr)
+        started = time.monotonic()
+        with log_path.open("w", encoding="utf-8") as log:
+            returncode = subprocess.call(
+                command, cwd=cwd_path, env=env, stdout=log, stderr=subprocess.STDOUT
+            )
+        wall_s = time.monotonic() - started
+        results.append(
+            {
+                "step": label,
+                "command": command,
+                "returncode": returncode,
+                "wall_s": round(wall_s, 3),
+                "log": str(log_path),
+            }
+        )
+        print(f"    rc={returncode} wall={wall_s:.1f}s", file=sys.stderr)
+        if returncode != 0:
+            failed += 1
+            failed_conditions.add(condition_name)
+            print(f"    see {log_path}", file=sys.stderr)
+
+    (out_root / "run.json").write_text(
+        json.dumps(
+            {
+                "mode": "demo",
+                "scenario": str(args.scenario),
+                "source": str(scenario.get("source", "")),
+                "loops": artifacts.get("loops", 1),  # type: ignore[union-attr]
+                "steps": results,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"{len(results) - failed}/{len(results)} demo steps ok -> {out_root}",
+        file=sys.stderr,
+    )
+    return 1 if failed else 0
+
+
 # ----------------------------------------------------------------------- main
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -102,9 +243,19 @@ def main(argv: list[str] | None = None) -> int:
         "--interval-ms", type=int, default=100, help="sampler interval"
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help=(
+            "run each condition's 'artifacts' block once and render the videos "
+            "(never inside a measured trial)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     scenario = json.loads(args.scenario.read_text(encoding="utf-8"))
+    if args.demo:
+        return run_demo(scenario, args)
     repeats = int(args.repeats or scenario.get("repeats", 3))
     duration = float(args.duration or scenario.get("duration_s", 120))
     out_root = Path(args.out or scenario.get("out_dir") or (REPO / "results/bench"))

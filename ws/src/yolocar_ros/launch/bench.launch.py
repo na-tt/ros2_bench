@@ -61,6 +61,8 @@ def generate_launch_description() -> LaunchDescription:
         _argument('pinned', 'true', 'page-locked host buffers in TensorRT'),
         _argument('trt_log_level', 'warning', 'TensorRT logger verbosity'),
         _argument('records', 'results/ros/records.jsonl', 'per-frame JSONL output'),
+        _argument('detections', '',
+                  'optional per-frame detections JSONL (rendered offline by `yolocar.demo`)'),
         _argument('summary', 'results/ros/summary.json', 'run summary JSON output'),
         _argument('log_level', 'INFO', 'python logger level for the pipeline modules'),
     ]
@@ -88,6 +90,7 @@ def generate_launch_description() -> LaunchDescription:
         'pinned': _typed('pinned', bool),
         'trt_log_level': _typed('trt_log_level', str),
         'records': _typed('records', str),
+        'detections': _typed('detections', str),
         'summary': _typed('summary', str),
         'log_level': _typed('log_level', str),
     }
