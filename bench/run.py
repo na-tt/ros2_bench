@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Interleaved trial orchestrator: runs conditions round-robin and samples them.
+"""Trial orchestrator: expands the scenario matrix and runs it interleaved.
 
 Why interleaved and not "all of A, then all of B": clocks are not pinned and the
 garbage collector is not touched, so a run drifts by several percent as the
-machine warms. Sequential blocks attribute that drift to whichever condition
-ran second. Round-robin with alternating order spreads it across conditions,
-and a duplicated *control* condition (same command twice) measures the noise
-floor directly, so any real difference can be quoted against it.
+machine warms, and sequential blocks attribute that drift to whichever cell ran
+second. Cells are therefore run in passes -- every cell once per pass -- with a
+zig-zag inside blocks and a seeded shuffle across them, so the machine state a
+cell inherits is randomised rather than fixed. The one cell that appears in every
+pass is the anchor: comparing against it inside a pass is what makes a delta
+comparable, and it replaces the duplicate control cell the design used to pay for.
+
+Trials are budgeted in frames (that is what the percentiles are computed from)
+with a time ceiling derived from that budget (the machine state is a function of
+elapsed time), see ``trial_budget``.
 
 ``--demo`` is a separate mode: instead of trials it runs each condition's
 ``artifacts`` block once (one replay of the clip, detections sidecar on, no
@@ -23,8 +29,8 @@ template, so the monolith and a ROS 2 launch file are configured the same way.
 
 Usage::
 
-    bench/run.py --repeats 3 --duration 300
-    bench/run.py --conditions monolith,monolith-ctrl --dry-run
+    bench/run.py --repeats 3 --conditions monolith-720p-n,ros-4node-720p-n
+    bench/run.py --dry-run                      # the whole matrix, planned
     bench/run.py --scenario bench/scenarios.json --out results/bench
     bench/run.py --demo --conditions monolith,ros-4node
 """

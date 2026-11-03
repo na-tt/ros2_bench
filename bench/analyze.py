@@ -9,20 +9,26 @@ Reads the artefacts written by ``bench/run.py``::
 
 and prints (and optionally writes) a markdown report.
 
-Window selection happens *here*, not during the run: ``--from``/``--to`` are
-seconds relative to the first recorded frame, so the same data can be
-re-examined with a different steady-state window without repeating the
-measurement. The default is the whole trial.
+Window selection happens *here*, not during the run: ``--settle`` seconds after
+the first recorded frame are dropped (startup and the thermal ramp), then
+``--frames`` frames are taken, so the same data can be re-examined with a
+different window without repeating the measurement. Both default to the
+scenario's ``trial`` block.
 
-Reported per condition: latency percentiles, throughput, per-stage medians,
-CPU milliseconds per frame (and how many cores that is), PSS, GPU duty cycle,
-board power and joules per frame, peak temperature -- plus the spread across
-repeats, which is the noise floor any difference must beat.
+Reported per cell: latency percentiles, throughput, per-stage medians, CPU
+milliseconds per frame (and how many cores that is), PSS, GPU duty cycle, board
+power and joules per frame, peak temperature -- as mean ± sample std across
+passes, with the per-pass values printed underneath.
+
+Claims are not made from those means: every cell is also differenced against the
+anchor *within each pass* and reported with a 95 % CI, because two means measured
+hours apart share no machine state and the board drifts more than most effects.
 
 Usage::
 
-    bench/analyze.py                       # whole trials
-    bench/analyze.py --from 30 --to 240    # steady-state window
+    bench/analyze.py                       # scenario window, deltas vs anchor
+    bench/analyze.py --settle 20 --frames 1500
+    bench/analyze.py --from 30 --to 240    # legacy: absolute seconds, no cap
     bench/analyze.py --md results/report.md --json results/report.json
     bench/analyze.py --timeline-out results/report/timeline
 """
