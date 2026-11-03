@@ -156,6 +156,7 @@ def build_summary(
     latency_ms: list[float],
     acquisition_ms: list[float],
     preprocess_ms: list[float],
+    preprocess_ops: Mapping[str, list[float]] | None = None,
     inference_ms: list[float],
     postprocess_ms: list[float],
     transport_ms: list[float],
@@ -163,6 +164,7 @@ def build_summary(
     detections_by_class: dict[str, int],
     records_path: Path | None,
     detections_path: Path | None = None,
+    pre_ops: list[str] | None = None,
 ) -> dict[str, object]:
     """Assemble the ``summary.json`` payload (same shape as the monolith)."""
     fps = (frames / wall_time_s) if frames and wall_time_s > 0 else 0.0
@@ -186,6 +188,18 @@ def build_summary(
         'stage_ms': {
             'acquisition': latency_stats(acquisition_ms),
             'preprocess': latency_stats(preprocess_ms),
+            #: Only present when a conditioning chain ran; the sum of these
+            #: means is ``stage_ms.preprocess``.
+            **(
+                {
+                    'preprocess_ops': {
+                        name: latency_stats(values)
+                        for name, values in preprocess_ops.items()
+                    }
+                }
+                if preprocess_ops
+                else {}
+            ),
             'inference': latency_stats(inference_ms),
             'postprocess': latency_stats(postprocess_ms),
             'presentation': {},
@@ -207,6 +221,7 @@ def build_summary(
             'conf_threshold': config.conf_threshold,
             'iou_threshold': config.iou_threshold,
             'image_size': config.image_size,
+            'pre_ops': list(pre_ops or []),
             'target_class_ids': list(config.target_class_ids),
             'agnostic_nms': config.agnostic_nms,
             'device': config.device,

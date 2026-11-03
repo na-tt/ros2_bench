@@ -1,20 +1,23 @@
 """
-Message <-> numpy conversions for the four-node chain.
+Message <-> numpy conversions for the node chain.
 
 All pipeline logic stays in :mod:`yolocar`; this module only moves the values
-between the stage functions and the wire types in ``yolocar_interfaces``. Raw
-tensor payloads are host-order (little-endian) bytes, exactly what
-``numpy.ndarray.tobytes()`` produces on this board.
+between the stage functions and the wire types in ``yolocar_interfaces``.
+
+Every hop that carries pixels carries an ``ImageFrame`` (BGR uint8, source
+geometry): the model contract -- letterbox, colour order, layout, dtype -- is
+applied by the inference node and never travels, so the wire has no tensor type
+and no payload is fixed in size regardless of the source resolution.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from yolocar.postprocessing import Candidates
 from yolocar.model_input import LetterboxInfo
+from yolocar.postprocessing import Candidates
 
-from yolocar_interfaces.msg import CandidatesFrame, FrameMeta, ImageFrame, TensorFrame
+from yolocar_interfaces.msg import CandidatesFrame, FrameMeta, ImageFrame
 
 BGR8 = 'bgr8'
 
@@ -40,7 +43,7 @@ def frame_meta(
     return meta
 
 
-def letterbox_from_message(msg: TensorFrame | CandidatesFrame) -> LetterboxInfo:
+def letterbox_from_message(msg: CandidatesFrame) -> LetterboxInfo:
     """Rebuild the letterbox geometry stage 6 needs from its wire form."""
     return LetterboxInfo(
         scale=float(msg.scale),
@@ -94,41 +97,6 @@ def frame_from_image(msg: ImageFrame) -> np.ndarray:
             f'({msg.width}x{msg.height}x{msg.channels})'
         )
     return data.reshape(int(msg.height), int(msg.width), int(msg.channels))
-
-
-# --------------------------------------------------------------------- tensor
-def tensor_frame(
-    tensor: np.ndarray, meta: FrameMeta, letterbox: LetterboxInfo
-) -> TensorFrame:
-    """Engine-ready NCHW tensor + letterbox geometry -> ``TensorFrame``."""
-    array = np.ascontiguousarray(tensor)
-    if array.ndim != 4 or array.shape[0] != 1 or array.shape[1] != 3:
-        raise ValueError(f'expected a 1x3xHxW tensor, got {array.shape}')
-
-    msg = TensorFrame()
-    msg.meta = meta
-    msg.height = int(array.shape[2])
-    msg.width = int(array.shape[3])
-    msg.dtype = array.dtype.name
-    msg.scale = float(letterbox.scale)
-    msg.pad_x = int(letterbox.pad_x)
-    msg.pad_y = int(letterbox.pad_y)
-    msg.original_height = int(letterbox.original_shape[0])
-    msg.original_width = int(letterbox.original_shape[1])
-    msg.data = array.tobytes()
-    return msg
-
-
-def tensor_from_frame(msg: TensorFrame) -> np.ndarray:
-    """``TensorFrame`` -> read-only 1x3xHxW view of the engine input tensor."""
-    dtype = np.dtype(msg.dtype)
-    expected = 3 * int(msg.height) * int(msg.width)
-    data = np.frombuffer(msg.data, dtype=dtype)
-    if data.size != expected:
-        raise ValueError(
-            f'tensor payload is {data.size} {dtype} elements, expected {expected}'
-        )
-    return data.reshape(1, 3, int(msg.height), int(msg.width))
 
 
 # ----------------------------------------------------------------- candidates

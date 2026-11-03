@@ -3,8 +3,8 @@
 import numpy as np
 import pytest
 
-from yolocar.postprocessing import Candidates
 from yolocar.model_input import LetterboxInfo
+from yolocar.postprocessing import Candidates
 
 from yolocar_interfaces.msg import FrameMeta
 
@@ -15,8 +15,6 @@ from yolocar_ros.conversions import (
     frame_meta,
     image_frame,
     letterbox_from_message,
-    tensor_frame,
-    tensor_from_frame,
 )
 
 
@@ -80,34 +78,6 @@ def test_frame_from_image_rejects_padded_rows() -> None:
         frame_from_image(msg)
 
 
-def test_tensor_frame_round_trips_float32_tensor_and_geometry() -> None:
-    rng = np.random.default_rng(1)
-    tensor = rng.random((1, 3, 640, 640), dtype=np.float32)
-    letterbox = _letterbox()
-
-    msg = tensor_frame(tensor, _meta(), letterbox)
-    assert (msg.height, msg.width) == (640, 640)
-    assert msg.dtype == 'float32'
-    assert msg.scale == pytest.approx(0.5)
-    assert (msg.pad_x, msg.pad_y) == (0, 140)
-    assert (msg.original_height, msg.original_width) == (720, 1280)
-
-    restored = tensor_from_frame(msg)
-    assert restored.dtype == np.float32
-    assert restored.shape == (1, 3, 640, 640)
-    np.testing.assert_array_equal(restored, tensor)
-
-    info = letterbox_from_message(msg)
-    assert info == letterbox
-
-
-def test_tensor_from_frame_rejects_wrong_dtype_payload() -> None:
-    msg = tensor_frame(np.zeros((1, 3, 4, 4), dtype=np.float32), _meta(), _letterbox())
-    msg.dtype = 'float16'  # payload is still float32-sized
-    with pytest.raises(ValueError):
-        tensor_from_frame(msg)
-
-
 def test_candidates_frame_round_trips_arrays() -> None:
     boxes = np.array([[1.0, 2.0, 30.0, 40.0], [5.0, 6.0, 7.0, 8.0]], dtype=np.float32)
     scores = np.array([0.9, 0.25], dtype=np.float32)
@@ -115,6 +85,9 @@ def test_candidates_frame_round_trips_arrays() -> None:
     candidates = Candidates(boxes=boxes, scores=scores, class_ids=class_ids)
 
     msg = candidates_frame(candidates, _meta(), _letterbox(), engine_loaded_t=99.5)
+    # The geometry is echoed on the candidates message: stage 6 needs it and the
+    # tensor that produced it never leaves the inference node.
+    assert letterbox_from_message(msg) == _letterbox()
     assert len(msg.boxes) == 8
     assert len(msg.scores) == 2
     assert len(msg.class_ids) == 2

@@ -160,6 +160,14 @@ def test_parse_accepts_a_single_string() -> None:
     assert [op.name for op in parse("clahe")] == ["clahe"]
 
 
+def test_parse_splits_a_semicolon_separated_string() -> None:
+    """The form a ROS parameter or shell argument can carry."""
+    chain = parse("clahe;bilateral:d=9,sigma_color=50;gamma:gamma=0.8")
+    assert [op.name for op in chain] == ["clahe", "bilateral", "gamma"]
+    assert chain[1].params == {"d": 9.0, "sigma_color": 50.0}
+    assert parse("clahe;") == parse("clahe")
+
+
 @pytest.mark.parametrize(
     ("spec", "message"),
     [

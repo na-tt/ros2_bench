@@ -1,8 +1,12 @@
 """
-Stage 3 node: TensorRT invocation + detect-head decoding.
+Stage 3 node: model input contract + TensorRT invocation + decode.
 
 The node owns the engine (one node per engine: TensorRT execution contexts are
-not thread-safe, and a single-threaded executor serialises the callbacks).
+not thread-safe, and a single-threaded executor serialises the callbacks), and
+with it the *input contract*: :func:`yolocar.model_input.prepare` letterboxes
+the incoming BGR frame, converts it to RGB NCHW and casts it to the engine's
+dtype. That is why ``imgsz``/``input_dtype`` are not launch arguments here: the
+engine is the source of truth, so a mismatch cannot be passed in by hand.
 
 The stage boundary is *after* the decode/threshold step:
 :func:`yolocar.inference.decode_predictions` +
@@ -10,9 +14,9 @@ The stage boundary is *after* the decode/threshold step:
 publishes :class:`yolocar.postprocessing.Candidates` instead of the raw
 ``(1, 84, 8400)`` detect head. Serialising a ~2.8 MB raw head per frame would
 dominate the measurement and is not how a real ROS 2 pipeline would split the
-stages. Consequence: ``infer_ms`` here includes decode/threshold, so compare
-``infer + post`` as one block against the monolith, not the two buckets
-individually.
+stages. Consequence: ``infer_ms`` here includes the contract and the
+decode/threshold, so compare ``infer + post`` as one block against the
+monolith, not the two buckets individually.
 """
 
 from __future__ import annotations
@@ -27,23 +31,20 @@ from rclpy.node import Node
 
 from yolocar.config import COCO_CLASS_NAMES, YoloCarConfig
 from yolocar.inference import decode_predictions, first_output, infer
+from yolocar.model_input import prepare
 from yolocar.postprocessing import select_candidates
 from yolocar.processor import YoloCarProcessor
 
-from yolocar_interfaces.msg import CandidatesFrame, TensorFrame
+from yolocar_interfaces.msg import CandidatesFrame, ImageFrame
 
 from . import qos, topics
-from .conversions import (
-    candidates_frame,
-    letterbox_from_message,
-    tensor_from_frame,
-)
+from .conversions import candidates_frame, frame_from_image
 
 LOGGER = logging.getLogger('yolocar')
 
 
 class InferenceNode(Node):
-    """Load the engine once, then turn each ``TensorFrame`` into candidates."""
+    """Load the engine once, then turn each ``ImageFrame`` into candidates."""
 
     def __init__(self) -> None:
         super().__init__('yolocar_inference')
@@ -54,7 +55,10 @@ class InferenceNode(Node):
             ).value
         )
         device = int(self.declare_parameter('device', 0).value)
+        # Dynamic-shape hint only: a static engine's shape wins, and the dtype
+        # is always read from the engine (see yolocar.model_input.InputSpec).
         image_size = int(self.declare_parameter('imgsz', 640).value)
+        self.pad_value = int(self.declare_parameter('pad_value', 114).value)
         pinned = bool(self.declare_parameter('pinned', True).value)
         trt_log_level = str(
             self.declare_parameter('trt_log_level', 'warning').value
@@ -82,28 +86,27 @@ class InferenceNode(Node):
         self.engine_loaded_t = time.monotonic()
         self.get_logger().info(
             f'engine ready after {self.engine_loaded_t - t_load:.2f} s '
-            f'(input={self.processor.input_spec.dtype} '
-            f'{self.processor.input_spec.shape}, {len(COCO_CLASS_NAMES)} classes)'
+            f'(contract: {self.processor.input_spec.dtype} '
+            f'{self.processor.input_spec.shape}, pad={self.pad_value}, '
+            f'{len(COCO_CLASS_NAMES)} classes)'
         )
 
         self.publisher = self.create_publisher(
             CandidatesFrame, topics.CANDIDATES_TOPIC, qos.latest()
         )
         self.create_subscription(
-            TensorFrame, topics.TENSOR_TOPIC, self._on_tensor, qos.latest()
+            ImageFrame, topics.INPUT_TOPIC, self._on_frame, qos.latest()
         )
 
-    def _on_tensor(self, msg: TensorFrame) -> None:
+    def _on_frame(self, msg: ImageFrame) -> None:
         t0 = time.monotonic()
-        tensor = tensor_from_frame(msg)
+        frame = frame_from_image(msg)
         spec = self.processor.input_spec
-        if tensor.dtype != spec.dtype or tensor.shape[2:] != spec.shape:
-            raise ValueError(
-                'the preprocessing node produced '
-                f'{tensor.dtype} {tensor.shape}, but the engine expects '
-                f'{spec.dtype} (1, 3, {spec.height}, {spec.width}); '
-                'check the imgsz/input_dtype launch arguments'
-            )
+        # The contract: letterbox + RGB HWC->NCHW + dtype, all read off the
+        # engine this node owns, so there is nothing to disagree with.
+        tensor, letterbox = prepare(
+            frame, spec.shape, spec.dtype, pad_value=self.pad_value
+        )
 
         outputs = infer(self.processor.engine, tensor)
         boxes_cxcywh, class_scores = decode_predictions(
@@ -123,7 +126,7 @@ class InferenceNode(Node):
             candidates_frame(
                 candidates,
                 meta,
-                letterbox_from_message(msg),
+                letterbox,
                 engine_loaded_t=self.engine_loaded_t,
             )
         )

@@ -116,11 +116,15 @@ def parse(spec: str | Sequence[str] | None) -> tuple[Op, ...]:
     strings. Each element is ``name`` or ``name:key=value,key2=value2``, e.g.
     ``("clahe:clip_limit=3.0", "bilateral:d=9")``. Both forms exist so the same
     chain can come from a CLI flag, a launch argument or a scenario file.
+
+    A single string may carry several ops separated by ``;`` -- the form a ROS
+    parameter or a shell argument can express, since ``,`` is already the
+    parameter separator: ``"clahe;bilateral:d=9"``.
     """
     if spec is None:
         return ()
     if isinstance(spec, str):
-        items: Sequence[str] = (spec,) if spec.strip() else ()
+        items: Sequence[str] = tuple(spec.split(";")) if spec.strip() else ()
     else:
         items = tuple(spec)
 

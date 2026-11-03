@@ -32,6 +32,8 @@ from yolocar.postprocessing import (
     to_detections,
 )
 
+from yolocar.preprocessing import describe, parse
+
 from yolocar_interfaces.msg import CandidatesFrame, FrameAck
 
 from . import qos, topics
@@ -73,6 +75,9 @@ class PostprocessingNode(Node):
         log_level = str(self.declare_parameter('log_level', 'INFO').value)
         LOGGER.setLevel(log_level.upper())
 
+        # Provenance only: this node never runs the chain, but the summary it
+        # writes must say which one ran (the monolith's config block does).
+        self.pre_ops = describe(parse(str(self.declare_parameter('pre_ops', '').value)))
         self.config = YoloCarConfig(
             model_path=Path(model),
             device=int(self.declare_parameter('device', 0).value),
@@ -136,6 +141,7 @@ class PostprocessingNode(Node):
         self._latency_ms: list[float] = []
         self._acquisition_ms: list[float] = []
         self._preprocess_ms: list[float] = []
+        self._preprocess_ops: dict[str, list[float]] = {}
         self._inference_ms: list[float] = []
         self._postprocess_ms: list[float] = []
         self._transport_ms: list[float] = []
@@ -182,6 +188,9 @@ class PostprocessingNode(Node):
         self._latency_ms.append(latency_ms)
         self._acquisition_ms.append(float(meta.acq_ms))
         self._preprocess_ms.append(float(meta.pre_ms))
+        pre_ops = dict(zip(meta.pre_op_names, meta.pre_op_ms))
+        for name, value in pre_ops.items():
+            self._preprocess_ops.setdefault(name, []).append(float(value))
         self._inference_ms.append(float(meta.infer_ms))
         self._postprocess_ms.append(post_ms)
         self._transport_ms.append(transport_ms)
@@ -204,6 +213,13 @@ class PostprocessingNode(Node):
                 't_mono': round(float(meta.t_mono), 6),
                 'acq_ms': round(float(meta.acq_ms), 4),
                 'pre_ms': round(float(meta.pre_ms), 4),
+                # Optional stage-2 breakdown, as in the monolith: absent when
+                # the chain is empty, so the record stays comparable.
+                **(
+                    {'pre_ops': {k: round(v, 4) for k, v in pre_ops.items()}}
+                    if pre_ops
+                    else {}
+                ),
                 'infer_ms': round(float(meta.infer_ms), 4),
                 'post_ms': round(post_ms, 4),
                 'present_ms': 0.0,
@@ -266,11 +282,13 @@ class PostprocessingNode(Node):
             latency_ms=self._latency_ms,
             acquisition_ms=self._acquisition_ms,
             preprocess_ms=self._preprocess_ms,
+            preprocess_ops=self._preprocess_ops,
             inference_ms=self._inference_ms,
             postprocess_ms=self._postprocess_ms,
             transport_ms=self._transport_ms,
             detections_per_frame=self._detections_per_frame,
             detections_by_class=self._detections_by_class,
+            pre_ops=self.pre_ops,
             records_path=self.config.records_path,
             detections_path=self.config.detections_path,
         )

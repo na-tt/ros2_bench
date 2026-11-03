@@ -1,14 +1,20 @@
 """
-Stage 2 node: letterbox + BGR->RGB NCHW tensor.
+Stage 2 node: image conditioning at source resolution.
 
-All image logic is :func:`yolocar.model_input.prepare`; this node only
-deserialises the frame, calls it, and publishes the tensor together with the
-letterbox geometry the coordinate-adaptation stage will need later.
+All image logic is :func:`yolocar.preprocessing.condition`; this node
+deserialises the frame, applies the configured chain and publishes the result
+as another ``ImageFrame`` -- same geometry, still BGR uint8, so this stage can
+be split into more nodes without changing the wire type.
 
-The engine's input dtype cannot be queried without loading the engine (which
-is the inference node's job), so the launch file passes ``imgsz`` and
-``input_dtype`` here. The inference node validates them against the real engine
-contract and fails loudly on a mismatch instead of silently casting.
+The chain is data, not code: ``pre_ops:='clahe;bilateral:d=9'`` (see
+:func:`yolocar.preprocessing.parse`). Empty means identity: the node then
+forwards the decoded frame untouched, which is what every measurement taken
+before this stage existed recorded.
+
+The engine's input contract -- letterbox, colour order, NCHW, dtype -- is *not*
+applied here. It belongs to the inference node, which owns the engine and can
+therefore read the real ``InputSpec`` instead of taking ``imgsz`` and
+``input_dtype`` on trust from a launch argument.
 """
 
 from __future__ import annotations
@@ -16,60 +22,59 @@ from __future__ import annotations
 import logging
 import time
 
-import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 
-from yolocar.model_input import prepare
+from yolocar.preprocessing import condition, describe, parse
 
-from yolocar_interfaces.msg import ImageFrame, TensorFrame
+from yolocar_interfaces.msg import ImageFrame
 
 from . import qos, topics
-from .conversions import frame_from_image, tensor_frame
+from .conversions import frame_from_image, image_frame
 
 LOGGER = logging.getLogger('yolocar')
 
 
 class PreprocessingNode(Node):
-    """Turn each ``ImageFrame`` into a ``TensorFrame``."""
+    """Turn each ``ImageFrame`` into a conditioned ``ImageFrame``."""
 
     def __init__(self) -> None:
         super().__init__('yolocar_preprocessing')
 
-        self.image_size = int(self.declare_parameter('imgsz', 640).value)
-        self.input_dtype = np.dtype(
-            str(self.declare_parameter('input_dtype', 'float32').value)
-        )
-        self.pad_value = int(self.declare_parameter('pad_value', 114).value)
+        spec = str(self.declare_parameter('pre_ops', '').value)
         log_level = str(self.declare_parameter('log_level', 'INFO').value)
         LOGGER.setLevel(log_level.upper())
 
+        self.chain = parse(spec)
+        self.get_logger().info(
+            'preprocessing: '
+            + (', '.join(describe(self.chain)) or 'no conditioning ops (identity)')
+        )
+
         self.publisher = self.create_publisher(
-            TensorFrame, topics.TENSOR_TOPIC, qos.latest()
+            ImageFrame, topics.INPUT_TOPIC, qos.latest()
         )
         self.create_subscription(
             ImageFrame, topics.FRAME_TOPIC, self._on_frame, qos.latest()
-        )
-        self.get_logger().info(
-            f'preprocessing: {self.image_size}x{self.image_size} -> '
-            f'(1, 3, {self.image_size}, {self.image_size}) {self.input_dtype}'
         )
 
     def _on_frame(self, msg: ImageFrame) -> None:
         t0 = time.monotonic()
         frame = frame_from_image(msg)
-        tensor, letterbox = prepare(
-            frame,
-            (self.image_size, self.image_size),
-            self.input_dtype,
-            pad_value=self.pad_value,
-        )
+        conditioned, op_ms = condition(frame, self.chain)
         t1 = time.monotonic()
 
         meta = msg.meta
-        meta.pre_ms = (t1 - t0) * 1e3
-        self.publisher.publish(tensor_frame(tensor, meta, letterbox))
+        # Additive, not overwritten: when the stage is split over several
+        # nodes each one adds its own share, so pre_ms is the whole stage
+        # either way and the two configurations stay comparable.
+        meta.pre_ms = float(meta.pre_ms) + (t1 - t0) * 1e3
+        # Parallel arrays instead of a dict: fixed IDL, no map type, and the
+        # terminal node rebuilds the per-op map the records contract expects.
+        meta.pre_op_names = list(meta.pre_op_names) + list(op_ms)
+        meta.pre_op_ms = list(meta.pre_op_ms) + list(op_ms.values())
+        self.publisher.publish(image_frame(conditioned, meta))
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -7,7 +7,6 @@ find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/FrameMeta.msg"
   "msg/ImageFrame.msg"
-  "msg/TensorFrame.msg"
   "msg/CandidatesFrame.msg"
   "msg/FrameAck.msg"
 )

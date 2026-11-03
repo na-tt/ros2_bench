@@ -55,8 +55,12 @@ def generate_launch_description() -> LaunchDescription:
                   'TensorRT engine deserialized by the inference node'),
         _argument('conf', 0.25, 'candidate confidence threshold'),
         _argument('iou', 0.45, 'NMS IoU threshold'),
-        _argument('imgsz', 640, 'engine input size (square)'),
-        _argument('input_dtype', 'float32', 'engine input dtype: float32/float16/uint8'),
+        _argument('imgsz', 640,
+                  'dynamic-shape hint for a dynamic engine; a static engine wins, '
+                  'and the input dtype is always read from the engine'),
+        _argument('pre_ops', '',
+                  'stage-2 conditioning chain, ";" separated '
+                  '(e.g. "clahe;bilateral:d=9"); empty = identity'),
         _argument('device', 0, 'CUDA device ordinal'),
         _argument('classes', '0,1,2,3,5,6,7,9,11,12', 'comma separated COCO ids kept'),
         _argument('agnostic_nms', 'false', 'merge boxes across classes'),
@@ -85,7 +89,7 @@ def generate_launch_description() -> LaunchDescription:
         'conf': _typed('conf', float),
         'iou': _typed('iou', float),
         'imgsz': _typed('imgsz', int),
-        'input_dtype': _typed('input_dtype', str),
+        'pre_ops': _typed('pre_ops', str),
         'device': _typed('device', int),
         'classes': _typed('classes', str),
         'agnostic_nms': _typed('agnostic_nms', bool),

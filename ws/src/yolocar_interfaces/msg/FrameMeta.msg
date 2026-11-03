@@ -9,5 +9,12 @@ uint64 seq        # monotonic frame counter, across replays
 uint32 loop       # 0-based replay index of the source
 float64 t_mono    # time.monotonic() at capture, seconds (CLOCK_MONOTONIC)
 float64 acq_ms    # stage 1: decode + rotation correction
-float64 pre_ms    # stage 2: letterbox + BGR->RGB NCHW tensor
-float64 infer_ms  # stage 3: engine invocation + detect-head decode/threshold
+float64 pre_ms    # stage 2: conditioning chain at source resolution
+float64 infer_ms  # stage 3: model contract + engine + decode/threshold
+
+# Stage 2 breakdown, parallel arrays in chain order (empty when it ran none).
+# The terminal node rebuilds the optional `pre_ops` map of the records
+# contract from them; carried in the message so a frame split across several
+# filter nodes still reports one per-op breakdown instead of one node's share.
+string[] pre_op_names
+float64[] pre_op_ms
