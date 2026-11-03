@@ -136,13 +136,19 @@ tail -f results/full-run.log
 ### 4. Analyse (window chosen here, not during the run)
 
 ```bash
-bench/analyze.py --from 30 --to 170 --md results/report.md --json results/report.json
-bench/analyze.py --from 30 --to 170 --timeline-out results/report/timeline
+bench/analyze.py --md results/report.md --json results/report.json
+bench/analyze.py --timeline-out results/report/timeline
 ```
 
-`--from`/`--to` are seconds after the **first recorded frame**, so startup and
-settling stay in the data and you can re-window without re-measuring (drop
-`--from/--to` to use whole trials). `--dir` points at a different artefact root.
+The window defaults come from the scenario's `trial` block: drop `settle_s`
+seconds after the **first recorded frame** (startup and the thermal ramp), then
+take `analysis_frames` frames. So every cell reports percentiles over the same
+`n` while the settling skip stays in the physics' unit. Startup and settling stay
+in the recorded data, so a different window is a re-analysis, not a re-measure:
+`--settle S`, `--frames N`, or the legacy `--from/--to` (seconds after the first
+frame, no frame cap). A cell that came up short prints a warning naming the
+likely cause (an over-optimistic `fps_hint`). `--dir` points at another artefact
+root.
 
 `--timeline-out DIR` writes one figure per condition (`timeline-<condition>.png`)
 from that condition's first usable trial: latency stacked by stage, acquisition
@@ -167,6 +173,8 @@ rendered demo videos to the report when any exist.
 | `--demo` | `run.py` | run the `artifacts` block instead of trials (see *Demo material*) |
 | `--dry-run` | `run.py` | print the expanded commands and exit |
 | `--scenario FILE` | `run.py` | alternate condition set |
+| `--settle` / `--frames` | `analyze.py` | window: settling seconds, then a frame count (defaults from `trial`) |
+| `--from` / `--to` | `analyze.py` | legacy absolute window in seconds, no frame cap |
 | `--dir` / `--records` / `--sampler` | `analyze.py` | where to read trials from |
 | `--timeline-out DIR` | `analyze.py` | one stage-stacked latency figure per condition |
 | `--demo-dir DIR` | `analyze.py` | list rendered demo videos in the report |

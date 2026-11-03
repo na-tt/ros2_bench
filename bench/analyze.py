@@ -99,11 +99,49 @@ def _median(values: Iterable[float]) -> float | None:
     return statistics.median(data) if data else None
 
 
+def window_indices(
+    records: list[dict[str, Any]],
+    *,
+    settle_s: float | None = None,
+    frames: int | None = None,
+    to_s: float | None = None,
+) -> tuple[int, int]:
+    """Half-open ``(start, stop)`` slice selecting the analysis window.
+
+    Two knobs with two different jobs: ``settle_s`` drops the thermal/clock ramp
+    (a property of elapsed time, so it is the same number for every cell), and
+    ``frames`` then takes a fixed count (a property of the statistics, so every
+    cell reports percentiles from the same n even when cells differ 4x in speed).
+    ``to_s`` is the legacy absolute end of a time window and is kept for
+    re-analysing old trials.
+    """
+    if not records:
+        return 0, 0
+    t_first = records[0]["t_mono"]
+    start = t_first + (settle_s or 0.0)
+    low = len(records)
+    for index, record in enumerate(records):
+        if record["t_mono"] >= start:
+            low = index
+            break
+    high = len(records)
+    if to_s is not None:
+        end = t_first + to_s
+        for index in range(low, len(records)):
+            if records[index]["t_mono"] > end:
+                high = index
+                break
+    if frames:
+        high = min(high, low + int(frames))
+    return low, high
+
+
 # ---------------------------------------------------------------------- trials
 def summarise_trial(
     trial_dir: Path,
     *,
-    from_s: float | None,
+    settle_s: float | None,
+    frames: int | None,
     to_s: float | None,
     records_name: str,
     sampler_name: str,
@@ -120,27 +158,27 @@ def summarise_trial(
     if meta.get("returncode") not in (None, 0):
         return {"condition": trial_dir.parent.name, "repeat": trial_dir.name, "failed": True}
 
-    t_first = records[0]["t_mono"]
-    start = t_first + (from_s or 0.0)
-    end = t_first + to_s if to_s is not None else float("inf")
-    window = [record for record in records if start <= record["t_mono"] <= end]
+    low, high = window_indices(records, settle_s=settle_s, frames=frames, to_s=to_s)
+    window = records[low:high]
     if not window:
         return None
 
+    count = len(window)
     latency = [record["latency_ms"] for record in window]
-    frames = len(window)
     span = window[-1]["t_mono"] - window[0]["t_mono"]
-    throughput = frames / span if span > 0 else 0.0
+    throughput = count / span if span > 0 else 0.0
 
     result: dict[str, Any] = {
         "condition": trial_dir.parent.name,
         "repeat": trial_dir.name,
-        "frames": frames,
+        "frames": count,
+        "requested_frames": int(frames) if frames else None,
+        "window_short": bool(frames) and count < int(frames),
         "window_s": round(span, 3),
         "replays": max(record["loop"] for record in window) - window[0]["loop"] + 1,
         "latency": _percentiles(latency),
         "fps": throughput,
-        "detections_per_frame": sum(record["n_det"] for record in window) / frames,
+        "detections_per_frame": sum(record["n_det"] for record in window) / count,
         "stage_ms": {
             key: _median(record[key] for record in window)
             for key in ("acq_ms", "pre_ms", "infer_ms", "post_ms")
@@ -161,7 +199,7 @@ def summarise_trial(
         cpu = [row.get("work_cpu_ms") for row in samples if row.get("work_cpu_ms") is not None]
         if len(cpu) >= 2:
             cpu_used = max(cpu) - min(cpu)
-            result["cpu_ms_per_frame"] = cpu_used / frames
+            result["cpu_ms_per_frame"] = cpu_used / count
             result["cores_used"] = cpu_used / (span * 1000.0) if span > 0 else None
         result["pss_mb"] = _median(
             row.get("work_peak_pss_mb") or row.get("work_peak_rss_mb") for row in samples
@@ -184,14 +222,15 @@ def summarise_trial(
             result["power_w"] = _median(watts)
             energy = _energy_j(times, watts)
             result["joules"] = energy
-            result["joules_per_frame"] = energy / frames
+            result["joules_per_frame"] = energy / count
     return result
 
 
 def collect(
     root: Path,
     *,
-    from_s: float | None,
+    settle_s: float | None,
+    frames: int | None,
     to_s: float | None,
     records_name: str,
     sampler_name: str,
@@ -202,7 +241,8 @@ def collect(
             continue
         trial = summarise_trial(
             trial_dir,
-            from_s=from_s,
+            settle_s=settle_s,
+            frames=frames,
             to_s=to_s,
             records_name=records_name,
             sampler_name=sampler_name,
@@ -401,7 +441,8 @@ def _stack(axes, seconds: list[float], records: list[dict[str, Any]], stages) ->
 def plot_timelines(
     root: Path,
     *,
-    from_s: float | None,
+    settle_s: float | None,
+    frames: int | None,
     to_s: float | None,
     out_dir: Path,
     records_name: str,
@@ -461,9 +502,11 @@ def plot_timelines(
                     label="acquisition (excluded from latency)",
                 )
 
-            window_end = seconds[-1] if to_s is None else to_s
-            start = from_s or 0.0
-            if start > 0.0 or to_s is not None:
+            low, high = window_indices(
+                records, settle_s=settle_s, frames=frames, to_s=to_s
+            )
+            if low < high and (low > 0 or high < len(records)):
+                start, window_end = seconds[low], seconds[high - 1]
                 for axes in (top, detail):
                     axes.axvspan(start, window_end, color="0.9", zorder=0)
                 top.plot([], [], color="0.9", linewidth=6, label="analysis window")
@@ -519,12 +562,36 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dir", type=Path, default=REPO / "results/bench")
     parser.add_argument(
-        "--from", dest="from_s", type=float, default=None,
-        help="start of the analysis window, seconds after the first frame",
+        "--scenario",
+        type=Path,
+        default=Path(__file__).resolve().with_name("scenarios.json"),
+        help="read the default settle/frames window from this scenario's `trial` block",
     )
     parser.add_argument(
-        "--to", dest="to_s", type=float, default=None,
-        help="end of the analysis window, seconds after the first frame",
+        "--settle",
+        type=float,
+        default=None,
+        help="seconds after the first frame treated as settling (default: trial.settle_s)",
+    )
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=None,
+        help="frames of analysis window after the settling (default: trial.analysis_frames)",
+    )
+    parser.add_argument(
+        "--from",
+        dest="from_s",
+        type=float,
+        default=None,
+        help="legacy: start the window this many seconds after the first frame",
+    )
+    parser.add_argument(
+        "--to",
+        dest="to_s",
+        type=float,
+        default=None,
+        help="end the window this many seconds after the first frame",
     )
     parser.add_argument("--records", default="records.jsonl")
     parser.add_argument("--sampler", default="sampler.csv")
@@ -544,9 +611,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    defaults: dict[str, Any] = {}
+    try:
+        scenario = json.loads(args.scenario.read_text(encoding="utf-8"))
+        defaults = dict(scenario.get("trial") or {})
+    except (OSError, ValueError):
+        defaults = {}
+    settle_s = args.from_s if args.from_s is not None else args.settle
+    if settle_s is None:
+        settle_s = defaults.get("settle_s")
+    window_frames = args.frames if args.frames is not None else defaults.get("analysis_frames")
+
     trials = collect(
         args.dir,
-        from_s=args.from_s,
+        settle_s=settle_s,
+        frames=window_frames,
         to_s=args.to_s,
         records_name=args.records,
         sampler_name=args.sampler,
@@ -561,11 +640,27 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     report = aggregate(trials)
-    window = (
-        f"{args.from_s or 0:g}s → "
-        + ("end" if args.to_s is None else f"{args.to_s:g}s")
-        + " after the first frame"
-    )
+    spans = [trial["window_s"] for trial in trials if trial.get("window_s")]
+    span_note = f" (median span {statistics.median(spans):.1f}s)" if spans else ""
+    if window_frames:
+        window = (
+            f"first {int(window_frames)} frames after {settle_s or 0:g}s of settling"
+            + span_note
+        )
+    else:
+        window = (
+            f"{settle_s or 0:g}s → "
+            + ("end" if args.to_s is None else f"{args.to_s:g}s")
+            + " after the first frame"
+        )
+    for trial in trials:
+        if trial.get("window_short"):
+            print(
+                f"warning: {trial['condition']}/{trial['repeat']} yielded "
+                f"{trial['frames']} of {trial['requested_frames']} window frames "
+                "(trial stopped too early: lower the fps hint or raise the ceiling)",
+                file=sys.stderr,
+            )
     markdown = to_markdown(report, window)
     extra = demo_section(args.demo_dir)
     if extra:
@@ -575,7 +670,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.timeline_out is not None:
         written = plot_timelines(
             args.dir,
-            from_s=args.from_s,
+            settle_s=settle_s,
+            frames=window_frames,
             to_s=args.to_s,
             out_dir=args.timeline_out,
             records_name=args.records,
