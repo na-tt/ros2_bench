@@ -105,6 +105,21 @@ def _median(values: Iterable[float]) -> float | None:
     return statistics.median(data) if data else None
 
 
+def _rate(values: Iterable[float]) -> float | None:
+    """Mean of a duty-cycle metric, where ``_median`` would collapse to zero.
+
+    ``GR3D_FREQ`` and ``cpu_load_pct`` are rates: a 100 ms sample either caught
+    GPU work or did not, so at low duty the samples are bimodal and the median
+    lands on the zero mode. Measured on this board: ``ros-4node-720p-n`` reads
+    0 % by median while its non-zero samples are 22 % and its mean is 7 % -- and
+    ``infer_ms`` says the GPU is working 10 ms/frame. Rates are averaged; levels
+    (PSS, power, temperature) stay medians, where an outlier should not move the
+    number.
+    """
+    data = [float(value) for value in values if value is not None]
+    return statistics.fmean(data) if data else None
+
+
 def window_indices(
     records: list[dict[str, Any]],
     *,
@@ -261,8 +276,8 @@ def summarise_trial(
         result["pss_mb"] = _median(
             row.get("work_peak_pss_mb") or row.get("work_peak_rss_mb") for row in samples
         )
-        result["gpu_util_pct"] = _median(row.get("gpu_util_pct") for row in samples)
-        result["cpu_load_pct"] = _median(row.get("cpu_load_pct") for row in samples)
+        result["gpu_util_pct"] = _rate(row.get("gpu_util_pct") for row in samples)
+        result["cpu_load_pct"] = _rate(row.get("cpu_load_pct") for row in samples)
         result["ram_used_mb"] = _median(row.get("ram_used_mb") for row in samples)
         result["tj_c_max"] = max(
             (row["tj_c"] for row in samples if "tj_c" in row), default=None

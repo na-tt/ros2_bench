@@ -315,7 +315,7 @@ Three things, in this order.
 | `fps` | records | frames inside the window over the window span |
 | `cpu ms/f`, `cores` | `/proc` | workload CPU time per frame; `cores` = cpu/wall |
 | `pss MB` | `/proc` | peak PSS of the process group (accounts for shared pages) |
-| `gpu %` | tegrastats | `GR3D_FREQ` duty cycle, not occupancy; a latency-bound chain reads low |
+| `gpu %` | tegrastats | `GR3D_FREQ` duty cycle, not occupancy; a latency-bound chain reads low. Mean over the samples, not median: at low duty the 100 ms samples are bimodal (GPU work / no GPU work) and the median lands on the zero mode — `ros-4node-720p-n` reads 7 % by mean and 0 % by median |
 | `W`, `J/f` | tegrastats | board-level `VDD_IN`; energy is the trapezoidal integral over the window |
 | `tj °C` | tegrastats | junction temperature, max over the window |
 | `xport` | records | ROS only: `transport_ms`, i.e. serialisation + DDS + scheduling |
