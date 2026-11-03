@@ -11,6 +11,12 @@ The chain is data, not code: ``pre_ops:='clahe;bilateral:d=9'`` (see
 forwards the decoded frame untouched, which is what every measurement taken
 before this stage existed recorded.
 
+The node takes its topics as parameters (``in_topic``/``out_topic``) and the
+launch file uses that to instantiate it more than once: with ``pre_split`` the
+chain is cut into one node per op, wired head to tail, and ``pre_ms``/the op
+arrays are accumulated additively along the way. No node code knows whether it
+is the only stage-2 node or the second of five -- the partition is launch data.
+
 The engine's input contract -- letterbox, colour order, NCHW, dtype -- is *not*
 applied here. It belongs to the inference node, which owns the engine and can
 therefore read the real ``InputSpec`` instead of taking ``imgsz`` and
@@ -43,20 +49,24 @@ class PreprocessingNode(Node):
         super().__init__('yolocar_preprocessing')
 
         spec = str(self.declare_parameter('pre_ops', '').value)
+        self.in_topic = str(self.declare_parameter('in_topic', topics.FRAME_TOPIC).value)
+        self.out_topic = str(
+            self.declare_parameter('out_topic', topics.INPUT_TOPIC).value
+        )
         log_level = str(self.declare_parameter('log_level', 'INFO').value)
         LOGGER.setLevel(log_level.upper())
 
         self.chain = parse(spec)
         self.get_logger().info(
-            'preprocessing: '
+            f'preprocessing [{self.in_topic} -> {self.out_topic}]: '
             + (', '.join(describe(self.chain)) or 'no conditioning ops (identity)')
         )
 
         self.publisher = self.create_publisher(
-            ImageFrame, topics.INPUT_TOPIC, qos.latest()
+            ImageFrame, self.out_topic, qos.latest()
         )
         self.create_subscription(
-            ImageFrame, topics.FRAME_TOPIC, self._on_frame, qos.latest()
+            ImageFrame, self.in_topic, self._on_frame, qos.latest()
         )
 
     def _on_frame(self, msg: ImageFrame) -> None:
