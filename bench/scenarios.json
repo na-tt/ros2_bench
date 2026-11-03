@@ -9,25 +9,25 @@
   "anchor_note": "The reference cell every delta is expressed against. Not measured more often than the other cells -- every cell runs once per pass -- so its job is to be the shared zero: any run of a subset of the matrix must include it, or that run yields no comparable delta. Chosen as the cheapest representative cell so including it is nearly free. analyze.py --anchor overrides it, which costs nothing: the deltas are re-derived from the records already on disk.",
   "out_dir": "results/bench",
   "trial": {
-    "note": "The design is stated in frames -- that is what the percentiles are computed from -- and each trial gets a time ceiling derived from them, because the machine state that dominates trial-to-trial variance is a function of elapsed time, not of frame count. `settle_s` is skipped by the analyser (thermal/clock ramp); `analysis_frames` is then taken verbatim, so every cell reports percentiles over the same n. `fps_hint` sizes the box: it is the 720p rate measured over 3 passes (2026-xx, see the baseline in AGENTS.md) with 10 % taken off, because an over-estimate shortens the ceiling until the window goes short while an under-estimate only costs a few seconds. Re-derive it after a change that plausibly moves throughput.",
+    "note": "The design is stated in frames -- that is what the percentiles are computed from -- and each trial gets a time ceiling derived from them, because the machine state that dominates trial-to-trial variance is a function of elapsed time, not of frame count. `settle_s` is skipped by the analyser (thermal/clock ramp); `analysis_frames` is then taken verbatim, so every cell reports percentiles over the same n. `fps_hint` sizes the box and must be PESSIMISTIC: it is 0.7x the 720p rate measured on a quiet board (59.5 fps for monolith-720p-n), because the same desk with a browser and an editor open measured 1.4x slower with identical code and wrote a `window_short` warning instead. An over-estimate shortens the ceiling until the window goes short; an under-estimate only runs a little longer. Re-derive only from a clean run, and keep the margin.",
     "settle_s": 30,
     "analysis_frames": 2500,
     "fps_hint": {
       "monolith": {
-        "n": 54,
-        "m": 27,
-        "x": 17
+        "n": 42,
+        "m": 21,
+        "x": 13
       },
       "ros-4node": {
-        "n": 18,
-        "m": 15,
-        "x": 11
+        "n": 14,
+        "m": 12,
+        "x": 9
       }
     }
   },
   "factors": {
     "resolution": {
-      "note": "Three re-encodes of the same clip at the same CRF, so bitrate (and therefore decode cost) scales with resolution. They are stored upright: ffmpeg baked the rotation into the pixels and cleared the display matrix, hence rotate 0. `clip_frames` is what makes the replay count exact instead of a 1000-loop fudge. `fps_scale` is the measured throughput ratio against 720p across both chains (1.10-1.31 per cell, 360p 1.10-1.18, 180p 1.13-1.31); the shipped values sit at the conservative end for the same reason as `fps_hint`.",
+      "note": "Three re-encodes of the same clip at the same CRF, so bitrate (and therefore decode cost) scales with resolution. They are stored upright: ffmpeg baked the rotation into the pixels and cleared the display matrix, hence rotate 0. `clip_frames` is what makes the replay count exact instead of a 1000-loop fudge. `fps_scale` is the measured throughput ratio against 720p across both chains (360p 1.10-1.18, 180p 1.13-1.31, i.e. a 22x pixel reduction buys at most a third more frames because `imgsz` is fixed); the shipped values sit at the low end of the measured range for the same reason as `fps_hint`.",
       "720p": {
         "source": "assets/video/0000f77c-6257be58_720p.mov",
         "rotate": 0,

@@ -187,8 +187,12 @@ resolution, cells do not.
    The trial is what was randomised. (Cross-check: the pooled median is 12.59 ms,
    within 0.02 ms of the mean of the per-trial medians -- pooling the *location*
    is harmless, pooling the *spread* is not.)
-2. **Comparing means from different hours.** The ±8 % drift is larger than most
-   effects. Use the delta table, or don't compare.
+2. **Comparing means from different hours.** The ~8 % drift is larger than most
+   effects, and the desktop is worse than drift: the same design measured a 27 %
+   board load on a quiet desk and 95 % with a browser open, with the pipeline
+   1.4x slower at the higher load and identical code. Use the delta table, or
+   don't compare -- and check the `load %` column first, which is why it is
+   printed.
 3. **Quoting the std as a CI** (or the reverse). `12.57 ± 0.19` and
    `12.57 ± 0.47` are both true and answer different questions.
 4. **Reading the stage table as latency.** Acquisition is excluded from

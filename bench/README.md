@@ -302,7 +302,12 @@ Three things, in this order.
    reports the mean delta with a 95 % CI over paired passes. A `*` means the CI
    excludes zero. This is also why every subset run must include the anchor: the
    deltas only add up across subsets and sessions if they share the same zero.
-3. **Stage split before the headline.** Acquisition is excluded from
+3. **`load %` before any cross-run comparison.** Whole-board CPU load averaged
+   across cores: a quiet desk sits at ~20-35 %, a busy one at 90 %+, and the same
+   pipeline runs up to 1.4x slower in the busy case. Within-pass deltas survive
+   that; absolute numbers do not. If two runs you are comparing have different
+   `load %`, they are not comparable.
+4. **Stage split before the headline.** Acquisition is excluded from
    `latency_ms` on purpose (it is the decoder: 2.8 ms at 720p, 11 % of the CPU
    time on this board, and 0.4 ms at 180p), and in the ROS arms most of the frame
    is `xport`. Reading `p50` without the stage table will attribute a transport
@@ -316,6 +321,7 @@ Three things, in this order.
 | `fps` | records | frames inside the window over the window span |
 | `cpu ms/f`, `cores` | `/proc` | workload CPU time per frame; `cores` = cpu/wall |
 | `pss MB` | `/proc` | peak PSS of the process group (accounts for shared pages) |
+| `load %` | tegrastats | whole-board CPU load, averaged across cores over the window. This is the column that says whether a run is comparable to another: the same design measured 27 % (range 16-36) on a quiet desk and 95 % with a browser open, and the pipeline ran 1.4x slower for it |
 | `gpu %` | tegrastats | `GR3D_FREQ` duty cycle, not occupancy; a latency-bound chain reads low. Mean over the samples, not median: at low duty the 100 ms samples are bimodal (GPU work / no GPU work) and the median lands on the zero mode — `ros-4node-720p-n` reads 7 % by mean and 0 % by median |
 | `W`, `J/f` | tegrastats | board-level `VDD_IN`; energy is the trapezoidal integral over the window |
 | `tj °C` | tegrastats | junction temperature, max over the window |
@@ -364,9 +370,9 @@ fp16 -- not a smaller video.
 
 ### Pruning
 
-18 cells is ~50 min per pass at the current budget (2 passes ~1.7 h, 3 passes
-~2.5 h) before engine load and gaps, and the spread is wide: `monolith-180p-n`
-is ~73 s while `ros-4node-720p-x` is ~280 s. `--conditions` selects by cell name:
+18 cells is ~61 min per pass at the current budget (2 passes ~2.0 h, 3 passes
+~3.1 h) before engine load and gaps, and the spread is wide: `monolith-180p-n`
+is ~85 s while `ros-4node-720p-x` is ~336 s. `--conditions` selects by cell name:
 
 ```bash
 bench/run.py --dry-run --conditions monolith-720p-n,ros-4node-720p-n
@@ -394,11 +400,13 @@ The two failure modes here have different currencies, so the design uses both.
 
 `scenarios.json` therefore carries `trial.settle_s`, `trial.analysis_frames` and
 `trial.fps_hint` (`chain -> model`, scaled by `fps_scale` per resolution). The
-hints are the 720p rates measured over a 3-pass run with 10 % taken off: an
-over-estimate shortens the ceiling until the window goes short, an under-estimate
-only costs a few seconds. Re-derive them after anything that plausibly moves
-throughput, and treat a `window_short` warning as "the hint is now wrong". Per
-trial, `run.py` derives:
+hints are **0.7x** the 720p rates measured on a quiet board (59.5 fps for
+`monolith-720p-n`), not 0.9x: the same desk with a browser and an editor open
+measured 1.4x slower with identical code, which turned a full window into a
+`window_short` warning. An over-estimate shortens the ceiling until the window
+goes short; an under-estimate only runs a little longer. Re-derive them from a
+clean run, keep the margin, and treat a `window_short` warning as "the hint is
+now wrong". Per trial, `run.py` derives:
 
 ```
 duration  = settle_s + 1.1 * analysis_frames / fps_hint     # stop condition

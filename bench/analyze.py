@@ -331,6 +331,7 @@ SCALARS = (
     ("p99_ms", lambda t: t["latency"].get("p99")),
     ("fps", lambda t: t["fps"]),
     ("cpu_ms_f", lambda t: t.get("cpu_ms_per_frame")),
+    ("load_pct", lambda t: t.get("cpu_load_pct")),
     ("cores", lambda t: t.get("cores_used")),
     ("pss_mb", lambda t: t.get("pss_mb")),
     ("gpu_pct", lambda t: t.get("gpu_util_pct")),
@@ -512,9 +513,9 @@ def to_markdown(
 
     header = (
         "| condition | passes | frames | p50 ms | p95 ms | p99 ms | fps "
-        "| cpu ms/f | cores | pss MB | gpu % | W | J/f | tj °C |"
+        "| cpu ms/f | cores | pss MB | gpu % | load % | W | J/f | tj °C |"
     )
-    rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+    rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     lines = [header, rule]
     for condition, entry in report.items():
         lines.append(
@@ -532,6 +533,7 @@ def to_markdown(
                     _fmt(entry.get("cores"), 2),
                     _fmt(entry.get("pss_mb"), 0),
                     _fmt(entry.get("gpu_pct"), 0),
+                    _fmt(entry.get("load_pct"), 0),
                     _fmt(entry.get("power_w"), 1),
                     _fmt_stats(stats_of(entry, "j_f"), 3),
                     _fmt(entry.get("tj_max"), 1),
