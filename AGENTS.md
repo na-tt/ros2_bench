@@ -235,6 +235,7 @@ never imports pipeline code. Details and the metric dictionary are in
 | sampler | `bench/sampler.py` | `tegrastats` (board) + `/proc` (workload) -> CSV, one clock |
 | orchestrator | `bench/run.py` | interleaved trials, rotates order, drives the sampler |
 | analysis | `bench/analyze.py` | picks the steady-state window, aggregates across trials |
+| estimators | `bench/METHOD.md` | what each number is computed over (cell/trial/pass, std vs CI, deltas) |
 
 **File contract -- every front-end must emit this**, monolith and ROS 2 alike:
 

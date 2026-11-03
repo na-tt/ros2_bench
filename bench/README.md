@@ -11,8 +11,13 @@ bench/
 ├── run.py          # orchestrator: interleaved trials + sampler + artefacts (+ --demo)
 ├── sampler.py      # board (tegrastats) + workload (/proc) telemetry -> CSV
 ├── analyze.py      # trials -> markdown/JSON report, window chosen here
-└── scenarios.json  # factors x design -> cells, + an `artifacts` (demo) block
+├── scenarios.json  # factors x design -> cells, + an `artifacts` (demo) block
+└── METHOD.md       # what the reported numbers are computed over, and why
 ```
+
+New to the report? Read `METHOD.md` first: it defines cell / trial / pass /
+anchor, and explains why a claim is a per-pass delta with a CI rather than a
+difference of two means.
 
 ## Policy (deliberate, not accidental)
 
