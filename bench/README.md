@@ -32,6 +32,30 @@ bench/
   control cell that used to serve this purpose is now only a demo artifact — see
   *Calibration*.
 
+## Trial order
+
+`order` in `scenarios.json` decides who runs when, and the audit of that decision
+is written to `run/<out>/run.json`.
+
+* **`policy: auto`** keeps the cyclic Latin square while it is cheap and correct
+  (`<= 6` cells *and* `repeats` a multiple of the cell count). It balances every
+  slot position exactly — but it needs `repeats % n == 0` (with 2 cells and 3
+  passes, A is first twice) and it gives every cell a fixed successor, so
+  adjacency is never balanced.
+* **Otherwise** cells are grouped into blocks and the block order is shuffled per
+  pass with a logged seed, while the direction inside a block alternates
+  (boustrophedon). `block_by: ["resolution", "model"]` puts a monolith and a ROS
+  cell at the same resolution and model next to each other, so the chain delta is
+  a difference measured minutes apart; across passes each block lands at a
+  different time of day. Blocks are grouped *by factor*, not by cell name, so
+  editing `design` cannot desynchronise them.
+
+The point of shuffling rather than rotating: a deterministic order that is not
+balanced turns drift into a *bias* the report cannot see, while a randomised one
+turns it into *variance* the std does see. `run.json` records the schedule, the
+slot-position and predecessor histograms per cell, and any warning (a cell that
+always ran after the same cell, a pass that was not a full pass).
+
 ## Running a measurement
 
 ### 0. Get the project shell (mandatory, every time)

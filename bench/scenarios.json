@@ -359,6 +359,15 @@
       }
     }
   },
+  "order": {
+    "note": "`auto` keeps the cyclic Latin square where it is cheap and correct (<= 6 cells, repeats a multiple of the cell count), and otherwise shuffles blocks per pass with a logged seed and reverses the direction inside a block on alternate passes. `block_by` groups the cells that should be measured back-to-back: here a monolith and a ROS cell at the same resolution and model, so a chain delta is a difference of minutes, not hours. Blocks are grouped by factors rather than by cell name so editing `design` cannot silently desynchronise them.",
+    "policy": "auto",
+    "seed": 20271103,
+    "block_by": [
+      "resolution",
+      "model"
+    ]
+  },
   "cells": {
     "note": "Per-cell overrides, merged over the generated cell. Nothing here yet: the factor tables and the `trial` block describe every cell today. Use it for a measured `fps_hint`, a different window for one cell, or `\"enabled\": false` to retire a cell without editing the design."
   }

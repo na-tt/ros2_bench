@@ -35,11 +35,13 @@ import argparse
 import json
 import math
 import os
+import random
 import shlex
 import signal
 import subprocess
 import sys
 import time
+from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -171,6 +173,121 @@ def matrix_conditions(
             condition["note"] = model_spec["note"]  # type: ignore[index]
         out.append((name, condition))
     return out
+
+
+# ------------------------------------------------------------- trial order
+def _blocks(
+    names: list[str],
+    conditions: dict[str, dict[str, object]],
+    cfg: dict[str, object],
+) -> list[list[str]]:
+    """Group the selected cells into blocks that run back-to-back, adjacent in time.
+
+    Two ways to say it: ``blocks`` names the cells explicitly, or ``block_by``
+    names factors and every combination of their values becomes a block. The
+    second survives edits to the design, and it is the one that matters here: with
+    ``block_by: ["resolution", "model"]`` a monolith and a ROS cell at the same
+    resolution and model are neighbours, so the chain delta is a difference
+    measured minutes apart instead of hours apart.
+    """
+    explicit = cfg.get("blocks")
+    if explicit:
+        blocks = [[str(cell) for cell in block] for block in explicit]  # type: ignore[union-attr]
+        placed = {cell for block in blocks for cell in block}
+        unknown = sorted(placed - set(names))
+        if unknown:
+            print(
+                f"order: blocks name cells not in this run: {', '.join(unknown)}",
+                file=sys.stderr,
+            )
+        # Anything the blocks forgot still gets measured, as its own singleton.
+        blocks.extend([[name] for name in names if name not in placed])
+        return [block for block in blocks if block]
+
+    keys = [str(key) for key in (cfg.get("block_by") or []) if key]
+    if keys:
+        groups: dict[tuple[str, ...], list[str]] = {}
+        for name in names:
+            cell = conditions[name].get("cell") or {}
+            key = tuple(str(cell.get(k)) for k in keys)  # type: ignore[union-attr]
+            groups.setdefault(key, []).append(name)
+        return [groups[key] for key in sorted(groups)]
+    return [list(names)]
+
+
+def build_schedule(
+    names: list[str],
+    conditions: dict[str, dict[str, object]],
+    repeats: int,
+    order_cfg: dict[str, object] | None,
+) -> tuple[list[list[str]], dict[str, object]]:
+    """Decide who runs when, and audit the result.
+
+    A cyclic Latin square is exactly right while it is affordable: it balances
+    every slot position, but it needs ``repeats % n == 0``, it never balances
+    *predecessors* (cell i is always followed by i+1), and at n = 18 it costs 18
+    passes. So it is used only where it is cheap and correct (n <= 6, balanced),
+    and the matrix uses blocks instead: block order is shuffled per pass with a
+    logged seed and the direction inside a block alternates, which balances
+    short-term drift for the comparisons that matter and turns any residual
+    imbalance into variance the report can see rather than a bias it cannot.
+    """
+    cfg = order_cfg if isinstance(order_cfg, dict) else {}
+    policy = str(cfg.get("policy", "auto"))
+    n = len(names)
+    square = policy == "latin" or (policy == "auto" and n <= 6 and repeats % n == 0)
+
+    blocks: list[list[str]] = []
+    if square:
+        schedule = [
+            [names[(repeat + index) % n] for index in range(n)]
+            for repeat in range(repeats)
+        ]
+    else:
+        blocks = _blocks(names, conditions, cfg)
+        rng = random.Random(cfg.get("seed"))  # type: ignore[arg-type]
+        schedule = []
+        for repeat in range(repeats):
+            block_order = list(blocks)
+            rng.shuffle(block_order)
+            flat: list[str] = []
+            for block in block_order:
+                flat.extend(block if repeat % 2 == 0 else list(reversed(block)))
+            schedule.append(flat)
+
+    slots: dict[str, Counter] = {name: Counter() for name in names}
+    predecessors: dict[str, Counter] = {name: Counter() for name in names}
+    warnings: list[str] = []
+    for pass_order in schedule:
+        if sorted(pass_order) != sorted(names):
+            missing = sorted(set(names) - set(pass_order))
+            warnings.append(f"pass is not a full pass: missing {', '.join(missing)}")
+        for position, name in enumerate(pass_order):
+            slots[name][position] += 1
+            predecessors[name][pass_order[position - 1] if position else None] += 1
+
+    for name in names:
+        if sum(slots[name].values()) != len(schedule):
+            warnings.append(f"{name} did not run once per pass")
+            continue
+        if len(schedule) > 1:
+            common, count = predecessors[name].most_common(1)[0]
+            if count == len(schedule) and common is not None:
+                warnings.append(f"{name} always followed {common}")
+
+    meta: dict[str, object] = {
+        "policy": "latin" if square else "blocks",
+        "seed": cfg.get("seed"),
+        "blocks": blocks,
+        "schedule": schedule,
+        "slots": {name: dict(sorted(counts.items())) for name, counts in slots.items()},
+        "predecessors": {
+            name: {str(key): value for key, value in counts.items()}
+            for name, counts in predecessors.items()
+        },
+        "warnings": warnings,
+    }
+    return schedule, meta
 
 
 # --------------------------------------------------------------- trial budget
@@ -439,6 +556,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
+        "--seed", type=int, default=None, help="seed for the per-pass block shuffle"
+    )
+    parser.add_argument(
         "--demo",
         action="store_true",
         help=(
@@ -519,11 +639,31 @@ def main(argv: list[str] | None = None) -> int:
         file=sys.stderr,
     )
 
+    order_cfg = dict(scenario.get("order") or {})
+    if args.seed is not None:
+        order_cfg["seed"] = args.seed
+    schedule, order_meta = build_schedule(
+        [name for name, _ in conditions],
+        dict(conditions),
+        repeats,
+        order_cfg,
+    )
+    if order_meta["policy"] == "blocks":
+        print(
+            f"order: blocks ({len(order_meta['blocks'])}), seed {order_meta['seed']}",
+            file=sys.stderr,
+        )
+    else:
+        print("order: cyclic Latin square (balanced)", file=sys.stderr)
+    for warning in order_meta["warnings"]:  # type: ignore[union-attr]
+        print(f"order: warning: {warning}", file=sys.stderr)
+
+    by_name = dict(conditions)
     trials: list[dict[str, object]] = []
-    for repeat in range(repeats):
-        # Rotate the order every repeat so no condition is systematically first.
-        order = conditions[repeat % len(conditions):] + conditions[: repeat % len(conditions)]
-        for name, condition in order:
+    for repeat, order in enumerate(schedule):
+        print(f"  pass {repeat + 1}: {' '.join(order)}", file=sys.stderr)
+        for name in order:
+            condition = by_name[name]
             trial_dir = out_root / name / f"r{repeat + 1}"
             trial_dir.mkdir(parents=True, exist_ok=True)
             budget = budgets[name]
@@ -629,11 +769,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             if returncode != 0:
                 print(f"    see {log_path}", file=sys.stderr)
-            if args.gap > 0 and (repeat, name) != (repeats - 1, order[-1][0]):
+            if args.gap > 0 and (repeat, name) != (repeats - 1, order[-1]):
                 time.sleep(args.gap)
 
     summary = {
         "scenario": str(args.scenario),
+        "order": order_meta,
         "budgets": budgets,
         "trials": trials,
     }
