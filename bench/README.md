@@ -281,12 +281,24 @@ The per-frame contract is the piece every front-end must satisfy:
 `t_mono` is `time.monotonic()`, which is system-wide on Linux, so the sampler's
 `t_mono` column joins directly against it.
 
-The ROS 2 front-end adds one key to this contract: `transport_ms`,
-end-to-end latency minus the three stage timings (serialisation + DDS +
-scheduling). The monolith has no such cost, so its absence there is not a
-missing measurement. In the ROS chain `infer_ms` also contains the detect-head
-decode/threshold (the candidates, not the raw head, cross the topic boundary):
-compare `infer + post` as a block, not the two buckets separately.
+Two keys are **optional** and appear only when the run had something to put in
+them, so a record written before they existed still analyses:
+
+* **`transport_ms`** -- ROS only: end-to-end latency minus the stage timings,
+  i.e. serialisation + DDS + scheduling. The monolith has no such cost, so its
+  absence there is not a missing measurement.
+* **`pre_ops`** -- `{"clahe": 4.1, "bilateral": 38.2}`: the stage-2 breakdown,
+  one entry per conditioning op. `pre_ms` remains the per-frame *sum*, so the
+  stage bucket means the same thing with a chain, with one op, or with none.
+  Both front-ends emit it, including when the chain is split across several
+  nodes (`analyze.py` prints a per-op table for cells that have it).
+
+Stage attribution is the same in both front-ends: `pre_ms` is conditioning at
+source resolution, `infer_ms` is the model input contract (letterbox + tensor)
+*plus* the engine and the detect-head decode/threshold. The last part is why
+the ROS chain's `infer_ms` must be compared as `infer + post` against the
+monolith's separate buckets -- but `pre_ms` is directly comparable, because it
+now measures the same thing on both sides.
 
 ## Reading the report
 
@@ -349,24 +361,33 @@ A cell is `<chain>-<resolution>-<model>` (`monolith-720p-n`,
 generates the full product.
 
 What each axis can and cannot move (all three engines take FLOAT
-`(1,3,640,640)` and emit FLOAT `(1,84,8400)`, so `imgsz` and `input_dtype` are
-constant across the matrix):
+`(1,3,640,640)` and emit FLOAT `(1,84,8400)`, and `imgsz` is no longer a
+launch parameter: the inference node reads the contract off the engine it owns):
 
-| axis | image topic | tensor topic | inference | acquisition |
-|---|---|---|---|---|
-| resolution | 2.76 → 0.69 → 0.17 MB | unchanged (4.92 MB) | unchanged | 3 decode sizes |
-| model | unchanged | unchanged | conv compute only | unchanged |
-| chain | hops per frame | hops per frame | unchanged | unchanged |
+| axis | hops out of stage 2 | inference | acquisition |
+|---|---|---|---|
+| resolution | 2 x BGR frame: 2.76 -> 0.69 -> 0.17 MB | unchanged | 3 decode sizes |
+| model | unchanged | conv compute only | unchanged |
+| chain | hops per frame | unchanged | unchanged |
+| `pre_split` (stage depth) | one hop per conditioning op | unchanged | unchanged |
 
-The resolution axis is therefore a **transport** probe with a modest compute
-side-effect: the letterboxed 640x640 tensor dominates the wire either way, so
-720p→180p removes ~34 % of the bytes, not ~22x. **Measured on the first full
-pass**, `xport` is 24.2 / 21.2 / 18.4 ms at 720p / 360p / 180p for `n` — i.e.
-~7 ms of fixed serialisation/scheduling cost plus ~2.2 ms/MB (~450 MB/s), linear
-to within 7 %. So the chain is bandwidth-bound, and the resolution axis can
-recover only that 34 %, because it cannot touch the tensor. Shrinking the
-transport further means not shipping the image at all, or shipping the tensor in
-fp16 -- not a smaller video.
+The wire no longer carries a tensor. That tension -- "the letterboxed 640x640
+tensor dominates the wire either way" -- is what used to cap the resolution
+axis at ~34 % of the bytes; now every hop carries the BGR frame at source
+resolution, so 720p -> 180p removes ~94 % of the payload bytes and the axis
+finally measures what it is named after.
+
+**The current graph has not been re-measured.** What is known is the per-hop
+model fitted on the old five-message chain, where the fit is unambiguous
+because one hop was a constant and the other scaled:
+
+    xport = hops * (3.6 ms + 2.2 ms/MB)          # ~450 MB/s, linear to ~7 %
+
+Predicted from it: ~13.3 ms at 720p and ~7.6 ms at 180p for the two-frame-hop
+chain (down from 24.2 / 18.4), and ~4.0 ms added by each extra hop at 180p.
+A single unsplit-vs-split smoke run measured +1.8 ms for one extra hop, which
+is inside the noise of one non-interleaved pair: quote only interleaved
+`bench/run.py` deltas, never that pair.
 
 ### Pruning
 

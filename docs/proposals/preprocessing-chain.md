@@ -1,6 +1,7 @@
 # Proposal: an independent preprocessing stage, and a chain-length axis
 
-Status: **implementing** (branch `feature/preprocessing-ops`).
+Status: **implemented** on branch `feature/preprocessing-ops` (commits below).
+Not yet measured: the matrix has to be re-run before any cell number is quoted.
 
 This document records four decisions, the scaling model they serve, and the
 commit sequence that lands them. It is written *before* the code so the trail
@@ -148,15 +149,53 @@ nodes can only lose. Partitioning pays only when stages overlap on different
 frames, i.e. in-flight depth > 1, which decouples `latency_ms` from `fps`.
 Depth is therefore a factor for a later run, not a constant to hard-code now.
 
-## Commit sequence
+## Commit sequence (as landed)
 
-| # | commit | leaves the tree |
+| # | commit | left the tree |
 | --- | --- | --- |
-| 1 | this document | unchanged code |
-| 2 | `refactor: move the model contract into model_input` | behaviour identical, tests green |
-| 3 | `feat: conditioning op registry + filters` | new stage exists, unused |
-| 4 | `feat: wire ops into the monolith and records` | `--pre` works, `pre_ops` recorded |
-| 5 | `feat(bench): report the per-op breakdown` | analyser reads it |
-| 6 | `refactor(ros): inference node owns the contract` | `TensorFrame` gone, 3 nodes + 1 hop removed from the wire |
-| 7 | `feat(ros): generic filter node` | any chain partition expressible |
-| 8 | `docs: stage map, contract and scenario notes` | documentation matches code |
+| 1 | `docs: proposal for an independent preprocessing stage and a chain-length axis` | unchanged code |
+| 2 | `refactor(yolocar)!: move the model input contract out of preprocessing` | behaviour identical, 147 tests green |
+| 3 | `feat(yolocar): a conditioning op registry for the preprocessing stage` | ops exist, unused; 43 new tests |
+| 4 | `feat(yolocar): run the conditioning chain in the monolith and record it` | `--pre` works, `pre_ops` recorded |
+| 5 | `feat(bench): report the stage-2 chain breakdown when the records carry it` | analyser prints it |
+| 6 | `refactor(yolocar_ros)!: stage 2 conditions at source resolution, the inference node owns the contract` | `TensorFrame` deleted; 4 messages, contract off the wire |
+| 7 | `feat(yolocar_ros): a data-driven stage-2 partition, one process per op` | `pre_split` — any partition from launch data |
+
+## What is now true
+
+* `preprocessing.condition(frame, chain)` is stage 2: coercion plus ops, source
+  geometry, BGR uint8. Empty chain returns the input array itself.
+* `model_input.prepare(frame, shape, dtype, pad_value)` is the contract, invoked
+  by the inference stage on both front-ends with the engine's own `InputSpec`.
+* Ops are `yolocar.filters` functions, registered in `preprocessing.OPS`, and
+  named by a chain string (`"clahe;bilateral:d=9"`, `;` for the ROS/shell form,
+  or a sequence for the CLI's repeatable `--pre`).
+* Both front-ends record `pre_ops` per frame (optional key) and
+  `stage_ms.preprocess_ops` in the summary; `analyze.py` reports a per-op table
+  for the cells that have it.
+* `pre_split:=true` runs one `preprocessing` process per op, head to tail,
+  through `yolocar/filter_<i>` topics, with `pre_ms` and the per-op arrays
+  accumulated additively so the records are identical in both shapes.
+
+## Smoke evidence (not a measurement)
+
+180p, `pre_ops:=clahe;gamma:gamma=0.8`, model n, single short runs:
+
+| shape | p50 | pre_ms | xport |
+| --- | --- | --- | --- |
+| one stage-2 node | 28.4 ms | 3.7 ms | 10.6 ms |
+| one node per op | 32.9 ms | 3.1 ms | 12.4 ms |
+
+Consistent with the per-hop model above (`+1.8 ms` observed for the extra hop at
+180p, `+4.0 ms` predicted, single non-interleaved pair), and with "splitting two
+cheap ops does not pay". That is a smoke test, not a result: it is one pass, no
+interleaving, no anchor delta. The k x A grid below is what would make it one.
+
+## Not implemented, on purpose
+
+* In-flight depth > 1 (the only configuration in which partitioning can win).
+* The dynamic-shape engine / per-resolution `imgsz` run (Decision 2).
+* `bench/scenarios.json` cells for the k x A grid: they are `pre_ops`/
+  `pre_split` values on the existing `ros-4node` template, so they can be added
+  without touching the harness -- but the budget question (3 ops x 3 chain
+  depths x 3 resolutions x 3 passes) is an operator decision, not a code one.

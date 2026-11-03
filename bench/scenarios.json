@@ -48,7 +48,7 @@
       }
     },
     "model": {
-      "note": "All three engines take FLOAT (1,3,640,640) and produce FLOAT (1,84,8400), so imgsz and input_dtype are constant across the matrix and the model axis moves zero bytes on the wire.",
+      "note": "All three engines take FLOAT (1,3,640,640) and produce FLOAT (1,84,8400), so the model axis moves zero bytes on the wire and only the engine's own cost changes. imgsz is not a launch parameter any more (the inference node reads the contract off the engine), and the wire no longer carries a tensor at all: both hops out of stage 2 carry the BGR frame, so transport scales with source resolution instead of paying a fixed 4.9 MB per frame.",
       "n": {
         "model": "assets/models/yolov8n_fp16.engine"
       },

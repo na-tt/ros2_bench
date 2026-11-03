@@ -20,7 +20,9 @@ monolith/yolocar/
 │   ├── cuda.py            # ctypes -> libcudart (buffers, stream, copies)
 │   ├── engine.py          # TensorRT deserialize, buffers, infer
 │   ├── acquisition.py     # stage 1: sources + rotation correction
-│   ├── preprocessing.py   # stage 2: letterbox + BGR->RGB NCHW tensor
+│   ├── preprocessing.py   # stage 2: coercion + conditioning chain (ops)
+│   ├── filters.py         #   the ops themselves (gamma, clahe, bilateral, ...)
+│   ├── model_input.py     # stage 3 front: the engine's input contract
 │   ├── inference.py       # stage 3: engine call + detect-head decoding
 │   ├── postprocessing.py  # stages 4-6: NMS, domain filter, coord adaptation
 │   ├── detections.py      # per-frame detections sidecar (JSONL artefact)
@@ -31,7 +33,8 @@ monolith/yolocar/
 │   └── py.typed
 └── tests/
     ├── test_package.py             # import/wiring smoke tests
-    ├── test_yolocar_pipeline.py    # acquisition / preprocessing / inference / facade
+    ├── test_yolocar_pipeline.py    # acquisition / contract / inference / facade
+    ├── test_yolocar_preprocessing.py  # conditioning ops, parsing, no-op rule
     ├── test_yolocar_postprocessing.py  # stages 4-6 + frozen golden output
     ├── test_yolocar_detections.py  # detections sidecar writer/reader
     ├── test_yolocar_demo.py        # renderer: join, timing, composite
@@ -65,6 +68,43 @@ live in the repository-root `assets/` directory, not inside this project. All
 defaults (`YoloCarConfig.model_path`, `YoloCarConfig.source`) are relative
 paths, resolved against the current working directory — run the commands below
 from the repository root.
+
+## Stages
+
+| # | stage | module | what it is |
+|---|---|---|---|
+| 1 | acquisition | `acquisition` | decode + rotation correction |
+| 2 | conditioning | `preprocessing` (+ `filters`) | *image* question: how should it look |
+| 3 | contract + inference | `model_input` + `inference` | *model* question: what does the engine want |
+| 4-6 | postprocessing | `postprocessing` | NMS -> domain filter -> coordinate adaptation |
+
+The split between 2 and 3 is deliberate: letterbox, colour order, NCHW layout,
+dtype and `/255` are parameterised by one engine's `InputSpec` and improve
+nothing, so they belong to the inference stage. Stage 2 keeps source geometry
+and BGR uint8, which is what makes it splittable across processes.
+
+Conditioning is a chain of general image operations, applied in order:
+
+```bash
+# one op
+python3 -m yolocar.main --source assets/video/0000f77c-6257be58_720p.mov \
+    --pre clahe --records results/clahe.jsonl
+
+# a chain, with parameters (repeat --pre; order is preserved)
+python3 -m yolocar.main --source assets/video/0000f77c-6257be58_720p.mov \
+    --pre 'gamma:gamma=0.8' --pre clahe --pre 'bilateral:d=9'
+```
+
+Available ops are `yolocar.preprocessing.OPS`: `gamma`, `hist_equalization`,
+`clahe`, `gaussian`, `median`, `bilateral`, `denoise`. They are stand-ins for
+real preprocessing workloads -- what is measured is their cost, not their effect
+on accuracy -- and they span different bottlenecks on purpose (single-pass LUT,
+multi-pass memory work, separable convolution, non-separable `O(k^2)`, a search
+window). No ops means identity: no copy, no pixel change, and `pre_ms` ~ 0.
+
+Each op is timed into `pre_ops` in the per-frame records and
+`stage_ms.preprocess_ops` in the summary, so the chain can be read op by op
+without re-running anything.
 
 ## Model
 
@@ -113,8 +153,9 @@ Run-length flags for long measurements:
   once the engine is loaded, so startup does not eat into the budget.
 * `--records PATH` — write one JSON object per frame (JSONL): `seq`, `loop`,
   `t_mono`, `acq_ms`, `pre_ms`, `infer_ms`, `post_ms`, `present_ms`,
-  `latency_ms`, `n_det`. Nothing is discarded at runtime; the steady-state
-  window is chosen afterwards, per run.
+  `latency_ms`, `n_det` (plus `pre_ops` when a conditioning chain ran).
+  Nothing is discarded at runtime; the steady-state window is chosen
+  afterwards, per run.
 
 `--rotate {0,90,180,270}` rotates every frame clockwise at acquisition. It is
 needed for clips whose container rotation flag the decoder ignores: OpenCV

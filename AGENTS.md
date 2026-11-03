@@ -19,7 +19,9 @@ ros2_bench/
 │       │   ├── __init__.py      # lazy re-exports
 │       │   ├── config.py        # tunables + COCO table (no logic)
 │       │   ├── acquisition.py   # stage 1: sources + rotation
-│       │   ├── preprocessing.py # stage 2: letterbox + tensor
+│       │   ├── preprocessing.py # stage 2: coercion + conditioning chain
+│       │   ├── filters.py       #   the conditioning ops themselves
+│       │   ├── model_input.py   # engine input contract (letterbox + tensor)
 │       │   ├── inference.py     # stage 3: engine call + decode
 │       │   ├── postprocessing.py# stages 4-6: NMS/filter/coords
 │       │   ├── render.py        # optional annotation + sinks
@@ -201,7 +203,9 @@ source install/setup.bash
   ```
   The launch file starts acquisition, preprocessing, inference and
   postprocessing as four processes and stops them together. `duration:=-1` runs
-  the source to its end.
+  the source to its end. Add `"pre_ops:=clahe;bilateral:d=9"` to condition the
+  frame, and `pre_split:=true` to give each op its own process (see *Current
+  State*).
 
 ---
 
@@ -296,7 +300,10 @@ never imports pipeline code. Details and the metric dictionary are in
 
 **Baseline** (Orin Nano, full matrix, 3 interleaved passes, `settle_s=30` +
 `analysis_frames=2500`, rotation-corrected footage). Mean ± sample std across
-passes; the anchor is bold:
+passes; the anchor is bold. Measured on the chain *before* the model contract
+moved into the inference node, so the `ros-4node` p50 includes the 4.9 MB
+tensor hop that no longer exists -- treat it as the historical reference, not
+as the current graph (see *Current State*, `pre_ms` attribution):
 
 | cell | p50 ms | fps | cpu ms/f | cores | gpu % | W | J/f | pss MB |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -324,7 +331,8 @@ Road objects video detection with yolo on dashcam footage.
 
 #### Specification
 - (1) **acquisition:** read frame from video file. bgr frame at experimental resolution
-- (2) **preprocessing:** image conditioning to expected input characteristics. rgb image, 1×3×640×640, float/uint8 per model
+- (2) **preprocessing:** general image conditioning at **source resolution**, as a chain of ops (denoise, CLAHE, gamma, histogram equalisation, ...). BGR uint8 in, BGR uint8 out, geometry unchanged. Stage 2 says *how the image should look*; it does not know the model. Empty chain = identity (bit-exact, zero-copy), which is the baseline.
+- (2b) **model input contract:** letterbox + BGR→RGB + HWC→NCHW + dtype/scale. Parameterised only by the engine's `InputSpec`, and therefore part of the inference stage, not of preprocessing.
 - (3) **inference:** run yolo and produce candidate detection boxes.
 - (4) **NMS:** perform Non Maximum Supression to reduce detections.
 - (5) **domain filter:** filter to only class ids corresponding to road objects (default set: `yolocar.config.ROAD_CLASS_IDS`)
@@ -341,8 +349,10 @@ One module per upstream/downstream boundary; the facade only wires them.
 | Stage | Module |
 | --- | --- |
 | acquisition (sources, rotation correction) | `yolocar.acquisition` (`open_source`, `rotate_frame`) |
-| preprocessing (letterbox, tensor) | `yolocar.preprocessing` (`preprocess`, `letterbox`, `to_tensor`, `LetterboxInfo`) |
-| inference (engine call, decode head) | `yolocar.inference` (`infer`, `decode_predictions`, `InputSpec`) |
+| preprocessing (conditioning chain) | `yolocar.preprocessing` (`OPS`, `Op`, `parse`, `enhance`, `condition`, `as_bgr_frame`) |
+| conditioning ops | `yolocar.filters` (`gamma`, `hist_equalization`, `clahe`, `gaussian`, `median`, `bilateral`, `denoise`) |
+| model input contract | `yolocar.model_input` (`InputSpec`, `LetterboxInfo`, `letterbox`, `to_tensor`, `prepare`) |
+| inference (engine call, decode head) | `yolocar.inference` (`infer`, `decode_predictions`, `input_spec`) |
 | NMS | `yolocar.postprocessing.nms` |
 | domain filter | `yolocar.postprocessing.domain_filter` |
 | coordinate adaptation | `yolocar.postprocessing.coordinate_adaptation` |
@@ -361,18 +371,40 @@ type only at the very end.
 * **`ws/src/yolocar_ros` is the four-node chain** (acquisition ->
   preprocessing -> inference -> postprocessing), one process per stage, plus
   `ws/src/yolocar_interfaces` with the messages (`FrameMeta`, `ImageFrame`,
-  `TensorFrame`, `CandidatesFrame`, `FrameAck`). Each stage calls the
-  corresponding `yolocar` function and adds only ROS 2 boilerplate. The
-  acquisition node publishes one frame and waits for the terminal node's ack, so
-  the graph is demand-driven like the monolith (one frame in flight, no silent
-  drops). `bench/scenarios.json` (the `ros-4node` chain, i.e. every
-  `ros-4node-*` cell) drives it through
-  `launch/bench.launch.py`; any node exiting shuts the launch down.
+  `CandidatesFrame`, `FrameAck`). Each stage calls the corresponding `yolocar`
+  function and adds only ROS 2 boilerplate. The acquisition node publishes one
+  frame and waits for the terminal node's ack, so the graph is demand-driven
+  like the monolith (one frame in flight, no silent drops).
+  `bench/scenarios.json` (the `ros-4node` chain, i.e. every `ros-4node-*` cell)
+  drives it through `launch/bench.launch.py`; any node exiting shuts the launch
+  down.
+* **Stage 2 is splittable by launch data, not by code.** `pre_ops` says *what*
+  conditioning runs (`;` separated, empty = identity); `pre_split:=true` cuts
+  it into one `preprocessing` process per op, wired head to tail through
+  `yolocar/filter_<i>` topics. The first node still reads `yolocar/frame` and
+  the last still writes `yolocar/input`, so nothing downstream can tell how
+  deep the stage was split. `pre_ms` and the `pre_op_names`/`pre_op_ms` arrays
+  accumulate additively, so the records are identical in both configurations
+  and the extra hops land in `transport_ms`. The partition policy is one pure
+  function (`stage_two_instances` in the launch file), tested without ROS.
+  With one frame in flight, more nodes can only add latency -- depth is a
+  *cost* axis here until in-flight depth > 1 becomes a measured factor.
+* **No tensor crosses a topic.** Both hops out of stage 2 carry an
+  `ImageFrame`, and the model input contract is applied by the inference node,
+  which reads `InputSpec` off the engine it owns. Consequences: the 4.9 MB
+  fixed tensor payload is gone (so transport scales with source resolution
+  again), `TensorFrame` is deleted, and `input_dtype` no longer exists as a
+  launch argument -- a dtype that disagrees with the engine is not expressible.
 * **Compare `infer + post` as one block in the ROS chain.** The inference node
   publishes decoded/thresholded `Candidates` instead of the raw
-  `(1, 84, 8400)` head (2.8 MB/frame), so `infer_ms` there includes
-  `decode_predictions`/`select_candidates`. `acq_ms`, `pre_ms` and the
-  detections remain directly comparable.
+  `(1, 84, 8400)` head (2.8 MB/frame), so `infer_ms` there includes the model
+  contract *and* `decode_predictions`/`select_candidates`. `acq_ms`, `pre_ms`
+  and the detections remain directly comparable.
+* **`pre_ms` means conditioning only, in both front-ends.** Letterbox/tensor now
+  counts inside `infer_ms`. Numbers recorded before this change are therefore
+  not comparable bucket for bucket: the `pre` and `infer` columns of the table
+  above mix the old and new attribution, only `p50/p99/fps/cpu/gpu` are
+  unaffected. Re-measure before quoting a stage split.
 * **The ROS chain is transport-bound, and that is the measurement.** The ROS
   records add `transport_ms` (serialisation + DDS + scheduling) and the summary
   adds a `transport` stage bucket. On this Jetson the two large payloads (2.7 MB
@@ -398,11 +430,17 @@ type only at the very end.
   `present_ms` and subtracted from `fps`). Demo material comes from
   `bench/run.py --demo`, a separate invocation that runs one replay per
   condition; measured commands are untouched by it.
-* **`imgsz` and `input_dtype` are launch parameters, not engine facts.** The
-  preprocessing node cannot load the engine (that is the inference node's job),
-  so the launch file passes both and the inference node validates them against
-  the real engine contract. The shipped `yolov8n_fp16.engine` wants
-  `float32` / 640. A mismatch raises an explicit error instead of casting.
+* **`imgsz` is a dynamic-shape hint; the dtype is an engine fact.** The
+  inference node reads both off the engine it loads
+  (`yolocar.inference.input_spec`), so `input_dtype` is no longer a parameter at
+  all. `imgsz` survives for dynamic engines only
+  (`TensorRTEngine(default_input_shape=...)`); a static engine such as the
+  shipped `yolov8n_fp16.engine` (float32 / 640) wins. A single engine built
+  with an optimization profile could serve several input sizes without
+  per-resolution exports -- documented in
+  `docs/proposals/preprocessing-chain.md` as a deferred experiment, because
+  letting `imgsz` track resolution makes inference cost O(pixels) and swamps
+  the conditioning ops the resolution axis is meant to measure.
 * **Run the launch from the repository root.** Default source/model/records
   paths are relative, and `yolocar` must be on `PYTHONPATH`
   (`PYTHONPATH=monolith/yolocar/src:$PYTHONPATH`) because there is no `pip` on
@@ -435,8 +473,9 @@ type only at the very end.
   pass: a diff there means detection behaviour changed.
 * **`results/` is generated and gitignored.** Keep a run's directory if you want
   to compare against it later; nothing in it is source.
-* Test counts at the end of this session: 147 (`pytest monolith/yolocar`,
-  including 17 hardware tests against the real engine, the detections sidecar
-  and the offline renderer); 22 passed + 1 skipped (`colcon test
-  --packages-select yolocar_ros`, 23 tests: ament lint, the records/summary
-  contract, sidecar/records parity and the real-engine stage-split test).
+* Test counts at the end of this session: 197 (`pytest monolith/yolocar`,
+  including 18 hardware tests against the real engine, the detections sidecar,
+  the offline renderer and the CLI `--pre` path); 31 passed + 1 skipped
+  (`colcon test --packages-select yolocar_ros`: ament lint, the records/summary
+  contract, sidecar/records parity, the real-engine stage-split test, and the
+  launch file's partition policy).

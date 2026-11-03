@@ -1,4 +1,4 @@
-# yolocar_ros — four-node ROS 2 chain
+# yolocar_ros — ROS 2 chain, with a splittable preprocessing stage
 
 ROS 2 wrapper for the [`yolocar`](../../monolith/yolocar) pipeline. It contains
 no computer-vision logic: every stage calls the same function the monolith
@@ -6,17 +6,27 @@ calls, and this package only adds nodes, topics and the benchmark's file
 contract.
 
 ```
-acquisition ──frame──> preprocessing ──tensor──> inference ──candidates──> postprocessing
+acquisition ──frame──> preprocessing ──frame──> inference ──candidates──> postprocessing
      ^                                                                          │
      └──────────────────────────── ack (one frame in flight) ───────────────────┘
+
+with pre_split:=true, the middle stage may be cut into one node per op:
+
+acquisition ──frame──> filter(clahe) ──frame──> filter(bilateral) ──frame──> inference ...
 ```
 
 | node | stage function | input → output |
 | --- | --- | --- |
 | `acquisition` | `yolocar.acquisition.open_source` | source → `ImageFrame` (BGR + metadata) |
-| `preprocessing` | `yolocar.preprocessing.preprocess` | `ImageFrame` → `TensorFrame` (NCHW + letterbox) |
-| `inference` | `yolocar.inference.infer` / `decode_predictions` / `select_candidates` | `TensorFrame` → `CandidatesFrame` |
+| `preprocessing` | `yolocar.preprocessing.condition` | `ImageFrame` → `ImageFrame` (same geometry, conditioned) |
+| `inference` | `yolocar.model_input.prepare` then `yolocar.inference.infer` / `decode_predictions` / `select_candidates` | `ImageFrame` → `CandidatesFrame` |
 | `postprocessing` | `yolocar.postprocessing.nms` → `domain_filter` → `coordinate_adaptation` | `CandidatesFrame` → `records.jsonl` + `summary.json` |
+
+Only two message types carry pixels, and both are the *same* type: every hop out
+of stage 2 carries a BGR `ImageFrame` at source resolution. The model input
+contract (letterbox, RGB, NCHW, dtype) never crosses a topic -- it is applied by
+the node that owns the engine -- so there is no payload of fixed size on the
+wire and the transport cost scales with the source resolution.
 
 Messages live in `../yolocar_interfaces`; the `FrameMeta` sub-message carries
 `seq`, `loop`, the capture timestamp (`time.monotonic()`) and the timings each
@@ -71,8 +81,28 @@ PYTHONPATH=monolith/yolocar/src:$PYTHONPATH \
 
 `duration:=-1` (the launch default) runs the source to its end. The clip in
 `assets/video/` is stored upside down, hence `rotate:=180` is the default.
-`input_dtype` and `imgsz` must match the engine's input contract; the inference
-node validates them and fails with an explicit message instead of casting.
+There is no `input_dtype` launch argument: the inference node reads the input
+spec off the engine it owns, so a dtype that disagrees with the engine is not
+expressible. `imgsz` survives only as a dynamic-shape hint for a dynamic engine
+(a static engine's shape wins).
+
+### Conditioning chain and partition depth
+
+`pre_ops` is the single definition of what stage 2 runs (`;` separated);
+`pre_split` decides where the cuts are:
+
+```bash
+# the whole chain in one node (the default shape of the graph)
+ros2 launch yolocar_ros bench.launch.py "pre_ops:=clahe;bilateral:d=9"
+
+# one process per op, wired head to tail
+ros2 launch yolocar_ros bench.launch.py "pre_ops:=clahe;bilateral:d=9" pre_split:=true
+```
+
+`pre_ms` and the per-op arrays accumulate along the chain, so the terminal node
+writes the same records either way and the extra hops show up in `transport_ms`.
+That is what makes partition depth a measurable axis rather than a different
+experiment.
 
 The benchmark harness uses exactly this entry point through
 `bench/scenarios.json` (`ros-4node`). A smoke comparison:
@@ -87,7 +117,8 @@ bench/analyze.py --from 10 --to 30
 | topic | type | direction |
 | --- | --- | --- |
 | `yolocar/frame` | `yolocar_interfaces/ImageFrame` | acquisition → preprocessing |
-| `yolocar/tensor` | `yolocar_interfaces/TensorFrame` | preprocessing → inference |
+| `yolocar/input` | `yolocar_interfaces/ImageFrame` | preprocessing → inference |
+| `yolocar/filter_<i>` | `yolocar_interfaces/ImageFrame` | between stage-2 nodes, only with `pre_split:=true` |
 | `yolocar/candidates` | `yolocar_interfaces/CandidatesFrame` | inference → postprocessing |
 | `yolocar/ack` | `yolocar_interfaces/FrameAck` | postprocessing → acquisition |
 | `yolocar/stop` | `std_msgs/Empty` | acquisition → postprocessing |
