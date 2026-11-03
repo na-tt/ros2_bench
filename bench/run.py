@@ -74,6 +74,19 @@ def expand(value: str | list[str], context: dict[str, str]) -> str | list[str]:
     return value.format(**context)
 
 
+def _rotate_of(condition: dict[str, object], scenario: dict[str, object]) -> object:
+    """Rotation is a property of the footage, not of the experiment.
+
+    The original clip is stored upside down and needs 180; the re-encoded
+    ``_720p``/``_360p``/``_180p`` files had the rotation baked into the pixels
+    by ffmpeg, which also cleared the display matrix, so they need 0. A
+    condition may therefore override the scenario-level default.
+    """
+    if "rotate" in condition:
+        return condition["rotate"]
+    return scenario.get("rotate", 0)
+
+
 def build_argv(condition: dict[str, object], context: dict[str, str]) -> list[str]:
     """A condition is either an argv list or a shell string (for `source ...`)."""
     shell = condition.get("shell")
@@ -109,7 +122,6 @@ def run_demo(scenario: dict[str, object], args: argparse.Namespace) -> int:
         "python": sys.executable,
         "repo": str(REPO),
         "source": str(scenario.get("source", "")),
-        "rotate": str(scenario.get("rotate", 0)),
         "loops": str(artifacts.get("loops", 1)),  # type: ignore[union-attr]
         "demo": str(out_root),
     }
@@ -122,7 +134,12 @@ def run_demo(scenario: dict[str, object], args: argparse.Namespace) -> int:
             print(f"skip {name}: disabled in scenario", file=sys.stderr)
             continue
         directory = out_root / name
-        context = {**base_context, "condition": name, "out": str(directory)}
+        context = {
+            **base_context,
+            "condition": name,
+            "out": str(directory),
+            "rotate": str(_rotate_of(condition, scenario)),
+        }
         for phase in ("run", "render"):
             spec = condition.get(phase)
             if spec:
@@ -275,7 +292,6 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("no runnable conditions")
 
     source = str(scenario.get("source", ""))
-    rotate = str(scenario.get("rotate", 0))
     out_root.mkdir(parents=True, exist_ok=True)
 
     print(
@@ -295,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
                 "python": sys.executable,
                 "repo": str(REPO),
                 "source": source,
-                "rotate": rotate,
+                "rotate": str(_rotate_of(condition, scenario)),
                 "duration": f"{duration:g}",
                 "out": str(trial_dir),
                 "condition": name,

@@ -42,7 +42,12 @@ def generate_launch_description() -> LaunchDescription:
     declared = [
         _argument('source', 'assets/video/0000f77c-6257be58.mov',
                   'video file, image, image directory or camera index'),
-        _argument('rotate', 180, 'clockwise rotation applied at acquisition'),
+        _argument(
+            'rotate',
+            0,
+            'clockwise rotation applied at acquisition; the shipped _720p/_360p/_180p '
+            'files are already upright (0), the original clip is stored upside down (180)',
+        ),
         _argument('loops', 1, 'replay the source this many times'),
         _argument('duration', -1.0, 'measurement seconds after engine load (-1 = source length)'),
         _argument('max_frames', -1, 'stop after this many frames (-1 = no cap)'),

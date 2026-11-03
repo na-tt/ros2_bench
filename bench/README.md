@@ -61,6 +61,15 @@ below needs.
 ls assets/models/yolov8n_fp16.engine assets/video/0000f77c-6257be58.mov
 ```
 
+**Rotation belongs to the footage, not to the experiment.** The original clip is
+stored upside down (`CAP_PROP_ORIENTATION_META` reports 270, which is wrong) and
+needs `--rotate 180`. The re-encoded `_720p`/`_360p`/`_180p` files had the
+rotation baked into the pixels by ffmpeg, which also cleared the display matrix,
+so they need `rotate: 0`. A condition may override the scenario-level `rotate`,
+and the ROS launch defaults to 0. Getting this wrong does not fail a run: it
+silently measures inference on an upside-down road scene, and only `n_det` and the
+demo video look wrong.
+
 ### 2. Smoke test first (~40 s)
 
 Cheap and it catches a moved engine, a stale workspace or a broken topic before
