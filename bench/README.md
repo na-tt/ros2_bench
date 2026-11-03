@@ -27,10 +27,13 @@ bench/
   replay of a 120 s run, in *either* direction). Running all of A and then all
   of B would attribute that drift to B. `run.py` orders trials so no cell is
   systematically first (see *Trial order*).
-* **An anchor cell.** One cell is repeated in every pass, so a comparison is a
-  per-pass delta rather than two means measured hours apart. The duplicate
-  control cell that used to serve this purpose is now only a demo artifact — see
-  *Calibration*.
+* **An anchor cell.** Every cell runs once per pass, so a pass yields one trial
+  per cell -- the anchor is not measured more often than the rest. It is the
+  *reference* cell: every delta in the report is expressed against it, so a
+  comparison is a per-pass delta rather than two means measured hours apart, and
+  every run of a subset must include it so that numbers from different subsets
+  and sessions share one zero. The duplicate control cell that used to serve this
+  purpose is now only a demo artifact — see *Calibration*.
 
 ## Trial order
 
@@ -292,8 +295,8 @@ Three things, in this order.
    apart are not comparable -- the board drifts ~8 % across a long session -- so
    `analyze.py` differences every cell against the anchor *inside each pass* and
    reports the mean delta with a 95 % CI over paired passes. A `*` means the CI
-   excludes zero. This is also why the anchor must appear in every pass: it is
-   the control, and its repetition is what produces the comparator.
+   excludes zero. This is also why every subset run must include the anchor: the
+   deltas only add up across subsets and sessions if they share the same zero.
 3. **Stage split before the headline.** Acquisition is excluded from
    `latency_ms` on purpose (it is the decoder, ~28 % of the CPU time), and in the
    ROS arms most of the frame is `xport`. Reading `p50` without the stage table
@@ -401,10 +404,10 @@ can be audited after the fact.
 
 The measured design has no duplicate control cell. `monolith-ctrl` survives only
 in the `artifacts` (demo) block, where two visually identical videos are worth
-having. The noise floor it used to measure is now carried by repeating the
-**anchor** cell in every pass: the std of the per-pass deltas is the number a
-ROS-vs-monolith difference has to clear, measured on the same clock as the
-comparison instead of once, months ago, on a different session. Run the A/A pair
+having. The noise floor it used to measure is now carried by the deltas
+themselves: the spread of the per-pass deltas against the **anchor** is the
+number a ROS-vs-monolith difference has to clear, measured on the same clock as
+the comparison instead of once, months ago, on a different session. Run the A/A pair
 on demand when the harness itself changes (`--conditions` with a throwaway
 scenario), because a control cell mostly caught harness bugs keyed off the
 condition name -- output paths, env merge, process-group discovery.

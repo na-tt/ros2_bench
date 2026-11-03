@@ -85,8 +85,10 @@ New pipelines follow the same shape: `monolith/<name>/` with `pyproject.toml`
      requirements to the harness: the machine's natural noise floor and
      desktop-session activity are deliberate parts of the measurement.
    * Compare conditions within interleaved passes, never as back-to-back
-     blocks: one cell (the *anchor*) is measured in every pass, and every claim
-     is a per-pass delta against it.
+     blocks: a claim is a per-pass delta against a fixed reference cell (the
+     *anchor*), not a difference of two means measured hours apart. The anchor is
+     not measured more often than the rest in a full pass (every cell runs once
+     per pass) -- it is the shared zero, so any run of a subset must include it.
 
 6. **Workspace Isolation**:
    * The ROS 2 workspace lives entirely within `ws/`.

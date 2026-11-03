@@ -6,9 +6,12 @@ garbage collector is not touched, so a run drifts by several percent as the
 machine warms, and sequential blocks attribute that drift to whichever cell ran
 second. Cells are therefore run in passes -- every cell once per pass -- with a
 zig-zag inside blocks and a seeded shuffle across them, so the machine state a
-cell inherits is randomised rather than fixed. The one cell that appears in every
-pass is the anchor: comparing against it inside a pass is what makes a delta
-comparable, and it replaces the duplicate control cell the design used to pay for.
+cell inherits is randomised rather than fixed. Every cell runs once per pass, so
+a pass yields one trial per cell; the anchor is not measured more often than that
+-- it is the *reference* cell, the zero that every delta in the report is
+expressed against, and any run of a subset of the matrix has to include it for
+deltas from different subsets and sessions to share that zero. What replaces the
+duplicate control cell is the spread of those deltas across passes.
 
 Trials are budgeted in frames (that is what the percentiles are computed from)
 with a time ceiling derived from that budget (the machine state is a function of
