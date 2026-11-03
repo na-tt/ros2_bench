@@ -87,7 +87,8 @@ Expect `2/2 trials ok`; if a trial exits non-zero, read
 ### 3. The full run (3 cells x 3 passes x 180 s ≈ 28 min)
 
 ```bash
-bench/run.py --repeats 3 --duration 180 --gap 5 --out results/bench
+bench/run.py --repeats 3 --gap 5 --out results/bench \
+  --conditions monolith-720p-n,ros-4node-720p-n
 ```
 
 A matrix run is `--conditions` on a subset, not always the whole product; see
@@ -133,7 +134,9 @@ rendered demo videos to the report when any exist.
 |---|---|---|
 | `--conditions a,b` | `run.py` | subset by cell name (`monolith-720p-n`, ...) |
 | `--repeats N` | `run.py` | passes over the selected cells (see *Trial order*) |
-| `--duration S` | `run.py` | measurement seconds; the clock starts once the engine is loaded |
+| `--settle S` | `run.py` | seconds per trial treated as settling (default from `trial.settle_s`) |
+| `--analysis-frames N` | `run.py` | frames of analysis window per trial (default from `trial.analysis_frames`) |
+| `--duration S` | `run.py` | override the computed time ceiling for every cell (quick looks only) |
 | `--gap S` | `run.py` | idle seconds between trials (default 5) |
 | `--out DIR` | `run.py` | artefact root (default `results/bench`) |
 | `--interval-ms N` | `run.py` | sampler period (default 100) |
@@ -306,6 +309,38 @@ bench/run.py --conditions monolith-720p-n,monolith-360p-n,monolith-180p-n,ros-4n
 A design that answers one factor beats a design that answers none: keep the
 anchor cell in every `design` (see *Calibration*), then add the cells needed for
 the axis under test.
+
+## Trial budget: settle by time, count by frames
+
+The two failure modes here have different currencies, so the design uses both.
+
+* **Frames** are the statistical unit: `p50/p95/p99` are computed from a frame
+  count, so every cell gets the same `analysis_frames` and the percentiles are
+  comparable across a matrix whose cells differ by 4x in speed. This also fixes a
+  content-mix bias: a fixed 180 s window is 5.2 clip passes at 36 fps but 1.5 at
+  10 fps, so dense-traffic passages weigh ~3.5x more in the monolith trial than
+  in the ROS trial.
+* **Seconds** are the machine-state unit: the ~8 % drift and the thermal ramp are
+  functions of elapsed time, so a pure frame budget would measure the fast cells
+  cold. `settle_s` is dropped by the analyser, and each trial gets a time ceiling
+  derived from its frame budget.
+
+`scenarios.json` therefore carries `trial.settle_s`, `trial.analysis_frames` and
+a deliberately pessimistic `trial.fps_hint` table (`chain -> model`, scaled by
+`fps_scale` per resolution). Per trial, `run.py` derives:
+
+```
+duration  = settle_s + 1.1 * analysis_frames / fps_hint     # stop condition
+max_frames= 1.5*settle_s*fps_hint + 1.2*analysis_frames      # hard cap behind it
+loops     = ceil(max_frames / clip_frames) + 1               # exact, not 1000
+```
+
+Both front-ends already stop on whichever comes first (`main.py`, and
+`acquisition_node.py` for the ROS chain), so this is config, not pipeline code.
+An over-estimated `fps_hint` truncates the window and `analyze.py` says so; an
+under-estimate only costs a few seconds. `run.json` records the whole budget
+table and every `run.meta.json` repeats its cell's budget, so a suspicious trial
+can be audited after the fact.
 
 ## Calibration
 

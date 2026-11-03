@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import signal
@@ -157,12 +158,99 @@ def matrix_conditions(
             "source", scenario.get("source", "")
         )
         condition["model"] = model_spec.get("model", scenario.get("model", ""))  # type: ignore[union-attr]
+        condition["cell"] = {
+            "chain": chain_name,
+            "resolution": resolution_name,
+            "model": model_name,
+        }
+        if resolution_spec.get("fps_scale"):  # type: ignore[union-attr]
+            condition["fps_scale"] = resolution_spec["fps_scale"]  # type: ignore[index]
         if resolution_spec.get("clip_frames"):  # type: ignore[union-attr]
             condition["clip_frames"] = resolution_spec["clip_frames"]  # type: ignore[index]
         if model_spec.get("note"):
             condition["note"] = model_spec["note"]  # type: ignore[index]
         out.append((name, condition))
     return out
+
+
+# --------------------------------------------------------------- trial budget
+DEFAULT_FPS_HINT = 30.0
+
+
+def _fps_hint(condition: dict[str, object], scenario: dict[str, object]) -> float:
+    """Best available guess of this cell's frame rate, only ever used to size a box.
+
+    Order: an explicit per-cell override, the scenario's chain/model table scaled
+    by the resolution, then a flat default. Under-estimating is harmless (the
+    trial runs a little longer than needed); over-estimating truncates the
+    analysis window, so the table is deliberately pessimistic and the report
+    says so when a window came up short.
+    """
+    if condition.get("fps_hint"):
+        return float(condition["fps_hint"])  # type: ignore[arg-type]
+    trial = scenario.get("trial") or {}
+    table = trial.get("fps_hint") if isinstance(trial, dict) else None
+    cell = condition.get("cell") or {}
+    if isinstance(table, dict) and cell:
+        row = table.get(cell.get("chain")) or {}
+        base = row.get(cell.get("model")) if isinstance(row, dict) else None
+        if base:
+            return float(base) * float(condition.get("fps_scale", 1.0))
+    if isinstance(table, (int, float)):
+        return float(table)
+    return DEFAULT_FPS_HINT
+
+
+def trial_budget(
+    condition: dict[str, object],
+    scenario: dict[str, object],
+    *,
+    settle: float | None,
+    analysis_frames: int | None,
+    duration: float | None,
+) -> dict[str, object]:
+    """Turn ``settle_s`` + ``analysis_frames`` into what a front-end needs.
+
+    The design is stated in frames (that is what the percentiles are computed
+    from), but the stop condition is a time ceiling computed from those frames,
+    because the machine state that dominates trial-to-trial variance is a
+    function of elapsed time. ``max_frames`` is a generous hard cap behind the
+    ceiling: it bounds a run whose frame rate was guessed too low, and it also
+    keeps the replay count deterministic.
+    """
+    trial = scenario.get("trial") or {}
+    trial = trial if isinstance(trial, dict) else {}
+    fps = _fps_hint(condition, scenario)
+    settle_s = float(
+        settle
+        if settle is not None
+        else condition.get("settle_s") or trial.get("settle_s", 30.0)
+    )
+    frames = int(
+        analysis_frames
+        if analysis_frames is not None
+        else condition.get("analysis_frames") or trial.get("analysis_frames", 2500)
+    )
+    # 10 % headroom: the analyser drops the settle seconds and then takes exactly
+    # `frames` frames, so a trial that is exactly on the boundary would be short.
+    ceiling = round(settle_s + 1.1 * frames / fps, 1)
+    cap = int(math.ceil(1.5 * settle_s * fps)) + int(math.ceil(1.2 * frames))
+    clip_frames = int(condition.get("clip_frames") or scenario.get("clip_frames") or 0)
+    loops = (
+        int(math.ceil(cap / clip_frames)) + 1
+        if clip_frames
+        else int(scenario.get("loops", 1000))
+    )
+    return {
+        "fps_hint": round(fps, 2),
+        "settle_s": round(settle_s, 2),
+        "analysis_frames": frames,
+        "max_frames": int(condition.get("max_frames") or cap),
+        "duration_s": float(
+            duration if duration is not None else condition.get("duration_s") or ceiling
+        ),
+        "loops": int(condition.get("loops") or loops),
+    }
 
 
 # ----------------------------------------------------------------------- demo
@@ -322,7 +410,24 @@ def main(argv: list[str] | None = None) -> int:
         "--out", type=Path, default=None, help="artefact root (default: results/bench)"
     )
     parser.add_argument("--repeats", type=int, default=None)
-    parser.add_argument("--duration", type=float, default=None)
+    parser.add_argument(
+        "--settle",
+        type=float,
+        default=None,
+        help="seconds of each trial treated as settling and excluded from analysis",
+    )
+    parser.add_argument(
+        "--analysis-frames",
+        type=int,
+        default=None,
+        help="frames of analysis window after the settle period (per-trial budget)",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="override the computed time ceiling for every cell",
+    )
     parser.add_argument(
         "--conditions", default=None, help="comma separated subset by name"
     )
@@ -347,7 +452,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.demo:
         return run_demo(scenario, args)
     repeats = int(args.repeats or scenario.get("repeats", 3))
-    duration = float(args.duration or scenario.get("duration_s", 120))
     out_root = Path(args.out or scenario.get("out_dir") or (REPO / "results/bench"))
     if not out_root.is_absolute():
         out_root = (REPO / out_root).resolve()
@@ -364,6 +468,7 @@ def main(argv: list[str] | None = None) -> int:
         ]
     )
     known: set[str] = set()
+    overrides = scenario.get("cells") or {}
     for name, condition in pool:
         known.add(name)
         if wanted and name not in wanted:
@@ -371,7 +476,15 @@ def main(argv: list[str] | None = None) -> int:
         if not condition.get("enabled", True):
             print(f"skip {name}: disabled in scenario", file=sys.stderr)
             continue
-        conditions.append((name, condition))
+        # Per-cell knobs (fps_hint, settle_s, analysis_frames, max_frames,
+        # duration_s, loops) live in `cells`, away from the factor tables.
+        merged = dict(condition)
+        if isinstance(overrides, dict):
+            merged.update(overrides.get(name) or {})
+        if merged.get("enabled", True) is False:
+            print(f"skip {name}: disabled in cells", file=sys.stderr)
+            continue
+        conditions.append((name, merged))
     if wanted:
         missing = [name for name in wanted if name not in known]
         if missing:
@@ -385,9 +498,24 @@ def main(argv: list[str] | None = None) -> int:
     source = str(scenario.get("source", ""))
     out_root.mkdir(parents=True, exist_ok=True)
 
+    budgets = {
+        name: trial_budget(
+            condition,
+            scenario,
+            settle=args.settle,
+            analysis_frames=args.analysis_frames,
+            duration=args.duration,
+        )
+        for name, condition in conditions
+    }
+    ceilings = [float(budgets[name]["duration_s"]) for name, _ in conditions]
+    settles = {float(budgets[name]["settle_s"]) for name, _ in conditions}
+    windows = {int(budgets[name]["analysis_frames"]) for name, _ in conditions}
     print(
-        f"{len(conditions)} condition(s) x {repeats} repeat(s), {duration:.0f}s each, "
-        f"-> {out_root}",
+        f"{len(conditions)} cell(s) x {repeats} pass(es); analysis window "
+        f"{', '.join(str(n) for n in sorted(windows))} frames after "
+        f"{', '.join(f'{s:g}' for s in sorted(settles))}s settle; "
+        f"time ceiling {min(ceilings):.0f}-{max(ceilings):.0f}s -> {out_root}",
         file=sys.stderr,
     )
 
@@ -398,17 +526,19 @@ def main(argv: list[str] | None = None) -> int:
         for name, condition in order:
             trial_dir = out_root / name / f"r{repeat + 1}"
             trial_dir.mkdir(parents=True, exist_ok=True)
+            budget = budgets[name]
             context = {
                 "python": sys.executable,
                 "repo": str(REPO),
                 "source": str(condition.get("source", source)),
                 "model": str(condition.get("model", "")),
                 "rotate": str(_rotate_of(condition, scenario)),
-                "duration": f"{duration:g}",
+                "duration": f"{float(budget['duration_s']):g}",
+                "frames": str(budget["max_frames"]),
                 "out": str(trial_dir),
                 "condition": name,
                 "repeat": str(repeat + 1),
-                "loops": str(scenario.get("loops", 1000)),
+                "loops": str(budget["loops"]),
             }
             command = build_argv(condition, context)
             env = os.environ.copy()
@@ -472,6 +602,7 @@ def main(argv: list[str] | None = None) -> int:
             meta = {
                 "condition": name,
                 "repeat": repeat + 1,
+                "budget": budget,
                 "command": command,
                 "cwd": cwd_path,
                 "returncode": returncode,
@@ -501,7 +632,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.gap > 0 and (repeat, name) != (repeats - 1, order[-1][0]):
                 time.sleep(args.gap)
 
-    summary = {"scenario": str(args.scenario), "duration_s": duration, "trials": trials}
+    summary = {
+        "scenario": str(args.scenario),
+        "budgets": budgets,
+        "trials": trials,
+    }
     (out_root / "run.json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
     )
