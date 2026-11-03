@@ -43,6 +43,9 @@ class YoloCarProcessor:
 
     def __init__(self, config: YoloCarConfig | None = None) -> None:
         self.config = config or YoloCarConfig()
+        #: Parsed stage-2 chain. Validation happens here (once per process) so
+        #: a typo in a chain fails at construction, not on the first frame.
+        self.pre_ops = preprocessing.parse(self.config.pre_ops)
         self._engine: TensorRTEngine | None = None
         self._input_spec: InputSpec | None = None
 
@@ -133,12 +136,20 @@ class YoloCarProcessor:
         self.close()
 
     # -------------------------------------------------------------- pipeline
-    def prepare_input(self, frame: np.ndarray) -> tuple[np.ndarray, LetterboxInfo]:
-        """Stage 2 + contract: BGR frame -> ``(engine tensor, letterbox geometry)``.
+    def condition(self, frame: np.ndarray) -> tuple[np.ndarray, dict[str, float]]:
+        """Stage 2: coerce the frame, then apply the conditioning chain.
 
-        The coercion that guarantees the wire type happens here, at the
-        boundary, and the contract itself is :mod:`yolocar.model_input` -- the
-        engine-specific part that the inference stage owns.
+        Returns the still-BGR frame and the per-op milliseconds. With an empty
+        chain this is a zero-copy no-op, so an unconditioned run measures
+        exactly what it measured before the stage existed.
+        """
+        return preprocessing.condition(frame, self.pre_ops)
+
+    def prepare_input(self, frame: np.ndarray) -> tuple[np.ndarray, LetterboxInfo]:
+        """The engine contract: conditioned BGR frame -> ``(tensor, geometry)``.
+
+        Part of the inference stage, not of conditioning: it is parameterised
+        by one engine and improves nothing (see :mod:`yolocar.model_input`).
         """
         spec = self.input_spec
         return model_input.prepare(
@@ -162,7 +173,8 @@ class YoloCarProcessor:
 
     def process_frame(self, frame: np.ndarray) -> list[Detection]:
         """Full pipeline for a single BGR frame."""
-        tensor, letterbox = self.prepare_input(frame)
+        conditioned, _ = self.condition(frame)
+        tensor, letterbox = self.prepare_input(conditioned)
         outputs = self.infer(tensor)
         return self.postprocess(outputs, letterbox)
 

@@ -46,6 +46,7 @@ import cv2
 import numpy as np
 from typing_extensions import Self
 
+from . import preprocessing
 from .acquisition import FrameSource, open_source
 from .config import DEFAULT_OUTPUT_FPS, ROAD_CLASS_IDS, YoloCarConfig
 from .detections import DetectionLog, build_header
@@ -193,6 +194,8 @@ def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
 
     acquisition_ms: list[float] = []
     preprocess_ms: list[float] = []
+    #: Per-op breakdown of stage 2, keyed by op name (empty when the chain is).
+    pre_op_ms: dict[str, list[float]] = {}
     inference_ms: list[float] = []
     postprocess_ms: list[float] = []
     presentation_ms: list[float] = []
@@ -253,8 +256,13 @@ def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
                     events["first_frame"] = t0
                 replays = frame.loop + 1
 
-                tensor, letterbox = processor.prepare_input(frame.image)
+                # Stage 2: conditioning only, at source resolution. The
+                # engine contract (letterbox/tensor) belongs to the inference
+                # stage below, exactly as it does in the ROS chain, so the
+                # pre_ms/infer_ms split means the same thing on both.
+                conditioned, op_ms = processor.condition(frame.image)
                 t1 = time.monotonic()
+                tensor, letterbox = processor.prepare_input(conditioned)
                 outputs = processor.infer(tensor)
                 t2 = time.monotonic()
                 detections: list[Detection] = processor.postprocess(outputs, letterbox)
@@ -263,8 +271,12 @@ def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
                 present = 0.0
                 if sink is not None or show:
                     t_present = time.monotonic()
+                    # Draw on what the model actually saw, not on the raw
+                    # decode: with a conditioning chain those differ.
                     annotated = (
-                        frame.image if not detections else draw_detections(frame.image, detections)
+                        conditioned
+                        if not detections
+                        else draw_detections(conditioned, detections)
                     )
                     if sink is not None:
                         sink.write(annotated)
@@ -289,6 +301,8 @@ def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
 
                 acquisition_ms.append(acquired)
                 preprocess_ms.append(preprocessed)
+                for name, value in op_ms.items():
+                    pre_op_ms.setdefault(name, []).append(value)
                 inference_ms.append(inferred)
                 postprocess_ms.append(postprocessed)
                 frame_ms.append(preprocessed + inferred + postprocessed)
@@ -314,6 +328,14 @@ def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
                         "t_mono": round(t_acq, 6),
                         "acq_ms": round(acquired, 4),
                         "pre_ms": round(preprocessed, 4),
+                        # Optional breakdown, like transport_ms in the ROS
+                        # records: absent when the chain is empty, so an
+                        # unconditioned record is byte-identical to before.
+                        **(
+                            {"pre_ops": {k: round(v, 4) for k, v in op_ms.items()}}
+                            if op_ms
+                            else {}
+                        ),
                         "infer_ms": round(inferred, 4),
                         "post_ms": round(postprocessed, 4),
                         "present_ms": round(present, 4),
@@ -379,6 +401,18 @@ def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
         "stage_ms": {
             "acquisition": _latency_stats(acquisition_ms),
             "preprocess": _latency_stats(preprocess_ms),
+            #: Only present when a conditioning chain ran; the sum of these
+            #: means is ``stage_ms.preprocess``.
+            **(
+                {
+                    "preprocess_ops": {
+                        name: _latency_stats(values)
+                        for name, values in pre_op_ms.items()
+                    }
+                }
+                if pre_op_ms
+                else {}
+            ),
             "inference": _latency_stats(inference_ms),
             "postprocess": _latency_stats(postprocess_ms),
             #: Debug only: annotation + encoding, excluded from ``fps``.
@@ -398,6 +432,7 @@ def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
             "conf_threshold": config.conf_threshold,
             "iou_threshold": config.iou_threshold,
             "image_size": config.image_size,
+            "pre_ops": list(config.pre_ops),
             "target_class_ids": list(config.target_class_ids),
             "agnostic_nms": config.agnostic_nms,
             "device": config.device,
@@ -448,6 +483,9 @@ def format_summary(summary: dict[str, object]) -> str:
         if stats:
             share = stats["mean"] / max(latency.get("mean", 1.0), 1e-9) * 100
             lines.append(f"  {stage:<11} mean {stats['mean']:.2f} ms ({share:.1f}%)")
+            if stage == "preprocess":
+                for name, op_stats in (stages.get("preprocess_ops") or {}).items():
+                    lines.append(f"    {name:<9} mean {op_stats['mean']:.2f} ms")
     presentation = stages.get("presentation") or {}
     if presentation:
         lines.append(
@@ -500,6 +538,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--classes",
         default=",".join(str(c) for c in ROAD_CLASS_IDS),
         help="comma separated COCO ids kept by the domain filter",
+    )
+    parser.add_argument(
+        "--pre",
+        action="append",
+        metavar="OP",
+        default=None,
+        help=(
+            "stage-2 conditioning op, repeatable and applied in the order "
+            "given (e.g. --pre clahe --pre 'bilateral:d=9'). Names come from "
+            "yolocar.preprocessing.OPS; empty (the default) is a no-op"
+        ),
     )
     parser.add_argument("--agnostic-nms", action="store_true")
     parser.add_argument("--max-det", type=int, default=YoloCarConfig.max_detections)
@@ -557,6 +606,13 @@ def config_from_args(args: argparse.Namespace) -> YoloCarConfig:
     class_ids = tuple(
         int(value) for value in str(args.classes).split(",") if value.strip() != ""
     )
+    pre_ops = tuple(args.pre or ())
+    try:
+        # Fail on a bad chain at argument parsing time, with the parser's
+        # message, instead of inside run_benchmark's traceback.
+        preprocessing.parse(pre_ops)
+    except ValueError as exc:
+        raise ValueError(f"--pre: {exc}") from exc
     return YoloCarConfig(
         model_path=Path(args.model),
         device=int(args.device),
@@ -573,6 +629,7 @@ def config_from_args(args: argparse.Namespace) -> YoloCarConfig:
         output_path=Path(args.output) if args.output else None,
         json_path=Path(args.json) if args.json else None,
         rotate=int(args.rotate),
+        pre_ops=pre_ops,
         conf_threshold=float(args.conf),
         iou_threshold=float(args.iou),
         agnostic_nms=bool(args.agnostic_nms),

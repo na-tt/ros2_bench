@@ -395,6 +395,48 @@ def test_pipeline_accepts_grayscale_strided_and_fortran_frames(
 
 
 # ----------------------------------------------------------------------- CLI
+def test_cli_conditioning_chain_is_recorded_per_op(tmp_path: Path) -> None:
+    """The chain reaches the records and the summary as an optional breakdown."""
+    source = tmp_path / "frames"
+    source.mkdir()
+    for index, frame in enumerate(_frames()):
+        assert cv2.imwrite(str(source / f"frame_{index:03d}.jpg"), frame)
+
+    json_path = tmp_path / "summary.json"
+    records = tmp_path / "records.jsonl"
+    code = yolocar_main(
+        [
+            "--model", str(ENGINE_PATH),
+            "--source", str(source),
+            "--json", str(json_path),
+            "--records", str(records),
+            "--pre", "gamma:gamma=1.5",
+            "--pre", "clahe",
+            "--max-frames", "2",
+            "--log-level", "WARNING",
+        ]
+    )
+    assert code == 0
+
+    summary = json.loads(json_path.read_text(encoding="utf-8"))
+    assert summary["config"]["pre_ops"] == ["gamma:gamma=1.5", "clahe"]
+    ops = summary["stage_ms"]["preprocess_ops"]
+    assert set(ops) == {"gamma", "clahe"}
+
+    rows = [json.loads(line) for line in records.read_text(encoding="utf-8").splitlines()]
+    assert rows and all(set(row["pre_ops"]) == {"gamma", "clahe"} for row in rows)
+    # Stage 2 is the chain alone: its total is the sum of the parts.
+    for row in rows:
+        assert row["pre_ops"]["gamma"] <= row["pre_ms"] + 1e-6
+        assert sum(row["pre_ops"].values()) <= row["pre_ms"] + 1e-6
+
+
+def test_cli_rejects_an_unknown_conditioning_op(capsys) -> None:
+    with pytest.raises(SystemExit):
+        yolocar_main(["--pre", "sharpen", "--source", "unused"])
+    assert "unknown preprocessing op" in capsys.readouterr().err
+
+
 def test_cli_benchmark_end_to_end(tmp_path: Path) -> None:
     source = tmp_path / "frames"
     source.mkdir()

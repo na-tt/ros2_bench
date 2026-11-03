@@ -139,6 +139,12 @@ class YoloCarConfig:
     trt_log_level: str = "warning"
 
     # --- source / output ------------------------------------------------
+    #: Stage 2 conditioning chain, applied in order at source resolution.
+    #: Strings in the form ``name`` or ``name:key=value,key2=value2``; the
+    #: registry and the parser live in :mod:`yolocar.preprocessing` (see
+    #: ``preprocessing.OPS``). Empty = identity, bit-exact and copy-free, which
+    #: is what every measurement taken before this stage existed recorded.
+    pre_ops: tuple[str, ...] = ()
     #: File, directory of images, video, or camera index ("0").
     source: Path | str = Path("assets/videos")
     #: Cap the number of processed frames (``None`` = all).

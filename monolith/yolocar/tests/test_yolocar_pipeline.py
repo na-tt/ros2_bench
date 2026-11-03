@@ -94,6 +94,49 @@ def test_preprocess_returns_tensor_and_geometry() -> None:
     assert info.original_shape == (720, 1280)
 
 
+# ------------------------------------------------------- stage-2 chain wiring
+def test_processor_parses_the_configured_chain() -> None:
+    config = YoloCarConfig(pre_ops=("gamma:gamma=1.5", "clahe"))
+    processor = YoloCarProcessor(config)
+    assert [op.name for op in processor.pre_ops] == ["gamma", "clahe"]
+    assert processor.pre_ops[0].params == {"gamma": 1.5}
+
+
+def test_processor_rejects_a_bad_chain_at_construction() -> None:
+    with pytest.raises(ValueError, match="unknown preprocessing op"):
+        YoloCarProcessor(YoloCarConfig(pre_ops=("sharpen",)))
+
+
+def test_processor_condition_is_a_noop_without_a_chain() -> None:
+    processor = YoloCarProcessor(YoloCarConfig())
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    out, timings = processor.condition(frame)
+    assert out is frame
+    assert timings == {}
+
+
+def test_processor_condition_reports_per_op_timings() -> None:
+    processor = YoloCarProcessor(YoloCarConfig(pre_ops=("gamma:gamma=0.5", "clahe")))
+    frame = np.full((24, 32, 3), 200, dtype=np.uint8)
+    out, timings = processor.condition(frame)
+    assert list(timings) == ["gamma", "clahe"]
+    assert out.shape == frame.shape and out.dtype == np.uint8
+    assert not np.array_equal(out, frame)
+
+
+def test_condition_and_contract_are_separate_stages() -> None:
+    """Stage 2 keeps source geometry; only the contract changes the shape."""
+    processor = YoloCarProcessor(YoloCarConfig(pre_ops=("clahe",)))
+    frame = np.full((90, 160, 3), 128, dtype=np.uint8)
+    conditioned, _ = processor.condition(frame)
+    assert conditioned.shape == frame.shape
+
+    tensor, info = prepare(conditioned, (64, 64), np.dtype(np.float32))
+    assert info.original_shape == (90, 160)
+    assert tensor.shape[2:] == info.input_shape
+    assert tensor.dtype == np.float32
+
+
 # -------------------------------------------------------------------- inference
 @pytest.mark.parametrize("transposed", [False, True])
 def test_decode_predictions_accepts_both_layouts(transposed: bool) -> None:
