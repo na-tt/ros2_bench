@@ -294,21 +294,28 @@ never imports pipeline code. Details and the metric dictionary are in
   is reported as `stage_ms.presentation` and subtracted from `fps`
   (`fps_wall` keeps the raw rate).
 
-**Baseline** (Orin Nano, `yolov8n_fp16.engine`, *original* clip with
-`--rotate 180`, 40 s clip replayed, 20 s analysis window, 2x120 s per condition).
-Sanity check, not a target -- and **not comparable to the matrix**: it was
-measured on the uprightness-corrected original file, so it pays a rotation the
-`_720p` cell does not, and it uses a time window rather than a frame budget.
-Re-measure it as `monolith-720p-n` before quoting a resolution delta against it:
+**Baseline** (Orin Nano, full matrix, 3 interleaved passes, `settle_s=30` +
+`analysis_frames=2500`, rotation-corrected footage). Mean ± sample std across
+passes; the anchor is bold:
 
-| | p50 | fps | cpu ms/f | cores | gpu % | W | J/f | pss MB |
+| cell | p50 ms | fps | cpu ms/f | cores | gpu % | W | J/f | pss MB |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| monolith | 17.2 ms | 34.8 | 29.0 | 1.0 | 26 | 10.8 | 0.31 | 470 |
+| **monolith-720p-n** | **12.57 ± 0.19** | **59.5** | 25.6 | 1.53 | 28 | 9.6 | 0.165 | 639 |
+| monolith-180p-n | 12.71 ± 0.06 | 70.3 | 14.4 | 1.01 | 33 | 9.6 | 0.140 | 607 |
+| ros-4node-720p-n | 42.40 ± 0.93 | 20.1 | 70.2 | 1.41 | 6 | 8.1 | 0.408 | 923 |
+| ros-4node-180p-n | 36.16 ± 0.90 | 26.3 | 49.8 | 1.31 | 8 | 8.2 | 0.316 | 871 |
 
-Reading: the chain uses ~1 core while the GPU sits at ~26 % duty, i.e. it is
-**CPU-bound**, and acquisition (decode + rotate, ~8 ms) is ~28 % of the CPU time
-while being excluded from the latency headline. ROS 2 overhead will land on the
-saturated resource. Harness overhead itself is +0.15 ms/frame (0.5 %).
+Reading. At fixed `imgsz=640` the resolution axis moves **CPU, not latency**:
+720p→180p leaves p50 flat (`+0.14 ± 0.33 ms`, not significant) while CPU per
+frame drops 44 % and throughput rises 18 %, because the only things resolution
+touches are decode, letterbox and memory traffic. The model axis sets latency
+(12.6 / 26.3 / 46.8 ms at 720p for n/m/x). The chain is **CPU-bound but no longer
+single-core**: 25.6 ms of CPU per 15.4 ms of latency (1.53 cores) at 720p, 1.0
+core at 180p -- the excess is the multithreaded letterbox/tensor conversion.
+Acquisition is 2.8 ms (11 % of CPU) at 720p and 0.4 ms at 180p, so the old
+"decode + rotate costs ~8 ms" figure was mostly the rotation these cells do not
+pay. ROS 2 overhead lands on the saturated resource: ~70 ms of CPU per frame
+across 4 processes.
 
 ## Pipelines
 ### yolocar
@@ -369,10 +376,19 @@ type only at the very end.
 * **The ROS chain is transport-bound, and that is the measurement.** The ROS
   records add `transport_ms` (serialisation + DDS + scheduling) and the summary
   adds a `transport` stage bucket. On this Jetson the two large payloads (2.7 MB
-  BGR frame, 4.9 MB float32 tensor) make the four-node chain ~70-85 ms p50 / ~10
-  fps, against ~17 ms / ~35 fps for the monolith. Do not reduce it by shrinking
-  the measured stages or by inserting queues; that is exactly what the
-  benchmark exists to show.
+  BGR frame, 4.9 MB float32 tensor) make the four-node chain ~42 ms p50 / ~20 fps
+  at 720p, against ~12.6 ms / ~60 fps for the monolith. Measured across the
+  resolution axis, `xport` behaves like **~7 ms of fixed cost plus ~2.2 ms/MB**
+  (~450 MB/s): 24.2 / 21.2 / 18.4 ms at 720p / 360p / 180p. The tensor is
+  constant, so the resolution axis can only remove ~34 % of the bytes -- and it
+  does, proportionally. Do not reduce the overhead by shrinking the measured
+  stages or by inserting queues; that is exactly what the benchmark exists to
+  show.
+  **Never compare these numbers to another session's.** An earlier run of the
+  same design measured `xport` = 67 ms, 84 ms p50 end to end, with identical wire
+  payloads and no relevant code change. Whether that was DDS falling back to
+  loopback instead of shared memory, or a busier desktop session, is unresolved
+  -- which is exactly why the report is built on within-pass deltas.
 * **Presentation is offline, never a fifth node.** A run can write
   `detections.jsonl` next to `records.jsonl` (`--detections` on the monolith,
   `detections:=` on the launch file) and `python -m yolocar.demo` renders it onto

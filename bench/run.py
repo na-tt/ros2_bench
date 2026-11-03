@@ -340,9 +340,13 @@ def trial_budget(
     The design is stated in frames (that is what the percentiles are computed
     from), but the stop condition is a time ceiling computed from those frames,
     because the machine state that dominates trial-to-trial variance is a
-    function of elapsed time. ``max_frames`` is a generous hard cap behind the
-    ceiling: it bounds a run whose frame rate was guessed too low, and it also
-    keeps the replay count deterministic.
+    function of elapsed time. ``max_frames`` is a hard cap *behind* the ceiling and
+    is sized to cover an fps overshoot: the frames the settle period eats at twice
+    the hinted rate, plus 50 % slack on the window. It is not the budget -- the
+    ceiling is -- but it must never bind first, or a cell that is simply faster
+    than its hint would be truncated mid-window. (Measured: at the old 1.5x/1.2x
+    sizing, ``monolith-180p-n`` cleared 2500 window frames with 20 frames to
+    spare, i.e. a truncation that would have gone unnoticed.)
     """
     trial = scenario.get("trial") or {}
     trial = trial if isinstance(trial, dict) else {}
@@ -360,7 +364,7 @@ def trial_budget(
     # 10 % headroom: the analyser drops the settle seconds and then takes exactly
     # `frames` frames, so a trial that is exactly on the boundary would be short.
     ceiling = round(settle_s + 1.1 * frames / fps, 1)
-    cap = int(math.ceil(1.5 * settle_s * fps)) + int(math.ceil(1.2 * frames))
+    cap = int(math.ceil(2.0 * settle_s * fps)) + int(math.ceil(1.5 * frames))
     clip_frames = int(condition.get("clip_frames") or scenario.get("clip_frames") or 0)
     loops = (
         int(math.ceil(cap / clip_frames)) + 1

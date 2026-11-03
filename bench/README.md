@@ -303,9 +303,10 @@ Three things, in this order.
    excludes zero. This is also why every subset run must include the anchor: the
    deltas only add up across subsets and sessions if they share the same zero.
 3. **Stage split before the headline.** Acquisition is excluded from
-   `latency_ms` on purpose (it is the decoder, ~28 % of the CPU time), and in the
-   ROS arms most of the frame is `xport`. Reading `p50` without the stage table
-   will attribute a transport cost to the pipeline.
+   `latency_ms` on purpose (it is the decoder: 2.8 ms at 720p, 11 % of the CPU
+   time on this board, and 0.4 ms at 180p), and in the ROS arms most of the frame
+   is `xport`. Reading `p50` without the stage table will attribute a transport
+   cost to the pipeline.
 
 ## Metrics
 
@@ -353,16 +354,19 @@ constant across the matrix):
 
 The resolution axis is therefore a **transport** probe with a modest compute
 side-effect: the letterboxed 640x640 tensor dominates the wire either way, so
-720p→180p removes ~34 % of the bytes, not ~22x. If the four-node chain is
-bandwidth-bound, `xport` should land near 45-50 ms at 180p against ~67 ms at
-720p; a much larger collapse would mean transport is scheduling-bound, not
-bandwidth-bound.
+720p→180p removes ~34 % of the bytes, not ~22x. **Measured on the first full
+pass**, `xport` is 24.2 / 21.2 / 18.4 ms at 720p / 360p / 180p for `n` — i.e.
+~7 ms of fixed serialisation/scheduling cost plus ~2.2 ms/MB (~450 MB/s), linear
+to within 7 %. So the chain is bandwidth-bound, and the resolution axis can
+recover only that 34 %, because it cannot touch the tensor. Shrinking the
+transport further means not shipping the image at all, or shipping the tensor in
+fp16 -- not a smaller video.
 
 ### Pruning
 
-18 cells is ~93 min per pass at the current budget (2 passes ~3.1 h, 3 passes
-~4.7 h) before engine load and gaps, and the spread is wide: `monolith-180p-n`
-is ~91 s while `ros-4node-720p-x` is ~718 s. `--conditions` selects by cell name:
+18 cells is ~50 min per pass at the current budget (2 passes ~1.7 h, 3 passes
+~2.5 h) before engine load and gaps, and the spread is wide: `monolith-180p-n`
+is ~73 s while `ros-4node-720p-x` is ~280 s. `--conditions` selects by cell name:
 
 ```bash
 bench/run.py --dry-run --conditions monolith-720p-n,ros-4node-720p-n
@@ -380,8 +384,8 @@ The two failure modes here have different currencies, so the design uses both.
 * **Frames** are the statistical unit: `p50/p95/p99` are computed from a frame
   count, so every cell gets the same `analysis_frames` and the percentiles are
   comparable across a matrix whose cells differ by 4x in speed. This also fixes a
-  content-mix bias: a fixed 180 s window is 5.2 clip passes at 36 fps but 1.5 at
-  10 fps, so dense-traffic passages weigh ~3.5x more in the monolith trial than
+  content-mix bias: a fixed 180 s window is 8.9 clip passes at 59.5 fps but 3.0 at
+  20.1 fps, so dense-traffic passages weigh ~3x more in the monolith trial than
   in the ROS trial.
 * **Seconds** are the machine-state unit: the ~8 % drift and the thermal ramp are
   functions of elapsed time, so a pure frame budget would measure the fast cells
@@ -389,21 +393,30 @@ The two failure modes here have different currencies, so the design uses both.
   derived from its frame budget.
 
 `scenarios.json` therefore carries `trial.settle_s`, `trial.analysis_frames` and
-a deliberately pessimistic `trial.fps_hint` table (`chain -> model`, scaled by
-`fps_scale` per resolution). Per trial, `run.py` derives:
+`trial.fps_hint` (`chain -> model`, scaled by `fps_scale` per resolution). The
+hints are the 720p rates measured over a 3-pass run with 10 % taken off: an
+over-estimate shortens the ceiling until the window goes short, an under-estimate
+only costs a few seconds. Re-derive them after anything that plausibly moves
+throughput, and treat a `window_short` warning as "the hint is now wrong". Per
+trial, `run.py` derives:
 
 ```
 duration  = settle_s + 1.1 * analysis_frames / fps_hint     # stop condition
-max_frames= 1.5*settle_s*fps_hint + 1.2*analysis_frames      # hard cap behind it
+max_frames= 2.0*settle_s*fps_hint + 1.5*analysis_frames      # hard cap behind it
 loops     = ceil(max_frames / clip_frames) + 1               # exact, not 1000
 ```
 
+The cap is sized to cover an fps *overshoot* (twice the hinted rate during the
+settle, 50 % slack on the window), because it must never bind before the ceiling:
+if it does, the trial ends mid-window and the cell is silently measured over
+fewer frames. The first full run came within 20 frames of exactly that, which is
+why the term is 2.0x rather than 1.5x.
+
 Both front-ends already stop on whichever comes first (`main.py`, and
 `acquisition_node.py` for the ROS chain), so this is config, not pipeline code.
-An over-estimated `fps_hint` truncates the window and `analyze.py` says so; an
-under-estimate only costs a few seconds. `run.json` records the whole budget
-table and every `run.meta.json` repeats its cell's budget, so a suspicious trial
-can be audited after the fact.
+`analyze.py` warns when a window came up short. `run.json` records the whole
+budget table and every `run.meta.json` repeats its cell's budget, so a suspicious
+trial can be audited after the fact.
 
 ## Calibration
 
