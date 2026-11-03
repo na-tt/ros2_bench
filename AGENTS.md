@@ -84,8 +84,9 @@ New pipelines follow the same shape: `monolith/<name>/` with `pyproject.toml`
    * Do not add clock pinning, GC tuning, warmup stages or headless-mode
      requirements to the harness: the machine's natural noise floor and
      desktop-session activity are deliberate parts of the measurement.
-   * Compare conditions with interleaved trials plus a duplicate control
-     condition, never as back-to-back blocks.
+   * Compare conditions within interleaved passes, never as back-to-back
+     blocks: one cell (the *anchor*) is measured in every pass, and every claim
+     is a per-pass delta against it.
 
 6. **Workspace Isolation**:
    * The ROS 2 workspace lives entirely within `ws/`.
@@ -179,11 +180,13 @@ source install/setup.bash
   `tensorrt` and the `.engine` exist (they do on this Jetson, so the suite
   covers the real driver, not just fakes).
 
-* **To run a full measurement** (interleaved trials + telemetry, see
-  *Measurement Protocol* below):
+* **To run a full measurement** (interleaved passes + telemetry, see
+  *Measurement Protocol* below). Cells are `<chain>-<resolution>-<model>`, so a
+  run selects them explicitly; `--settle`/`--analysis-frames` override the
+  trial budget only for smoke runs:
   ```bash
-  bench/run.py --repeats 3 --duration 300
-  bench/analyze.py --from 30 --to 270 --md results/report.md --json results/report.json
+  bench/run.py --repeats 3 --conditions monolith-720p-n,ros-4node-720p-n
+  bench/analyze.py --md results/report.md --json results/report.json
   ```
 
 * **To run a ROS 2 implementation** (the four-node chain -- see *Current State*):
@@ -256,20 +259,44 @@ never imports pipeline code. Details and the metric dictionary are in
   and is part of the measurement.
 * **No warmup stage, nothing discarded at runtime.** `processor.warmup()` exists
   for interactive use only. Startup and settling are recorded; the analysis
-  window is chosen in `analyze.py` (`--from`/`--to`, seconds after the first
-  frame) and can be re-chosen without re-measuring.
-* **Interleaved trials plus a duplicate control.** `monolith-ctrl` is a
-  byte-identical clone of `monolith`; the difference between them *is* the noise
-  floor. Measured on this Jetson: ~7 % between identical conditions over 4
-  interleaved 120 s trials, ~3 % within a condition, and ~8 % drift between
-  replays inside a single run (in either direction). Never run all of A, then
-  all of B.
+  window is chosen in `analyze.py` (`--settle` seconds, then `--frames` frames,
+  both defaulting to the scenario's `trial` block) and can be re-chosen without
+  re-measuring.
+* **Frames for the statistics, seconds for the machine.** Every cell's trial
+  budget targets the same `analysis_frames` -- that is what makes p95/p99
+  comparable across cells that differ 4x in speed, and it removes the content-mix
+  bias of an equal-seconds window. The *stop* condition stays a time ceiling
+  derived from those frames, because the ~8 % drift and the thermal ramp are
+  functions of elapsed time: a pure frame budget would measure the fast cells
+  cold. `fps_hint` only sizes the box; the report warns when a window came up
+  short.
+* **Blocks, zig-zag, anchor.** Cells are grouped into blocks (`block_by`) and the
+  block order is shuffled per pass with a logged seed, while the direction inside
+  a block alternates. The cyclic Latin square is kept only where it is exact
+  (<= 6 cells, `repeats` a multiple of the cell count). A randomised order turns
+  residual drift into variance the std can see; a deterministic unbalanced one
+  turns it into a bias the std cannot. Measured on this Jetson: ~7 % between
+  identical conditions over 4 interleaved 120 s trials, ~3 % within a condition,
+  and ~8 % drift between replays inside a single run (in either direction).
+  Never run all of A, then all of B.
+* **Report mean ± std across passes, and deltas for claims.** The headline table
+  carries mean ± sample std with `n`; with n < 6 the std itself is only good to
+  ~40 %, so the per-trial values are printed next to it. Any real claim is the
+  within-pass delta against the anchor with its 95 % CI -- two means measured
+  hours apart are not comparable. The old duplicate control cell (`monolith-ctrl`)
+  is no longer measured: the anchor's repetition provides the same noise floor on
+  the same clock. Keep it as a demo artifact and as an on-demand A/A check when
+  the harness itself changes.
 * **Annotation is debug only.** `--draw`/`--output` cost ~22 ms/frame; that time
   is reported as `stage_ms.presentation` and subtracted from `fps`
   (`fps_wall` keeps the raw rate).
 
-**Baseline** (Orin Nano, `yolov8n_fp16.engine`, 40 s clip replayed, 20 s analysis
-window, 2x120 s per condition). Sanity check, not a target:
+**Baseline** (Orin Nano, `yolov8n_fp16.engine`, *original* clip with
+`--rotate 180`, 40 s clip replayed, 20 s analysis window, 2x120 s per condition).
+Sanity check, not a target -- and **not comparable to the matrix**: it was
+measured on the uprightness-corrected original file, so it pays a rotation the
+`_720p` cell does not, and it uses a time window rather than a frame budget.
+Re-measure it as `monolith-720p-n` before quoting a resolution delta against it:
 
 | | p50 | fps | cpu ms/f | cores | gpu % | W | J/f | pss MB |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -369,9 +396,15 @@ type only at the very end.
   to `yolocar_ros` fixed it: `import yolocar_ros` works and `import yolocar` now
   correctly needs `PYTHONPATH=monolith/yolocar/src`, as the `bench` conditions
   already do. Keep wrapper packages `<name>_ros`.
-* **The clip is stored upside down: use `--rotate 180`.** `CAP_PROP_ORIENTATION_META`
-  reports 270 for `assets/video/0000f77c-6257be58.mov`, which is wrong -- do not
-  auto-apply the container flag.
+* **Rotation belongs to the file, not the scenario.** The original
+  `assets/video/0000f77c-6257be58.mov` is stored upside down and
+  `CAP_PROP_ORIENTATION_META` reports 270 for it, which is wrong -- do not
+  auto-apply the container flag, pass `--rotate 180`. The per-resolution
+  re-encodes (`_720p`/`_360p`/`_180p`) had the rotation baked into the pixels by
+  ffmpeg, which also cleared the display matrix, so they need `rotate: 0`
+  (`run.py` allows a per-cell override; `bench.launch.py` defaults to 0). Getting
+  this wrong does not fail a run -- it measures inference on an upside-down road
+  scene, and only `n_det` and the demo video look wrong.
 * **`YoloCarConfig.source` default (`assets/videos`) is stale.** The directory
   was renamed to `assets/video/` (singular, commit `007caae`) and now holds a
   `.mov`, so the default fails either way (`no such dir`, or `no images found`

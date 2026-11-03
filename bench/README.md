@@ -250,7 +250,7 @@ source to its end.
 
 ```
 results/bench/
-├── run.json
+├── run.json            # scenario, order (schedule + balance audit), per-cell budgets
 └── <condition>/r<repeat>/
     ├── records.jsonl     # one JSON object per frame (the contract)
     ├── summary.json      # workload summary (latency, stages, provenance)
@@ -278,11 +278,30 @@ missing measurement. In the ROS chain `infer_ms` also contains the detect-head
 decode/threshold (the candidates, not the raw head, cross the topic boundary):
 compare `infer + post` as a block, not the two buckets separately.
 
+## Reading the report
+
+Three things, in this order.
+
+1. **The headline table is mean ± sample std across passes**, with `n` in its
+   second column. That std is a *dispersion, not a confidence interval*: with
+   n = 3-4 it is itself only good to ~40 %, which is why the raw per-trial values
+   are printed underneath rather than trusted to a summary.
+2. **Deltas vs the anchor are what a claim is made of.** Two cells measured hours
+   apart are not comparable -- the board drifts ~8 % across a long session -- so
+   `analyze.py` differences every cell against the anchor *inside each pass* and
+   reports the mean delta with a 95 % CI over paired passes. A `*` means the CI
+   excludes zero. This is also why the anchor must appear in every pass: it is
+   the control, and its repetition is what produces the comparator.
+3. **Stage split before the headline.** Acquisition is excluded from
+   `latency_ms` on purpose (it is the decoder, ~28 % of the CPU time), and in the
+   ROS arms most of the frame is `xport`. Reading `p50` without the stage table
+   will attribute a transport cost to the pipeline.
+
 ## Metrics
 
 | column | source | note |
 |---|---|---|
-| `p50/p95/p99` | records | p99/max are usually desktop-session noise, not the pipeline |
+| `p50/p95/p99` | records | over the window's frames; printed as mean ± std across passes |
 | `fps` | records | frames inside the window over the window span |
 | `cpu ms/f`, `cores` | `/proc` | workload CPU time per frame; `cores` = cpu/wall |
 | `pss MB` | `/proc` | peak PSS of the process group (accounts for shared pages) |
@@ -331,7 +350,9 @@ bandwidth-bound.
 
 ### Pruning
 
-18 cells x 3 passes is a full working day. `--conditions` selects by cell name:
+18 cells is ~93 min per pass at the current budget (2 passes ~3.1 h, 3 passes
+~4.7 h) before engine load and gaps, and the spread is wide: `monolith-180p-n`
+is ~91 s while `ros-4node-720p-x` is ~718 s. `--conditions` selects by cell name:
 
 ```bash
 bench/run.py --dry-run --conditions monolith-720p-n,ros-4node-720p-n

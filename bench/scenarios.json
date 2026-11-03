@@ -5,6 +5,8 @@
   "duration_s": 120,
   "loops": 1000,
   "repeats": 3,
+  "anchor": "monolith-720p-n",
+  "anchor_note": "The reference cell: it should appear in every pass, and every claim is reported as a within-pass delta against it (analyze.py --anchor to override). Chosen as the cheapest cell that is still representative, because its repetition is what buys the noise floor.",
   "out_dir": "results/bench",
   "trial": {
     "note": "The design is stated in frames -- that is what the percentiles are computed from -- and each trial gets a time ceiling derived from them, because the machine state that dominates trial-to-trial variance is a function of elapsed time, not of frame count. `settle_s` is skipped by the analyser (thermal/clock ramp); `analysis_frames` is then taken verbatim, so every cell reports percentiles over the same n. `fps_hint` only sizes the box: it is deliberately pessimistic, an over-estimate truncates the window (the report warns), an under-estimate just runs a few seconds longer. Replace the table with the numbers from a pilot.",

@@ -136,6 +136,48 @@ def window_indices(
     return low, high
 
 
+def _stats(values: Iterable[float | None]) -> dict[str, Any] | None:
+    """Mean and sample std across *passes* (never across frames).
+
+    A per-frame std is milliseconds and meaningless (frames are autocorrelated
+    and the distribution is skewed); the unit of replication is the trial.
+    """
+    data = [float(value) for value in values if value is not None]
+    if not data:
+        return None
+    return {
+        "n": len(data),
+        "mean": statistics.fmean(data),
+        "std": statistics.stdev(data) if len(data) > 1 else None,
+        "min": min(data),
+        "max": max(data),
+    }
+
+
+#: Two-sided 95 % Student t for df = n - 1; beyond the table the normal limit
+#: (1.96) is close enough for a dispersion that is already only indicative.
+_T95 = {
+    1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
+    8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145,
+    15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086,
+}
+
+
+def _ci95(std: float | None, n: int) -> float | None:
+    if std is None or n < 2:
+        return None
+    return _T95.get(n - 1, 1.96) * std / (n**0.5)
+
+
+def _fmt_stats(stats: dict[str, Any] | None, digits: int = 2) -> str:
+    if not stats:
+        return "–"
+    mean = f"{stats['mean']:.{digits}f}"
+    if stats.get("std") is None:
+        return mean
+    return f"{mean} ± {stats['std']:.{digits}f}"
+
+
 # ---------------------------------------------------------------------- trials
 def summarise_trial(
     trial_dir: Path,
@@ -161,7 +203,16 @@ def summarise_trial(
     low, high = window_indices(records, settle_s=settle_s, frames=frames, to_s=to_s)
     window = records[low:high]
     if not window:
-        return None
+        span = records[-1]["t_mono"] - records[0]["t_mono"]
+        return {
+            "condition": trial_dir.parent.name,
+            "repeat": trial_dir.name,
+            "failed": True,
+            "reason": (
+                f"has no frames in the window (a {settle_s or 0:g}s settle over a "
+                f"{span:.1f}s trial)"
+            ),
+        }
 
     count = len(window)
     latency = [record["latency_ms"] for record in window]
@@ -281,19 +332,14 @@ def aggregate(trials: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             "trials": len(group),
             "frames": int(round(_median(t["frames"] for t in group) or 0)),
             "detections_per_frame": _median(t["detections_per_frame"] for t in group),
-            "spread": {},
+            "stats": {},
         }
         for name, getter in SCALARS:
-            values = [getter(trial) for trial in group]
-            values = [value for value in values if value is not None]
-            entry[name] = _median(values)
-            if len(values) > 1:
-                low, high = min(values), max(values)
-                entry["spread"][name] = (
-                    (high - low) / statistics.median(values) * 100.0
-                    if statistics.median(values)
-                    else None
-                )
+            stats = _stats(getter(trial) for trial in group)
+            entry["stats"][name] = stats
+            # Flat mean, so a consumer does not have to dig; the dispersion lives
+            # next to it in `stats` because it is the number a reader must see.
+            entry[name] = stats["mean"] if stats else None
         entry["trials_detail"] = [
             {
                 "repeat": trial["repeat"],
@@ -319,10 +365,133 @@ def _fmt(value: Any, digits: int = 1) -> str:
     return f"{float(value):.{digits}f}"
 
 
-def to_markdown(report: dict[str, dict[str, Any]], window: str) -> str:
+# ------------------------------------------------------------- paired deltas
+#: Metrics worth a per-pass difference against the anchor. Latency, throughput
+#: and the two resource ratios are what a claim is actually made of.
+DELTA_METRICS = (
+    ("p50_ms", lambda t: t["latency"].get("p50")),
+    ("p95_ms", lambda t: t["latency"].get("p95")),
+    ("fps", lambda t: t.get("fps")),
+    ("cpu_ms_f", lambda t: t.get("cpu_ms_per_frame")),
+    ("j_f", lambda t: t.get("joules_per_frame")),
+)
+
+
+def paired_deltas(
+    trials: list[dict[str, Any]], anchor: str | None
+) -> dict[str, dict[str, Any]]:
+    """Per-pass difference of every cell against the anchor cell.
+
+    Two cells from different hours are not comparable: the board drifts ~8 % over
+    a long session, which is larger than most effects and inflates the pooled
+    std until nothing is significant. Differencing inside a pass cancels the
+    machine state the two trials shared, so the spread that comes out is the one
+    a claim has to clear. Passes are matched on the repeat index, which is a pass
+    because every pass runs every cell once.
+    """
+    if not anchor:
+        return {}
+    usable = [trial for trial in trials if not trial.get("failed")]
+    by_key = {(trial["condition"], str(trial["repeat"])): trial for trial in usable}
+    anchor_trials = {
+        str(trial["repeat"]): trial
+        for trial in usable
+        if trial["condition"] == anchor
+    }
+    if not anchor_trials:
+        return {}
+
+    out: dict[str, dict[str, Any]] = {}
+    for condition in dict.fromkeys(trial["condition"] for trial in usable):
+        if condition == anchor:
+            continue
+        rows: list[dict[str, float]] = []
+        for repeat, anchor_trial in sorted(anchor_trials.items()):
+            cell_trial = by_key.get((condition, repeat))
+            if cell_trial is None:
+                continue
+            row = {}
+            for name, getter in DELTA_METRICS:
+                cell_value, anchor_value = getter(cell_trial), getter(anchor_trial)
+                if cell_value is None or anchor_value is None:
+                    continue
+                row[name] = float(cell_value) - float(anchor_value)
+            if row:
+                rows.append(row)
+        if not rows:
+            continue
+        metrics: dict[str, dict[str, Any]] = {}
+        for name, _getter in DELTA_METRICS:
+            stats = _stats(row.get(name) for row in rows)
+            if stats:
+                metrics[name] = {**stats, "ci95": _ci95(stats["std"], stats["n"])}
+        if metrics:
+            out[condition] = metrics
+    return out
+
+
+def _fmt_delta(stats: dict[str, Any] | None, digits: int = 2) -> str:
+    if not stats:
+        return "–"
+    mean = f"{stats['mean']:+.{digits}f}"
+    ci = stats.get("ci95")
+    if ci is None:
+        return mean
+    # A CI that excludes zero is the only kind of difference worth a sentence.
+    star = "*" if abs(stats["mean"]) > ci else ""
+    return f"{mean} ± {ci:.{digits}f}{star}"
+
+
+def delta_markdown(
+    deltas: dict[str, dict[str, Any]], anchor: str | None, n_passes: int
+) -> list[str]:
+    if not deltas or not anchor:
+        return [
+            "",
+            "Deltas: none (set `anchor` in the scenario or pass `--anchor` to "
+            "difference every cell against a reference measured in the same pass).",
+        ]
+    out = [
+        "",
+        f"Deltas vs `{anchor}`, within pass (mean ± 95 % CI over paired passes; "
+        "`*` = CI excludes zero)",
+        "",
+        "| cell | Δp50 ms | Δp95 ms | Δfps | Δcpu ms/f | ΔJ/f | passes |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for condition, metrics in deltas.items():
+        first = next(iter(metrics.values()))
+        out.append(
+            "| "
+            + " | ".join(
+                [
+                    condition,
+                    _fmt_delta(metrics.get("p50_ms")),
+                    _fmt_delta(metrics.get("p95_ms")),
+                    _fmt_delta(metrics.get("fps")),
+                    _fmt_delta(metrics.get("cpu_ms_f"), 2),
+                    _fmt_delta(metrics.get("j_f"), 3),
+                    str(first.get("n", n_passes)),
+                ]
+            )
+            + " |"
+        )
+    return out
+
+
+def to_markdown(
+    report: dict[str, dict[str, Any]],
+    window: str,
+    *,
+    deltas: dict[str, dict[str, Any]] | None = None,
+    anchor: str | None = None,
+) -> str:
+    def stats_of(entry: dict[str, Any], metric: str) -> dict[str, Any] | None:
+        return (entry.get("stats") or {}).get(metric)
+
     header = (
-        "| condition | trials | frames | p50 | p95 | p99 | fps | cpu ms/f | cores "
-        "| pss MB | gpu % | W | J/f | tj °C |"
+        "| condition | passes | frames | p50 ms | p95 ms | p99 ms | fps "
+        "| cpu ms/f | cores | pss MB | gpu % | W | J/f | tj °C |"
     )
     rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     lines = [header, rule]
@@ -334,23 +503,32 @@ def to_markdown(report: dict[str, dict[str, Any]], window: str) -> str:
                     condition,
                     str(entry["trials"]),
                     str(entry["frames"]),
-                    _fmt(entry.get("p50_ms"), 2),
-                    _fmt(entry.get("p95_ms"), 2),
+                    _fmt_stats(stats_of(entry, "p50_ms"), 2),
+                    _fmt_stats(stats_of(entry, "p95_ms"), 2),
                     _fmt(entry.get("p99_ms"), 2),
-                    _fmt(entry.get("fps"), 2),
-                    _fmt(entry.get("cpu_ms_f"), 2),
+                    _fmt_stats(stats_of(entry, "fps"), 2),
+                    _fmt_stats(stats_of(entry, "cpu_ms_f"), 2),
                     _fmt(entry.get("cores"), 2),
                     _fmt(entry.get("pss_mb"), 0),
                     _fmt(entry.get("gpu_pct"), 0),
                     _fmt(entry.get("power_w"), 1),
-                    _fmt(entry.get("j_f"), 2),
+                    _fmt_stats(stats_of(entry, "j_f"), 3),
                     _fmt(entry.get("tj_max"), 1),
                 ]
             )
             + " |"
         )
 
-    out = [f"Window: {window}", "", *lines, ""]
+    out = [
+        f"Window: {window}",
+        "",
+        "Headline values are mean ± sample std across passes (the cell width is a "
+        "dispersion, not a confidence interval: with n < 6 the std itself is only "
+        "good to ~40 %, so read the per-trial table below for the raw values).",
+        "",
+        *lines,
+        "",
+    ]
     out.append(
         "Stages (median ms): pre / infer / post, acquisition separately. "
         "`xport` is the ROS-only serialisation + DDS + scheduling residual."
@@ -377,7 +555,10 @@ def to_markdown(report: dict[str, dict[str, Any]], window: str) -> str:
         )
 
     out.append("")
-    out.append("Per-trial detail (spread across repeats is the noise floor)")
+    out.append(
+        "Per-trial detail (the raw values the mean ± std above are computed from; "
+        "with n < 6 read these, not the summary)"
+    )
     out.append("")
     out.append("| condition | repeat | frames | p50 | p95 | fps | replays |")
     out.append("|---|---|---|---|---|---|---|")
@@ -398,13 +579,17 @@ def to_markdown(report: dict[str, dict[str, Any]], window: str) -> str:
                 )
                 + " |"
             )
-        spread = entry["spread"]
-        if spread:
-            out.append(
-                f"| _{condition} spread_ | | | "
-                f"{_fmt(spread.get('p50_ms'), 1)}% | {_fmt(spread.get('p95_ms'), 1)}% | "
-                f"{_fmt(spread.get('fps'), 1)}% | |"
-            )
+        stats = entry.get("stats") or {}
+        out.append(
+            f"| _{condition} mean ± std_ | | | "
+            f"{_fmt_stats(stats.get('p50_ms'), 2)} | "
+            f"{_fmt_stats(stats.get('p95_ms'), 2)} | "
+            f"{_fmt_stats(stats.get('fps'), 2)} | |"
+        )
+
+    if deltas is not None:
+        passes = max((entry.get("trials", 0) for entry in report.values()), default=0)
+        out.extend(delta_markdown(deltas, anchor, passes))
     return "\n".join(out) + "\n"
 
 
@@ -593,6 +778,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="end the window this many seconds after the first frame",
     )
+    parser.add_argument(
+        "--anchor",
+        default=None,
+        help="cell every other cell is differenced against within each pass "
+        "(default: the scenario's `anchor`)",
+    )
     parser.add_argument("--records", default="records.jsonl")
     parser.add_argument("--sampler", default="sampler.csv")
     parser.add_argument("--md", type=Path, default=None)
@@ -611,6 +802,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    scenario: dict[str, Any] = {}
     defaults: dict[str, Any] = {}
     try:
         scenario = json.loads(args.scenario.read_text(encoding="utf-8"))
@@ -631,15 +823,21 @@ def main(argv: list[str] | None = None) -> int:
         sampler_name=args.sampler,
     )
     if not trials:
-        raise SystemExit(f"no trials with {args.records} found under {args.dir}")
+        raise SystemExit(
+            f"no trials with {args.records} found under {args.dir}"
+            " (if the window warnings above are empty, the directory has no trial output)"
+        )
     failed = [trial for trial in trials if trial.get("failed")]
     for trial in failed:
         print(
-            f"warning: {trial['condition']}/{trial['repeat']} exited non-zero; excluded",
+            f"warning: {trial['condition']}/{trial['repeat']} "
+            f"{trial.get('reason') or 'exited non-zero'}; excluded",
             file=sys.stderr,
         )
 
     report = aggregate(trials)
+    if not report:
+        raise SystemExit("no usable trials: every trial was excluded (see warnings above)")
     spans = [trial["window_s"] for trial in trials if trial.get("window_s")]
     span_note = f" (median span {statistics.median(spans):.1f}s)" if spans else ""
     if window_frames:
@@ -661,7 +859,14 @@ def main(argv: list[str] | None = None) -> int:
                 "(trial stopped too early: lower the fps hint or raise the ceiling)",
                 file=sys.stderr,
             )
-    markdown = to_markdown(report, window)
+    anchor = args.anchor or scenario.get("anchor")
+    deltas = paired_deltas(trials, anchor)
+    if args.anchor and anchor not in report:
+        print(
+            f"warning: anchor {anchor!r} has no usable pass; no deltas reported",
+            file=sys.stderr,
+        )
+    markdown = to_markdown(report, window, deltas=deltas, anchor=anchor)
     extra = demo_section(args.demo_dir)
     if extra:
         markdown += extra + "\n"
@@ -686,7 +891,8 @@ def main(argv: list[str] | None = None) -> int:
         args.md.write_text(markdown, encoding="utf-8")
     if args.json is not None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
-        args.json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        payload = {"anchor": anchor, "deltas": deltas, "conditions": report}
+        args.json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return 0
 
 
