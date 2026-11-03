@@ -441,6 +441,13 @@ type only at the very end.
   `docs/proposals/preprocessing-chain.md` as a deferred experiment, because
   letting `imgsz` track resolution makes inference cost O(pixels) and swamps
   the conditioning ops the resolution axis is meant to measure.
+* **Chain shape is proposed as a second axis, not implemented.**
+  `docs/proposals/chain-shapes.md` enumerates 2-node -> 12-node configurations,
+  predicts each one's delta from the per-hop model, and lists what a
+  generalisation would need (one `chain` launch argument, a stage-runner
+  postprocessing node with `post_ops`, the shape in the provenance). Nothing in
+  that document is built: today only stage 2 is splittable (`pre_split`) and
+  stage 4-6 always runs as one node.
 * **Run the launch from the repository root.** Default source/model/records
   paths are relative, and `yolocar` must be on `PYTHONPATH`
   (`PYTHONPATH=monolith/yolocar/src:$PYTHONPATH`) because there is no `pip` on
