@@ -77,6 +77,7 @@ class Terminal:
         self._acquisition_ms: list[float] = []
         self._preprocess_ms: list[float] = []
         self._preprocess_ops: dict[str, list[float]] = {}
+        self._postprocess_ops: dict[str, list[float]] = {}
         self._inference_ms: list[float] = []
         self._postprocess_ms: list[float] = []
         self._transport_ms: list[float] = []
@@ -107,7 +108,6 @@ class Terminal:
         *,
         meta: FrameMeta,
         detections: list[Detection],
-        post_ms: float,
         t_end: float,
         engine_loaded_t: float = 0.0,
     ) -> float:
@@ -118,6 +118,9 @@ class Terminal:
         transport residual is derived here because only the terminal node sees
         all three stage buckets at once.
         """
+        # `post_ms` arrives already accumulated: a stage 4-6 split over several
+        # nodes adds its share to the frame's metadata, exactly as stage 2 does.
+        post_ms = float(meta.post_ms)
         latency_ms = (t_end - float(meta.t_mono)) * 1e3 - float(meta.acq_ms)
         transport_ms = latency_ms - (
             float(meta.pre_ms) + float(meta.infer_ms) + post_ms
@@ -138,6 +141,9 @@ class Terminal:
         pre_ops = dict(zip(meta.pre_op_names, meta.pre_op_ms))
         for name, value in pre_ops.items():
             self._preprocess_ops.setdefault(name, []).append(float(value))
+        post_ops = dict(zip(meta.post_op_names, meta.post_op_ms))
+        for name, value in post_ops.items():
+            self._postprocess_ops.setdefault(name, []).append(float(value))
         self._inference_ms.append(float(meta.infer_ms))
         self._postprocess_ms.append(post_ms)
         self._transport_ms.append(transport_ms)
@@ -169,6 +175,11 @@ class Terminal:
                 ),
                 'infer_ms': round(float(meta.infer_ms), 4),
                 'post_ms': round(post_ms, 4),
+                **(
+                    {'post_ops': {k: round(v, 4) for k, v in post_ops.items()}}
+                    if post_ops
+                    else {}
+                ),
                 'present_ms': 0.0,
                 'latency_ms': round(latency_ms, 4),
                 'n_det': len(detections),
@@ -233,6 +244,7 @@ class Terminal:
             preprocess_ops=self._preprocess_ops,
             inference_ms=self._inference_ms,
             postprocess_ms=self._postprocess_ms,
+            postprocess_ops=self._postprocess_ops,
             transport_ms=self._transport_ms,
             detections_per_frame=self._detections_per_frame,
             detections_by_class=self._detections_by_class,

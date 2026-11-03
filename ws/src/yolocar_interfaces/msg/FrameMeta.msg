@@ -11,10 +11,14 @@ float64 t_mono    # time.monotonic() at capture, seconds (CLOCK_MONOTONIC)
 float64 acq_ms    # stage 1: decode + rotation correction
 float64 pre_ms    # stage 2: conditioning chain at source resolution
 float64 infer_ms  # stage 3: model contract + engine + decode/threshold
+float64 post_ms   # stages 4-6: NMS + domain filter + coordinate adaptation
 
-# Stage 2 breakdown, parallel arrays in chain order (empty when it ran none).
-# The terminal node rebuilds the optional `pre_ops` map of the records
-# contract from them; carried in the message so a frame split across several
-# filter nodes still reports one per-op breakdown instead of one node's share.
+# Per-stage breakdowns as parallel arrays in canonical stage order (empty when
+# the stage ran nothing). The terminal node rebuilds the optional `pre_ops` /
+# `post_ops` maps of the records contract from them; carried in the message so
+# a stage split across several nodes still reports one breakdown instead of one
+# node's share. `post_ms`/`pre_ms` are sums over the nodes that contributed.
 string[] pre_op_names
 float64[] pre_op_ms
+string[] post_op_names
+float64[] post_op_ms

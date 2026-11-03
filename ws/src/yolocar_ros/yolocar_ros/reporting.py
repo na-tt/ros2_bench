@@ -160,6 +160,7 @@ def build_summary(
     inference_ms: list[float],
     postprocess_ms: list[float],
     transport_ms: list[float],
+    postprocess_ops: Mapping[str, list[float]] | None = None,
     detections_per_frame: list[int],
     detections_by_class: dict[str, int],
     records_path: Path | None,
@@ -202,6 +203,18 @@ def build_summary(
             ),
             'inference': latency_stats(inference_ms),
             'postprocess': latency_stats(postprocess_ms),
+            #: Only present when stage 4-6 was cut over several nodes; the sum
+            #: of these means is ``stage_ms.postprocess``.
+            **(
+                {
+                    'postprocess_ops': {
+                        name: latency_stats(values)
+                        for name, values in postprocess_ops.items()
+                    }
+                }
+                if postprocess_ops
+                else {}
+            ),
             'presentation': {},
             #: ROS-only residual: capture -> detections minus the three stage
             #: timings, i.e. serialisation, transport and scheduling.

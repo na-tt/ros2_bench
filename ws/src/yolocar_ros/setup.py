@@ -17,8 +17,8 @@ setup(
     maintainer='nat',
     maintainer_email='panatt17@gmail.com',
     description=(
-        'Four-node ROS 2 chain for the yolocar pipeline: acquisition -> '
-        'preprocessing -> inference -> postprocessing.'
+        'ROS 2 chain for the yolocar pipeline: acquisition -> preprocessing -> '
+        'inference -> postprocessing, cut into any number of processes.'
     ),
     license='MIT',
     extras_require={
@@ -32,6 +32,9 @@ setup(
             'preprocessing = yolocar_ros.preprocessing_node:main',
             'inference = yolocar_ros.inference_node:main',
             'postprocessing = yolocar_ros.postprocessing_node:main',
+            # The general one: `stages:=` says which span this process runs,
+            # so a shape is launch data (see docs/proposals/chain-shapes.md).
+            'chain = yolocar_ros.chain_node:main',
         ],
     },
 )
