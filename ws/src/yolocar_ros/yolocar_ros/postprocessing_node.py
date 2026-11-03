@@ -9,7 +9,9 @@ signals that the run is over.
 Stage order is the canonical one from ``AGENTS.md`` and the monolith: NMS over
 all classes, then the road-class filter, then the inverse letterbox. The three
 calls are imported from :mod:`yolocar.postprocessing`; nothing is reimplemented
-here.
+here. The bookkeeping that makes this node the *terminal* one -- records,
+summary, ack -- lives in :class:`.terminal.Terminal`, because any node that runs
+the last stage needs exactly that and nothing about it is postprocessing.
 """
 
 from __future__ import annotations
@@ -24,7 +26,6 @@ from rclpy.node import Node
 from std_msgs.msg import Empty
 
 from yolocar.config import ROAD_CLASS_IDS, YoloCarConfig
-from yolocar.detections import build_header, DetectionLog
 from yolocar.postprocessing import (
     coordinate_adaptation,
     domain_filter,
@@ -34,15 +35,13 @@ from yolocar.postprocessing import (
 
 from yolocar.preprocessing import describe, parse
 
-from yolocar_interfaces.msg import CandidatesFrame, FrameAck
+from yolocar_interfaces.msg import CandidatesFrame
 
 from . import qos, topics
 from .conversions import candidates_from_frame
-from .reporting import build_summary, RecordWriter, write_summary
+from .terminal import Terminal
 
 LOGGER = logging.getLogger('yolocar')
-
-PROGRESS_EVERY = 50
 
 
 class PostprocessingNode(Node):
@@ -50,7 +49,6 @@ class PostprocessingNode(Node):
 
     def __init__(self) -> None:
         super().__init__('yolocar_postprocessing')
-        self._t_start = time.monotonic()
 
         iou = float(self.declare_parameter('iou', 0.45).value)
         agnostic = bool(self.declare_parameter('agnostic_nms', False).value)
@@ -101,53 +99,21 @@ class PostprocessingNode(Node):
             log_level=log_level,
         )
 
-        self.records = RecordWriter(self.config.records_path)
-        #: Side artifact, not part of the contract: one line per frame with the
-        #: final detections, so this run can be rendered afterwards. A no-op
-        #: unless the `detections` parameter was set.
-        self.detections_log = DetectionLog(
-            self.config.detections_path,
-            header=build_header(
-                source=self.config.source,
-                rotate=self.config.rotate,
-                model=self.config.model_path,
-                image_size=self.config.image_size,
-                conf_threshold=self.config.conf_threshold,
-                iou_threshold=self.config.iou_threshold,
-                agnostic_nms=self.config.agnostic_nms,
-                class_ids=self.config.target_class_ids,
-                producer='ros-4node',
+        self.terminal = Terminal(
+            self,
+            self.config,
+            pre_ops=self.pre_ops,
+            detections_header=Terminal.detections_header(
+                self.config, producer='ros-4node'
             ),
-        ).open_file()
+        )
 
-        self.ack_publisher = self.create_publisher(
-            FrameAck, topics.ACK_TOPIC, qos.control()
-        )
-        self.done_publisher = self.create_publisher(
-            Empty, topics.DONE_TOPIC, qos.control(depth=1)
-        )
         self.create_subscription(
             CandidatesFrame, topics.CANDIDATES_TOPIC, self._on_candidates, qos.latest()
         )
         self.create_subscription(
             Empty, topics.STOP_TOPIC, self._on_stop, qos.control(depth=1)
         )
-
-        self._frames = 0
-        self._max_loop = -1
-        self._first_t_mono: float | None = None
-        self._last_done = 0.0
-        self._engine_loaded_t = 0.0
-        self._latency_ms: list[float] = []
-        self._acquisition_ms: list[float] = []
-        self._preprocess_ms: list[float] = []
-        self._preprocess_ops: dict[str, list[float]] = {}
-        self._inference_ms: list[float] = []
-        self._postprocess_ms: list[float] = []
-        self._transport_ms: list[float] = []
-        self._detections_per_frame: list[int] = []
-        self._detections_by_class: dict[str, int] = {}
-        self._finished = False
 
         self.get_logger().info(
             f'postprocessing: iou={self.config.iou_threshold:.2f} '
@@ -171,143 +137,22 @@ class PostprocessingNode(Node):
         detections = to_detections(candidates)
         t1 = time.monotonic()
 
-        meta = msg.meta
-        post_ms = (t1 - t0) * 1e3
-        latency_ms = (t1 - float(meta.t_mono)) * 1e3 - float(meta.acq_ms)
-        transport_ms = latency_ms - (
-            float(meta.pre_ms) + float(meta.infer_ms) + post_ms
-        )
-
-        if self._first_t_mono is None:
-            self._first_t_mono = float(meta.t_mono)
-        if msg.engine_loaded_t > 0.0 and self._engine_loaded_t == 0.0:
-            self._engine_loaded_t = float(msg.engine_loaded_t)
-        self._last_done = t1
-        self._max_loop = max(self._max_loop, int(meta.loop))
-
-        self._latency_ms.append(latency_ms)
-        self._acquisition_ms.append(float(meta.acq_ms))
-        self._preprocess_ms.append(float(meta.pre_ms))
-        pre_ops = dict(zip(meta.pre_op_names, meta.pre_op_ms))
-        for name, value in pre_ops.items():
-            self._preprocess_ops.setdefault(name, []).append(float(value))
-        self._inference_ms.append(float(meta.infer_ms))
-        self._postprocess_ms.append(post_ms)
-        self._transport_ms.append(transport_ms)
-        self._detections_per_frame.append(len(detections))
-        for detection in detections:
-            self._detections_by_class[detection.class_name] = (
-                self._detections_by_class.get(detection.class_name, 0) + 1
-            )
-
-        self.detections_log.write(
-            seq=int(meta.seq),
-            loop=int(meta.loop),
-            t_mono=float(meta.t_mono),
+        self.terminal.emit(
+            meta=msg.meta,
             detections=detections,
-        )
-        self.records.write(
-            {
-                'seq': int(meta.seq),
-                'loop': int(meta.loop),
-                't_mono': round(float(meta.t_mono), 6),
-                'acq_ms': round(float(meta.acq_ms), 4),
-                'pre_ms': round(float(meta.pre_ms), 4),
-                # Optional stage-2 breakdown, as in the monolith: absent when
-                # the chain is empty, so the record stays comparable.
-                **(
-                    {'pre_ops': {k: round(v, 4) for k, v in pre_ops.items()}}
-                    if pre_ops
-                    else {}
-                ),
-                'infer_ms': round(float(meta.infer_ms), 4),
-                'post_ms': round(post_ms, 4),
-                'present_ms': 0.0,
-                'latency_ms': round(latency_ms, 4),
-                'n_det': len(detections),
-                # ROS-only: serialisation + transport + scheduling, i.e. what
-                # end-to-end latency has beyond the three stage timings.
-                'transport_ms': round(transport_ms, 4),
-            }
-        )
-        self._frames += 1
-
-        if self._frames % PROGRESS_EVERY == 0:
-            self.get_logger().info(
-                f'frame {self._frames} (loop {int(meta.loop)}): {latency_ms:.1f} ms '
-                f'(acq {float(meta.acq_ms):.1f} / pre {float(meta.pre_ms):.1f} / '
-                f'infer {float(meta.infer_ms):.1f} / post {post_ms:.1f} / '
-                f'transport {transport_ms:.1f}), {len(detections)} dets'
-            )
-
-        # The ack is what releases the acquisition node; send it only after the
-        # record is flushed, so one frame is truly in flight.
-        self.ack_publisher.publish(
-            FrameAck(seq=int(meta.seq), engine_loaded_t=self._engine_loaded_t)
+            post_ms=(t1 - t0) * 1e3,
+            t_end=t1,
+            engine_loaded_t=float(msg.engine_loaded_t),
         )
 
     # -------------------------------------------------------------- finish
     def _on_stop(self, _msg: Empty) -> None:
-        if self._finished:
+        if self.terminal.finish(stopped=True) is None:
             return
-        self._finish(stopped=True)
-        if rclpy.ok():
-            self.done_publisher.publish(Empty())
-
-    def _finish(self, *, stopped: bool) -> None:
-        """Write ``summary.json`` once, whether the run ended or was killed."""
-        if self._finished:
-            return
-        self._finished = True
-        t_end = time.monotonic()
-
-        events: dict[str, float] = {'start': self._t_start, 'end': t_end}
-        if self._engine_loaded_t > 0.0:
-            events['engine_loaded'] = self._engine_loaded_t
-        if self._first_t_mono is not None:
-            # A frame can be captured before the inference engine is ready;
-            # report the moment the pipeline could actually start on it.
-            events['first_frame'] = max(self._first_t_mono, self._engine_loaded_t)
-        origin = self._engine_loaded_t or self._first_t_mono or self._t_start
-        wall_time_s = max(self._last_done - origin, 0.0) if self._frames else 0.0
-
-        summary = build_summary(
-            config=self.config,
-            source=self.config.source if self.config.source else '',
-            frames=self._frames,
-            replays=max(self._max_loop + 1, 0),
-            events=events,
-            interrupted=not stopped,
-            wall_time_s=wall_time_s,
-            latency_ms=self._latency_ms,
-            acquisition_ms=self._acquisition_ms,
-            preprocess_ms=self._preprocess_ms,
-            preprocess_ops=self._preprocess_ops,
-            inference_ms=self._inference_ms,
-            postprocess_ms=self._postprocess_ms,
-            transport_ms=self._transport_ms,
-            detections_per_frame=self._detections_per_frame,
-            detections_by_class=self._detections_by_class,
-            pre_ops=self.pre_ops,
-            records_path=self.config.records_path,
-            detections_path=self.config.detections_path,
-        )
-        write_summary(self.config.json_path, summary)
-
-        median = float(summary['latency_ms'].get('median', 0.0))  # type: ignore[union-attr]
-        per_frame = float(summary['detections']['per_frame_mean'])  # type: ignore[index]
-        status = 'complete' if stopped else 'interrupted'
-        fps = float(summary['fps'])
-        self.get_logger().info(
-            f'run {status}: {self._frames} frames, {fps:.2f} fps, '
-            f'p50 {median:.2f} ms, {per_frame:.2f} dets/frame'
-        )
-        if self.config.json_path is not None:
-            self.get_logger().info(f'summary written to {self.config.json_path}')
+        self.terminal.publish_done()
 
     def close(self) -> None:
-        self.records.close()
-        self.detections_log.close()
+        self.terminal.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -324,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         if rclpy.ok():
             node.get_logger().info('shutting down')
     finally:
-        node._finish(stopped=False)
+        node.terminal.finish(stopped=False)
         node.close()
         node.destroy_node()
         if rclpy.ok():
