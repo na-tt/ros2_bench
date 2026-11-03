@@ -18,7 +18,7 @@ return to_tensor(padded, dtype), info
 
 1. **Coercion** -- `as_bgr_frame`: gray->BGR, dtype clamp, shape check.
 2. **Photometric/structural conditioning** -- *absent today*; this is the stage
-   we want to grow (denoise, CLAHE, gamma, histogram equalisation, ...).
+   we want to grow (CLAHE, bilateral, gamma, histogram equalisation, ...).
 3. **Geometric + layout adaptation** -- `letterbox` + `to_tensor`: pad value
    114, aspect-preserving resize, BGR->RGB, HWC->NCHW, `/255`. Parameterised
    *only* by `inference.InputSpec`, i.e. purely the engine's input contract.
@@ -92,15 +92,21 @@ Op selection is part of the design, not an afterthought. The set spans
 deliberately different bottlenecks, because that is what lets the resolution
 axis *show* the difference rather than assume it:
 
-| op | bottleneck | cost at 720p (order of magnitude) |
+| op | bottleneck | measured, 720p / 180p |
 | --- | --- | --- |
-| `gamma` (LUT) | memory, 1 pass | ~0.5 ms |
-| `hist_equalization` | memory, multi-pass | ~1-2 ms |
-| `clahe` | mixed, tile histograms | ~4 ms |
-| `gaussian` | separable convolution | ~3 ms |
-| `median` | non-separable, O(k^2) | ~10-20 ms |
-| `bilateral` | arithmetic, O(k^2) with exp | ~30-60 ms |
-| `denoise` (fastNlMeans) | arithmetic + search window | ~100 ms+ |
+| `gamma` (LUT) | memory, 1 pass | 2.4 / 0.2 ms |
+| `unsharp` | blur + weighted blend | 7.2 / 0.6 ms |
+| `hist_equalization` | memory, multi-pass | 9.1 / 0.6 ms |
+| `clahe` | mixed, fixed tile grid | 12.0 / 1.5 ms |
+| `gaussian` | separable convolution | 3.5 / 0.4 ms |
+| `median` | non-separable, O(k^2) | 16.6 / 1.3 ms |
+| `bilateral` | arithmetic, O(k^2) with exp | 50.0 / 8.3 ms |
+
+These are the guesses this table started with, replaced by measurement; the
+current numbers and the method live in
+`chain-shapes.md#calibration-measured`, which is the single source. A
+non-local-means `denoise` was in the original set and was removed after it
+measured 1.36 s/frame at 720p -- see that same section for why.
 
 An empty chain must be a **bit-exact, zero-copy no-op** (`return frame`), so
 existing cells and the frozen behaviour remain comparable.
