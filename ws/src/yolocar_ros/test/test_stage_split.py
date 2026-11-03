@@ -24,7 +24,7 @@ from yolocar.postprocessing import (  # noqa: E402
     select_candidates,
     to_detections,
 )
-from yolocar.preprocessing import preprocess  # noqa: E402
+from yolocar.model_input import prepare  # noqa: E402
 from yolocar.processor import YoloCarProcessor  # noqa: E402
 
 from yolocar_ros.conversions import (  # noqa: E402
@@ -61,7 +61,7 @@ def test_split_stage_boundary_matches_the_monolith_facade(frame: np.ndarray) -> 
         expected = processor.process_frame(frame)
 
         # Stage 2 -> wire -> stage 3 (the preprocessing node's boundary).
-        tensor, letterbox = preprocess(
+        tensor, letterbox = prepare(
             frame,
             processor.input_spec.shape,
             processor.input_spec.dtype,

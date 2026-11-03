@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from yolocar.postprocessing import Candidates
-from yolocar.preprocessing import LetterboxInfo
+from yolocar.model_input import LetterboxInfo
 
 from yolocar_interfaces.msg import FrameMeta
 

@@ -33,7 +33,7 @@ from yolocar.postprocessing import (  # noqa: E402
     to_detections,
     xywh_to_xyxy,
 )
-from yolocar.preprocessing import letterbox  # noqa: E402
+from yolocar.model_input import letterbox  # noqa: E402
 
 NUM_CLASSES = len(COCO_CLASS_NAMES)
 CAR = 2

@@ -10,13 +10,13 @@ pytest.importorskip("cv2")
 
 from yolocar.config import COCO_CLASS_NAMES, YoloCarConfig  # noqa: E402
 from yolocar.inference import InputSpec, decode_predictions, first_output  # noqa: E402
-from yolocar.preprocessing import (  # noqa: E402
+from yolocar.model_input import (  # noqa: E402
     LetterboxInfo,
-    as_bgr_frame,
     letterbox,
-    preprocess,
+    prepare,
     to_tensor,
 )
+from yolocar.preprocessing import as_bgr_frame  # noqa: E402
 from yolocar.processor import YoloCarProcessor  # noqa: E402
 
 NUM_CLASSES = len(COCO_CLASS_NAMES)
@@ -84,7 +84,7 @@ def test_as_bgr_frame_rejects_wrong_channel_count() -> None:
 
 
 def test_preprocess_returns_tensor_and_geometry() -> None:
-    tensor, info = preprocess(
+    tensor, info = prepare(
         np.zeros((720, 1280, 3), dtype=np.uint8), (640, 640), np.dtype(np.float16)
     )
     assert tensor.shape == (1, 3, 640, 640)

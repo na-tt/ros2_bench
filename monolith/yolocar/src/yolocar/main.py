@@ -253,7 +253,7 @@ def run_benchmark(config: YoloCarConfig) -> dict[str, object]:
                     events["first_frame"] = t0
                 replays = frame.loop + 1
 
-                tensor, letterbox = processor.preprocess(frame.image)
+                tensor, letterbox = processor.prepare_input(frame.image)
                 t1 = time.monotonic()
                 outputs = processor.infer(tensor)
                 t2 = time.monotonic()

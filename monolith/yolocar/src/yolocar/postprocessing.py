@@ -30,7 +30,7 @@ import numpy as np
 
 from .config import COCO_CLASS_NAMES, YoloCarConfig, class_name
 from .inference import decode_predictions, first_output
-from .preprocessing import LetterboxInfo
+from .model_input import LetterboxInfo
 
 
 # ------------------------------------------------------------------ value types

@@ -1,7 +1,7 @@
 """
 Stage 2 node: letterbox + BGR->RGB NCHW tensor.
 
-All image logic is :func:`yolocar.preprocessing.preprocess`; this node only
+All image logic is :func:`yolocar.model_input.prepare`; this node only
 deserialises the frame, calls it, and publishes the tensor together with the
 letterbox geometry the coordinate-adaptation stage will need later.
 
@@ -21,7 +21,7 @@ import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 
-from yolocar.preprocessing import preprocess
+from yolocar.model_input import prepare
 
 from yolocar_interfaces.msg import ImageFrame, TensorFrame
 
@@ -59,7 +59,7 @@ class PreprocessingNode(Node):
     def _on_frame(self, msg: ImageFrame) -> None:
         t0 = time.monotonic()
         frame = frame_from_image(msg)
-        tensor, letterbox = preprocess(
+        tensor, letterbox = prepare(
             frame,
             (self.image_size, self.image_size),
             self.input_dtype,

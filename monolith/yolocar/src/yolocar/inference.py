@@ -14,32 +14,30 @@ ROS 2 chain can put its topic boundary on either side of the decode depending
 on whether the engine and the postprocessing node share a process; decode
 therefore never happens implicitly inside :func:`infer`.
 
-This module knows about the engine but nothing about frames, letterboxing or
-detections, so it stays a sibling of :mod:`yolocar.preprocessing`.
+This module owns the engine. The engine's *input contract* -- letterbox,
+colour order, layout, dtype -- is :mod:`yolocar.model_input`, which stays
+engine-free; :func:`input_spec` is the bridge that reads it off a loaded
+engine. ``InputSpec`` and the geometry types are re-exported here so
+``inference.InputSpec`` keeps working for callers that already know the stage.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 
 import numpy as np
 
 from .engine import TensorRTEngine
+from .model_input import InputSpec, LetterboxInfo
 
-
-@dataclass(frozen=True)
-class InputSpec:
-    """What a preprocessing stage must produce for this engine."""
-
-    height: int
-    width: int
-    dtype: np.dtype
-
-    @property
-    def shape(self) -> tuple[int, int]:
-        """Engine input size as ``(height, width)``."""
-        return (self.height, self.width)
+__all__ = [
+    "InputSpec",
+    "LetterboxInfo",
+    "decode_predictions",
+    "first_output",
+    "infer",
+    "input_spec",
+]
 
 
 def input_spec(engine: TensorRTEngine) -> InputSpec:

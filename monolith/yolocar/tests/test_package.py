@@ -59,12 +59,20 @@ def test_every_exported_name_resolves_through_the_lazy_map() -> None:
 
 def test_stage_modules_expose_their_stage() -> None:
     """The module boundaries are the ROS 2 node boundaries; keep them named."""
-    from yolocar import acquisition, inference, postprocessing, preprocessing, render
+    from yolocar import (
+        acquisition,
+        inference,
+        model_input,
+        postprocessing,
+        preprocessing,
+        render,
+    )
 
     assert callable(acquisition.open_source)
     assert callable(acquisition.rotate_frame)
-    assert callable(preprocessing.preprocess)
-    assert callable(preprocessing.letterbox)
+    assert callable(preprocessing.as_bgr_frame)
+    assert callable(model_input.prepare)
+    assert callable(model_input.letterbox)
     assert callable(inference.infer)
     assert callable(inference.decode_predictions)
     for stage in ("nms", "domain_filter", "coordinate_adaptation"):

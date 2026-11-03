@@ -370,7 +370,7 @@ def test_full_pipeline_invariants_on_synthetic_frames(
 
 def test_preprocess_matches_the_engine_contract(processor: YoloCarProcessor) -> None:
     info = processor.engine.single_input
-    tensor, letterbox = processor.preprocess(_frames()[0])
+    tensor, letterbox = processor.prepare_input(_frames()[0])
 
     assert tensor.shape == info.shape
     assert tensor.dtype == info.dtype

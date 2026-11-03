@@ -7,7 +7,8 @@ class:
 module           stage
 ===============  ============================================================
 acquisition      frame source + rotation correction
-preprocessing    letterbox + BGR->RGB NCHW tensor
+preprocessing    image conditioning at source resolution
+model_input      frame -> engine-ready tensor + letterbox geometry
 inference        TensorRT invocation + detect-head decoding
 postprocessing   NMS -> domain filter -> coordinate adaptation
 render           optional annotation / sinks
@@ -27,12 +28,12 @@ from collections.abc import Mapping, Sequence
 import numpy as np
 from typing_extensions import Self
 
-from . import inference, postprocessing, preprocessing
+from . import inference, model_input, postprocessing, preprocessing
 from .config import YoloCarConfig
 from .engine import TensorRTEngine
 from .inference import InputSpec
+from .model_input import LetterboxInfo
 from .postprocessing import Detection
-from .preprocessing import LetterboxInfo
 
 LOGGER = logging.getLogger(__name__)
 
@@ -132,11 +133,16 @@ class YoloCarProcessor:
         self.close()
 
     # -------------------------------------------------------------- pipeline
-    def preprocess(self, frame: np.ndarray) -> tuple[np.ndarray, LetterboxInfo]:
-        """Stage 2: BGR frame -> ``(engine tensor, letterbox geometry)``."""
+    def prepare_input(self, frame: np.ndarray) -> tuple[np.ndarray, LetterboxInfo]:
+        """Stage 2 + contract: BGR frame -> ``(engine tensor, letterbox geometry)``.
+
+        The coercion that guarantees the wire type happens here, at the
+        boundary, and the contract itself is :mod:`yolocar.model_input` -- the
+        engine-specific part that the inference stage owns.
+        """
         spec = self.input_spec
-        return preprocessing.preprocess(
-            frame,
+        return model_input.prepare(
+            preprocessing.as_bgr_frame(frame),
             spec.shape,
             spec.dtype,
             pad_value=self.config.pad_value,
@@ -156,7 +162,7 @@ class YoloCarProcessor:
 
     def process_frame(self, frame: np.ndarray) -> list[Detection]:
         """Full pipeline for a single BGR frame."""
-        tensor, letterbox = self.preprocess(frame)
+        tensor, letterbox = self.prepare_input(frame)
         outputs = self.infer(tensor)
         return self.postprocess(outputs, letterbox)
 

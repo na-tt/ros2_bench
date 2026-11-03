@@ -15,7 +15,9 @@ Modules
 ``acquisition``
     Stage 1: video/image/camera iterators and the rotation correction.
 ``preprocessing``
-    Stage 2: letterbox + BGR->RGB NCHW tensor.
+    Stage 2: image conditioning at source resolution (coercion + op chain).
+``model_input``
+    The engine input contract: letterbox, colour/spatial layout, dtype.
 ``inference``
     Stage 3: engine invocation and detect-head decoding.
 ``postprocessing``
@@ -63,7 +65,7 @@ __all__ = [
     "nms",
     "open_source",
     "postprocess",
-    "preprocess",
+    "prepare",
     "process_frame",
     "rotate_frame",
     "to_detections",
@@ -78,11 +80,11 @@ _LAZY_ATTRIBUTES: dict[str, tuple[str, str]] = {
     "FrameSource": ("yolocar.acquisition", "FrameSource"),
     "open_source": ("yolocar.acquisition", "open_source"),
     "rotate_frame": ("yolocar.acquisition", "rotate_frame"),
-    "LetterboxInfo": ("yolocar.preprocessing", "LetterboxInfo"),
-    "letterbox": ("yolocar.preprocessing", "letterbox"),
-    "preprocess": ("yolocar.preprocessing", "preprocess"),
-    "to_tensor": ("yolocar.preprocessing", "to_tensor"),
-    "InputSpec": ("yolocar.inference", "InputSpec"),
+    "LetterboxInfo": ("yolocar.model_input", "LetterboxInfo"),
+    "letterbox": ("yolocar.model_input", "letterbox"),
+    "prepare": ("yolocar.model_input", "prepare"),
+    "to_tensor": ("yolocar.model_input", "to_tensor"),
+    "InputSpec": ("yolocar.model_input", "InputSpec"),
     "decode_predictions": ("yolocar.inference", "decode_predictions"),
     "Candidates": ("yolocar.postprocessing", "Candidates"),
     "Detection": ("yolocar.postprocessing", "Detection"),

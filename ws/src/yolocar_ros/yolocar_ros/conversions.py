@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 
 from yolocar.postprocessing import Candidates
-from yolocar.preprocessing import LetterboxInfo
+from yolocar.model_input import LetterboxInfo
 
 from yolocar_interfaces.msg import CandidatesFrame, FrameMeta, ImageFrame, TensorFrame
 
