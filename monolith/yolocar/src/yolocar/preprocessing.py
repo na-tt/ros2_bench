@@ -45,7 +45,7 @@ OPS: dict[str, Callable[..., np.ndarray]] = {
     "gamma": filters.gamma,
     "hist_equalization": filters.hist_equalization,
     "median": filters.median,
-    "denoise": filters.denoise,
+    "unsharp": filters.unsharp,
 }
 
 

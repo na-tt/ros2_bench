@@ -21,9 +21,9 @@ Two rules, both enforced by the tests in ``test_yolocar_preprocessing.py``:
   feature.
 
 The set deliberately spans different bottlenecks (single-pass LUT, multi-pass
-memory work, separable convolution, non-separable O(k^2) arithmetic, a search
-window) so the resolution axis can show *which* cost grows how, rather than
-assuming all filtering behaves alike.
+memory work, separable convolution, non-separable O(k^2) arithmetic, a
+blur-and-blend sharpening pass) so the resolution axis can show *which* cost
+grows how, rather than assuming all filtering behaves alike.
 """
 
 from __future__ import annotations
@@ -121,26 +121,29 @@ def bilateral(
     )
 
 
-def denoise(
+def unsharp(
     frame: np.ndarray,
-    h: float = 10.0,
-    h_color: float = 10.0,
-    template: int = 7,
-    search: int = 21,
+    ksize: int = 5,
+    sigma: float = 0.0,
+    amount: float = 1.0,
 ) -> np.ndarray:
-    """Non-local-means colour denoising: the deliberately expensive outlier.
+    """Unsharp mask: ``out = frame + amount * (frame - blur(frame))``.
 
-    Cost is ~O(pixels * search_window^2): measured 1.36 s/frame at 720p and
-    0.26 s at 180p, i.e. 25-300x every other op, and even the cheap parameter
-    set (``template=3, search=5``) stays at ~100 ms at 720p. It can justify
-    its own node against any per-hop transport cost, and it is too expensive to
-    leave in a chain that is meant to be measured at 2500 frames.
+    Two passes over the frame -- a separable Gaussian and a weighted blend --
+    so the cost is :func:`gaussian` plus a memory-bound ``addWeighted``. It is
+    the cheap stand-in for the sharpening stage a real pipeline ends with: it
+    measured ~11.8 ms standalone and ~8.5 ms inside the chain at 720p, ~0.7 ms
+    at 180p: the second most expensive op, but nowhere near an outlier, which
+    is what the seventh slot needs (see the calibration in
+    ``docs/proposals/chain-shapes.md``).
     """
-    return cv2.fastNlMeansDenoisingColored(
-        frame,
-        None,
-        float(h),
-        float(h_color),
-        int(template),
-        int(search),
-    )
+    size = int(ksize)
+    if size < 3 or size % 2 == 0:
+        raise ValueError(f"ksize must be odd and >= 3, got {size}")
+    value = float(amount)
+    if value < 0.0:
+        raise ValueError(f"amount must be >= 0, got {value}")
+    if value == 0.0:
+        return frame
+    blurred = cv2.GaussianBlur(frame, (size, size), float(sigma))
+    return cv2.addWeighted(frame, 1.0 + value, blurred, -value, 0.0)

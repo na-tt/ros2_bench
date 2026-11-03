@@ -331,7 +331,7 @@ Road objects video detection with yolo on dashcam footage.
 
 #### Specification
 - (1) **acquisition:** read frame from video file. bgr frame at experimental resolution
-- (2) **preprocessing:** general image conditioning at **source resolution**, as a chain of ops (denoise, CLAHE, gamma, histogram equalisation, ...). BGR uint8 in, BGR uint8 out, geometry unchanged. Stage 2 says *how the image should look*; it does not know the model. Empty chain = identity (bit-exact, zero-copy), which is the baseline.
+- (2) **preprocessing:** general image conditioning at **source resolution**, as a chain of ops (CLAHE, bilateral, gaussian, gamma, histogram equalisation, median, unsharp). BGR uint8 in, BGR uint8 out, geometry unchanged. Stage 2 says *how the image should look*; it does not know the model. Empty chain = identity (bit-exact, zero-copy), which is the baseline.
 - (2b) **model input contract:** letterbox + BGR→RGB + HWC→NCHW + dtype/scale. Parameterised only by the engine's `InputSpec`, and therefore part of the inference stage, not of preprocessing.
 - (3) **inference:** run yolo and produce candidate detection boxes.
 - (4) **NMS:** perform Non Maximum Supression to reduce detections.
@@ -350,7 +350,7 @@ One module per upstream/downstream boundary; the facade only wires them.
 | --- | --- |
 | acquisition (sources, rotation correction) | `yolocar.acquisition` (`open_source`, `rotate_frame`) |
 | preprocessing (conditioning chain) | `yolocar.preprocessing` (`OPS`, `Op`, `parse`, `enhance`, `condition`, `as_bgr_frame`) |
-| conditioning ops | `yolocar.filters` (`gamma`, `hist_equalization`, `clahe`, `gaussian`, `median`, `bilateral`, `denoise`) |
+| conditioning ops | `yolocar.filters` (`clahe`, `bilateral`, `gaussian`, `gamma`, `hist_equalization`, `median`, `unsharp`) |
 | model input contract | `yolocar.model_input` (`InputSpec`, `LetterboxInfo`, `letterbox`, `to_tensor`, `prepare`) |
 | inference (engine call, decode head) | `yolocar.inference` (`infer`, `decode_predictions`, `input_spec`) |
 | NMS | `yolocar.postprocessing.nms` |

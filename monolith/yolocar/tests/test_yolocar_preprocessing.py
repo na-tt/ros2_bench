@@ -125,6 +125,19 @@ def test_median_removes_salt() -> None:
     assert int(filters.median(frame, ksize=3)[8, 8, 0]) < 255
 
 
+def test_unsharp_of_zero_amount_is_the_identity() -> None:
+    frame = _frame()
+    np.testing.assert_array_equal(filters.unsharp(frame, amount=0.0), frame)
+
+
+def test_unsharp_steepens_an_edge() -> None:
+    """``frame + amount * (frame - blur)`` must widen a step, not blur it."""
+    frame = np.full((32, 32, 3), 60, dtype=np.uint8)
+    frame[16:, :, :] = 200
+    spread = lambda img: int(img[..., 0].max()) - int(img[..., 0].min())  # noqa: E731
+    assert spread(filters.unsharp(frame, ksize=5, amount=1.5)) > spread(frame)
+
+
 @pytest.mark.parametrize(
     ("op", "kwargs", "message"),
     [
@@ -135,6 +148,8 @@ def test_median_removes_salt() -> None:
         (filters.bilateral, {"d": 0}, "d must be"),
         (filters.clahe, {"tiles": 0}, "tiles must be"),
         (filters.clahe, {"clip_limit": 0.0}, "clip_limit must be"),
+        (filters.unsharp, {"ksize": 4}, "odd"),
+        (filters.unsharp, {"amount": -1.0}, "amount must be"),
     ],
 )
 def test_ops_reject_impossible_parameters(op, kwargs, message: str) -> None:

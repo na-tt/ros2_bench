@@ -95,12 +95,12 @@ python3 -m yolocar.main --source assets/video/0000f77c-6257be58_720p.mov \
     --pre 'gamma:gamma=0.8' --pre clahe --pre 'bilateral:d=9'
 ```
 
-Available ops are `yolocar.preprocessing.OPS`: `gamma`, `hist_equalization`,
-`clahe`, `gaussian`, `median`, `bilateral`, `denoise`. They are stand-ins for
-real preprocessing workloads -- what is measured is their cost, not their effect
-on accuracy -- and they span different bottlenecks on purpose (single-pass LUT,
-multi-pass memory work, separable convolution, non-separable `O(k^2)`, a search
-window). No ops means identity: no copy, no pixel change, and `pre_ms` ~ 0.
+Available ops are `yolocar.preprocessing.OPS`: `clahe`, `bilateral`,
+`gaussian`, `gamma`, `hist_equalization`, `median`, `unsharp`. They are
+stand-ins for real preprocessing workloads -- what is measured is their cost,
+not their effect on accuracy -- and they span different bottlenecks on purpose
+(fixed tile count, `O(k^2)` arithmetic, separable convolution, single-pass LUT,
+multi-pass memory work, non-separable median, blur-and-blend). No ops means identity: no copy, no pixel change, and `pre_ms` ~ 0.
 
 Each op is timed into `pre_ops` in the per-frame records and
 `stage_ms.preprocess_ops` in the summary, so the chain can be read op by op
