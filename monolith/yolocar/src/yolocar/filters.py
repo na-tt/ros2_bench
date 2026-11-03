@@ -37,8 +37,9 @@ import numpy as np
 def gamma(frame: np.ndarray, gamma: float = 1.0) -> np.ndarray:
     """Apply the tone curve ``out = 255 * (in / 255) ** gamma``.
 
-    A single LUT pass over the pixels: the cheapest op in the set (~0.5 ms at
-    720p on this board), and the memory-bound end of the spectrum.
+    A single LUT pass over the pixels: the cheapest op in the set (~3.8 ms at
+    720p / ~0.2 ms at 180p on this board), and the memory-bound end of the
+    spectrum.
     """
     value = float(gamma)
     if value <= 0.0:
@@ -129,9 +130,11 @@ def denoise(
 ) -> np.ndarray:
     """Non-local-means colour denoising: the deliberately expensive outlier.
 
-    Cost is ~O(pixels * search_window^2), two orders of magnitude above the
-    other ops at 720p -- the op that can justify its own node even against the
-    per-hop transport cost.
+    Cost is ~O(pixels * search_window^2): measured 1.36 s/frame at 720p and
+    0.26 s at 180p, i.e. 25-300x every other op, and even the cheap parameter
+    set (``template=3, search=5``) stays at ~100 ms at 720p. It can justify
+    its own node against any per-hop transport cost, and it is too expensive to
+    leave in a chain that is meant to be measured at 2500 frames.
     """
     return cv2.fastNlMeansDenoisingColored(
         frame,

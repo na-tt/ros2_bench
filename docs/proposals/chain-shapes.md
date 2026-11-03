@@ -191,9 +191,19 @@ baseline without any new measurement:
 | ros-4node-720p-n | 24.2 ms | 42.4 ms | 57 % |
 | ros-4node-180p-n | 18.4 ms | 36.2 ms | 51 % |
 
-and it is why the earlier note "only ops > ~10 ms/frame justify a hop even at
-720p" is really "at 180p *nothing* justifies a hop": the floor is 3.9 ms there,
-above gamma (0.5), hist_eq (1.5), gaussian and median.
+and it is the quantitative form of "an op should only get its own node if it
+costs more than the hop it needs". On the calibrated six-op chain that is a
+short list, and it shrinks with resolution:
+
+| hop cost | ops that beat it |
+| --- | --- |
+| 9.7 ms (720p) | clahe (16.7), bilateral (53.9), median (16.4), hist_eq (11.9); gaussian (9.5) is a wash |
+| 4.0 ms (180p) | bilateral (9.8), clahe (4.9) -- and clahe only marginally |
+
+So at 720p a per-op split is *sometimes* justified by compute alone, while at
+180p it is justified only for the two most expensive ops, and only if the
+resulting graph is worth it for some reason other than latency (it never is
+under one frame in flight -- see *What this axis cannot answer*).
 
 **H2: at small resolution a chain of hops is dominated by fixed per-hop cost,
 and no amount of shrinking the frame fixes it.** The k-sweep at 180p is the
@@ -256,7 +266,7 @@ The seven conditioning ops are one canonical chain, applied in this order:
 | `op4` | `gamma` | tone curve via LUT | **memory** | one pass, cheapest op in the set |
 | `op5` | `hist_eq` | luma histogram equalisation | **memory, multi-pass** | histogram + LUT + apply |
 | `op6` | `median` | non-separable median | arithmetic | `O(pixels * k^2)`, small constants |
-| `op7` | `denoise` | non-local means colour | **search window** | `O(pixels * search^2)`, the outlier |
+| `op7` | `denoise` | non-local means colour | **search window** | `O(pixels * search^2)`, the outlier (measured below, kept out of the matrix) |
 
 **Why this order is admissible.** With one frame in flight the ops are strictly
 sequential, so their order cannot change the sum of their costs -- only *where
@@ -271,16 +281,54 @@ plausible and the cells are comparable to a real pipeline.
 
 Two consequences that are *not* neutral and must be recorded:
 
-* **`op7` dominates every op-split cell if left at its defaults.** Non-local
-  means at 720p is ~1 s/frame, i.e. the `p8c3` cell would spend 2500 frames x
-  1 s per trial and the transport share would collapse to a few percent --
-  measuring nothing. Either its parameters are reduced for the shape matrix
-  (`denoise:template=3,search=5`) or it is dropped from the default chain and
-  measured as a standalone outlier cell. Calibration decides which; see the
-  commit sequence.
+* **`op7` costs more than the other six together** and must not sit in the
+  measured chain (see the calibration below).
 * **The per-op cost is not proportional to `p`.** `p` counts hops (a transport
-  quantity); the fact that `op2` costs 80x `op4` is a compute fact that shows
+  quantity); the fact that `op2` costs 15x `op4` is a compute fact that shows
   up in `pre_ops` and in the *node* that owns it, not in the label.
+
+### Calibration (measured, `settle` none, 8 frames, medians)
+
+Each op run alone through the monolith CLI, reading `pre_ops` from the records
+the run already writes:
+
+| | op | 720p ms | 180p ms | 720p/180p | note |
+| --- | --- | --- | --- | --- | --- |
+| `op1` | clahe | 16.65 | 4.88 | 3.4 | tile count is fixed, so it has a large size-independent part |
+| `op2` | bilateral | 53.86 | 9.76 | 5.5 | the dominant op of the six |
+| `op3` | gaussian | 9.53 | 1.51 | 6.3 | |
+| `op4` | gamma | 3.75 | 0.22 | 16.9 | scales with pixels, as a single pass should |
+| `op5` | hist_eq | 11.87 | 0.59 | 20.1 | super-linear ratio: the 180p frame is cache-resident |
+| `op6` | median | 16.37 | 1.28 | 12.8 | |
+| `op7` | denoise (defaults) | **1358.6** | **257.6** | 5.3 | unusable in the matrix |
+| `op7'` | denoise `template=3,search=5` | 132.8 | 16.7 | 7.9 | still the outlier |
+| | **6-op chain** (`op1..op6`) | **113.5** | **21.3** | 5.3 | sum of singles 112.0 / 18.2 (see below) |
+| | **7-op chain** (`op7'`) | 212.2 | 38.0 | 5.6 | |
+
+Three things follow, and they decide the design rather than decorate it.
+
+1. **The measured chain is `op1..op6`.** With `op7` at its defaults every
+   op-split cell would run at 0.6 fps and the transport share would collapse to
+   a few percent -- the axis would measure nothing but non-local means. Even
+   with cheap parameters it doubles the cost of the 12-node cell and turns the
+   compute/transport ratio from ~1.3:1 into 2.5:1. `denoise` therefore gets its
+   own standalone cell (it is the op that trivially justifies a hop) and stays
+   out of `p8c3`.
+2. **Op costs are additive inside one process, to within 1 % at 720p**
+   (113.5 measured vs 112.0 summed) and 17 % at 180p. That is the good news for
+   the axis: there is no hidden cache windfall to confound the hop count, and
+   the 180p discrepancy is the size of the smallest ops there.
+3. **With six ops the two terms are the same order of magnitude, which is the
+   only regime where the question has an answer.** At 720p: 113.5 ms of chain
+   compute against 88.4 ms of transport for `p8c3` (56 % compute). At 180p:
+   21.3 ms compute against 42.8 ms transport (33 % compute). The crossover sits
+   between 360p and 720p, and that is exactly "which grows faster with
+   resolution" -- with `op7` in the chain it would just be "denoise is slow".
+
+The `p8c3` budget with the six-op chain at 720p is
+`88.4 + 113.5 + ~15` (acquisition, contract, engine, decode) `~= 217 ms/frame`,
+i.e. ~4.6 fps and a ~630 s ceiling per trial -- ~10 min, which is affordable
+but is the reason Tier 2 stops at two cells.
 
 ## Shape -> process map
 
@@ -316,26 +364,24 @@ Two properties make this safe to generalise rather than special-case:
 
 ## Implementation plan
 
-Nine commits, each leaving the tree in a state that runs and a reason to be
+Ten commits, each leaving the tree in a state that runs and a reason to be
 bisected, in the order that keeps the blast radius smallest:
 
 | # | commit | leaves behind |
 | --- | --- | --- |
 | 1 | `docs: shape naming, stage-2 order and the shape -> process map` | this document; no code |
-| 2 | `feat(yolocar_ros): one stage-runner node for any contiguous stage span` | `chain_node` exists and is unit-tested, nothing launches it yet |
-| 3 | `refactor(yolocar_ros)!: the three stage nodes are chain_node with fixed stages` | same graph, same records, one implementation |
-| 4 | `feat(yolocar_ros): split stage 4-6, with per-stage timing` | `p2c2`/`p2c3` launchable |
-| 5 | `feat(yolocar_ros): the launch file composes a shape from a chain string` | `p1c0`/`p1c1`/`p2c0`/`p2c1` from one parameter |
-| 6 | `feat(yolocar_ros): group the stage-2 chain into several nodes` | `p3c1`/`p8c3` |
-| 7 | `test(yolocar_ros): every shape yields the same detections` | the D3 invariant, enforced |
-| 8 | `feat(bench): cells for the shape axis` | `bench/scenarios.json` + `N{x}`/`p{p}c{c}` validation |
-| 9 | `docs: re-measure and record the shape axis` | numbers, not predictions |
+| 2 | `docs(yolocar): measure the stage-2 ops and pin the chain` | the calibration above; six-op default, `denoise` outlier |
+| 3 | `feat(yolocar_ros): one stage-runner node for any contiguous stage span` | `chain_node` exists and is unit-tested, nothing launches it yet |
+| 4 | `refactor(yolocar_ros)!: the three stage nodes are chain_node with fixed stages` | same graph, same records, one implementation |
+| 5 | `feat(yolocar_ros): split stage 4-6, with per-stage timing` | `p2c2`/`p2c3` launchable |
+| 6 | `feat(yolocar_ros): the launch file composes a shape from a chain string` | `p1c0`/`p1c1`/`p2c0`/`p2c1` from one parameter |
+| 7 | `feat(yolocar_ros): group the stage-2 chain into several nodes` | `p3c1`/`p8c3` |
+| 8 | `test(yolocar_ros): every shape yields the same detections` | the D3 invariant, enforced |
+| 9 | `feat(bench): cells for the shape axis` | `bench/scenarios.json` + `N{x}`/`p{p}c{c}` validation |
+| 10 | `docs: re-measure and record the shape axis` | numbers, not predictions |
 
-Step 0 (before commit 1) is a **calibration**, not a commit: run each op and
-each stage at the three resolutions through the existing monolith CLI
-(`--pre <op> --records ...`, which already reports per-op ms) to pin the `p8c3`
-budget problem down with a number. Its results decide whether `op7` keeps its
-defaults in the shape matrix.
+`op7` staying out of the matrix is the one decision the calibration changed;
+everything else below it was prediction and is unchanged.
 
 ## Measurement design
 
