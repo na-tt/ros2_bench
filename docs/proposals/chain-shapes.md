@@ -1,9 +1,12 @@
 # Chain shapes: how many processes, and where the cuts go
 
-Status: **proposal**, nothing implemented. Branch `feature/preprocessing-ops`
-already ships the mechanism for one axis (stage 2, `pre_ops` + `pre_split`);
-this document is about generalising it to the whole pipeline and about what
-each shape is allowed to claim.
+Status: **ratified, implementation started** on branch
+`feature/preprocessing-ops`. The configurations, the naming and the stage-2
+order below are decisions; the commit sequence at the end is what turns them
+into a graph you can launch. Branch `feature/preprocessing-ops` already ships
+the mechanism for one axis (stage 2, `pre_ops` + `pre_split`); this document is
+about generalising it to the whole pipeline and about what each shape is
+allowed to claim.
 
 Related: `preprocessing-chain.md` (why the model contract moved into the
 inference node -- that decision is a precondition for the numbers here).
@@ -241,14 +244,124 @@ The ack does **not** need work: it stays one control hop from the terminal node
 to acquisition regardless of `N`. The per-frame scheduling cost of `N` nodes is
 inside the hop term, which is precisely what the sweep measures.
 
+## Stage 2 order: which op is `op1`
+
+The seven conditioning ops are one canonical chain, applied in this order:
+
+| | op | function | bottleneck | cost driver |
+| --- | --- | --- | --- | --- |
+| `op1` | `clahe` | local contrast (YCrCb round trip) | mixed | fixed tile count, per-pixel LUT interpolation |
+| `op2` | `bilateral` | edge-preserving smoothing | **arithmetic** | `exp` per neighbour, `O(k^2)` |
+| `op3` | `gaussian` | separable blur | mixed | `O(pixels * k)` |
+| `op4` | `gamma` | tone curve via LUT | **memory** | one pass, cheapest op in the set |
+| `op5` | `hist_eq` | luma histogram equalisation | **memory, multi-pass** | histogram + LUT + apply |
+| `op6` | `median` | non-separable median | arithmetic | `O(pixels * k^2)`, small constants |
+| `op7` | `denoise` | non-local means colour | **search window** | `O(pixels * search^2)`, the outlier |
+
+**Why this order is admissible.** With one frame in flight the ops are strictly
+sequential, so their order cannot change the sum of their costs -- only *where
+in the graph* each cost lands, which is what `p` counts, not which op sits at
+which index. The one order-dependent effect is cache locality: seven ops inside
+one node re-read a hot frame, seven nodes re-read a cold one, and that
+difference is exactly the "decomposition makes compute slower" term the axis is
+supposed to expose, so it is part of the measurement rather than a confound.
+Concretely: any permutation of `op1..op7` yields the same shape costs, and the
+default order is the one a practitioner would write, so the demo renders look
+plausible and the cells are comparable to a real pipeline.
+
+Two consequences that are *not* neutral and must be recorded:
+
+* **`op7` dominates every op-split cell if left at its defaults.** Non-local
+  means at 720p is ~1 s/frame, i.e. the `p8c3` cell would spend 2500 frames x
+  1 s per trial and the transport share would collapse to a few percent --
+  measuring nothing. Either its parameters are reduced for the shape matrix
+  (`denoise:template=3,search=5`) or it is dropped from the default chain and
+  measured as a standalone outlier cell. Calibration decides which; see the
+  commit sequence.
+* **The per-op cost is not proportional to `p`.** `p` counts hops (a transport
+  quantity); the fact that `op2` costs 80x `op4` is a compute fact that shows
+  up in `pre_ops` and in the *node* that owns it, not in the label.
+
+## Shape -> process map
+
+Every shape in this document is expressible with **one** new executable,
+`chain_node`, parameterised by which stages it runs and by the cut points
+inside stage 2 and stage 4-6. Nothing is duplicated per shape and no shape gets
+its own binary: a shape is a list of configs, and the launch file is the only
+thing that knows the shape.
+
+| shape | processes | notes |
+| --- | --- | --- |
+| `monolith` | `python3 -m yolocar.main` | 1 process, no ROS |
+| `p1c0` | `acquisition` \| `chain_node stages:=pre,infer,post` | the monolith in a second process: 1 pixel hop, nothing else |
+| `p2c0` | `acquisition` \| `chain_node stages:=pre` \| `chain_node stages:=infer,post` | |
+| `p1c1` | `acquisition` \| `chain_node stages:=pre,infer` \| `chain_node stages:=post` | pixels cross once |
+| `p2c1` | `acquisition` \| `pre` \| `infer` \| `post` | `chain_node` three times, `stages:=` one family each |
+| `p2c2` | `... \| post_stages:=nms` \| `post_stages:=filter,coord` | same binary, different slice |
+| `p2c3` | `... \| post_stages:=nms` \| `post_stages:=filter` \| `post_stages:=coord` | |
+| `p3c1` | `acquisition` \| `pre pre_ops:=<ops 1-2>` \| `pre pre_ops:=<ops 3-7>` \| `infer` \| `post` | two aggregate stage-2 nodes |
+| `p8c3` | `acquisition` \| 7x `pre pre_ops:=<one op>` \| `infer` \| 3x `post_stages:=<one stage>` | the 12-process extreme |
+
+Two properties make this safe to generalise rather than special-case:
+
+* **The terminal node is derived, not configured.** Whichever node runs the last
+  stage (`coord`) is the one that writes `records.jsonl`/`summary.json` and
+  sends the ack. A shape that ends somewhere else is not expressible, so the
+  file contract cannot be silently lost.
+* **Timing stays additive per stage.** `pre_ms`/`infer_ms`/`post_ms` are
+  accumulated by each node that contributes, and the per-stage breakdown travels
+  in parallel arrays (`pre_op_names`/`pre_op_ms`, and the same for post), so a
+  split stage reports the same number as an unsplit one and the extra hops land
+  in `transport_ms`.
+
+## Implementation plan
+
+Nine commits, each leaving the tree in a state that runs and a reason to be
+bisected, in the order that keeps the blast radius smallest:
+
+| # | commit | leaves behind |
+| --- | --- | --- |
+| 1 | `docs: shape naming, stage-2 order and the shape -> process map` | this document; no code |
+| 2 | `feat(yolocar_ros): one stage-runner node for any contiguous stage span` | `chain_node` exists and is unit-tested, nothing launches it yet |
+| 3 | `refactor(yolocar_ros)!: the three stage nodes are chain_node with fixed stages` | same graph, same records, one implementation |
+| 4 | `feat(yolocar_ros): split stage 4-6, with per-stage timing` | `p2c2`/`p2c3` launchable |
+| 5 | `feat(yolocar_ros): the launch file composes a shape from a chain string` | `p1c0`/`p1c1`/`p2c0`/`p2c1` from one parameter |
+| 6 | `feat(yolocar_ros): group the stage-2 chain into several nodes` | `p3c1`/`p8c3` |
+| 7 | `test(yolocar_ros): every shape yields the same detections` | the D3 invariant, enforced |
+| 8 | `feat(bench): cells for the shape axis` | `bench/scenarios.json` + `N{x}`/`p{p}c{c}` validation |
+| 9 | `docs: re-measure and record the shape axis` | numbers, not predictions |
+
+Step 0 (before commit 1) is a **calibration**, not a commit: run each op and
+each stage at the three resolutions through the existing monolith CLI
+(`--pre <op> --records ...`, which already reports per-op ms) to pin the `p8c3`
+budget problem down with a number. Its results decide whether `op7` keeps its
+defaults in the shape matrix.
+
 ## Measurement design
 
-Cells keep the existing `<chain>-<resolution>-<model>` form, with `chain` being
-the label: `monolith`, `ros-p1c0`, `ros-p2c0`, `ros-p1c1`, `ros-p2c1`
-(= `ros-4node`, kept as an alias), `ros-p2c2`, `ros-p3c1`, `ros-p2c3`,
-`ros-p8c3`. The `chain` factor in `bench/scenarios.json` selects which command
-template runs, so a shape is one extra entry per resolution, not a new harness,
-and the shape string goes in the summary provenance.
+Cells keep the existing `<chain>-<resolution>-<model>` form, and the chain
+factor spells the shape as **`ros-N{x}-p{p}c{c}`**, where `x` is the total
+process count and the label is the coordinate from the naming section:
+
+| cell prefix | N | p | c |
+| --- | --- | --- | --- |
+| `ros-N2-p1c0` | 2 | 1 | 0 |
+| `ros-N3-p2c0` | 3 | 2 | 0 |
+| `ros-N3-p1c1` | 3 | 1 | 1 |
+| `ros-N4-p2c1` | 4 | 2 | 1 |
+| `ros-N5-p2c2` | 5 | 2 | 2 |
+| `ros-N5-p3c1` | 5 | 3 | 1 |
+| `ros-N6-p2c3` | 6 | 2 | 3 |
+| `ros-N12-p8c3` | 12 | 8 | 3 |
+
+`x` is redundant with `p + c + 1` and that is on purpose: the redundant number
+is what a human reads first in a directory listing ("twelve processes"), and
+the coordinate is what the analysis needs; a mismatch between them is a bug in
+the scenario file that `bench/run.py` can check before launching anything.
+`ros-4node` stays as an alias for `ros-N4-p2c1` so existing paths keep meaning.
+The `chain` factor in `bench/scenarios.json` selects which command template
+runs, so a shape is one extra entry per resolution, not a new harness, and the
+shape string goes in the summary provenance.
 
 **Tier 1 -- the decisive minimum** (10 cells, 5 shapes x 720p and 180p):
 `monolith`, `ros-p1c0`, `ros-p2c0`, `ros-p1c1`, `ros-p2c1`. This answers H1
