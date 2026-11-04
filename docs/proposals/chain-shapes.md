@@ -1,9 +1,10 @@
 # Chain shapes: how many processes, and where the cuts go
 
-Status: **ratified, implementation started** on branch
-`feature/preprocessing-ops`. The configurations, the naming and the stage-2
-order below are decisions; the commit sequence at the end is what turns them
-into a graph you can launch. Branch `feature/preprocessing-ops` already ships
+Status: **implemented, not yet measured** on branch
+`feature/preprocessing-ops`. All eight shapes launch from one `chain:=`
+argument, the identity invariant is a test, and the benchmark has cells for the
+axis. What is missing is the measurement: nothing below may be quoted as a
+result until the matrix has been re-run. Branch `feature/preprocessing-ops` already ships
 the mechanism for one axis (stage 2, `pre_ops` + `pre_split`); this document is
 about generalising it to the whole pipeline and about what each shape is
 allowed to claim.
@@ -555,17 +556,21 @@ bisected, in the order that keeps the blast radius smallest:
 | 2 | `docs(yolocar): measure the stage-2 ops and pin the chain` | the calibration above |
 | 3 | `feat(yolocar): unsharp masking is the seventh op, denoise is gone` | op set final: seven ops, no outlier |
 | 4 | `refactor(yolocar_ros): the terminal bookkeeping is one class` | `Terminal` owns records/summary/ack; postprocessing uses it |
-| 5 | `feat(yolocar_ros): one stage-runner node for any contiguous stage span` | `chain_node` exists and is unit-tested, nothing launches it yet |
-| 6 | `refactor(yolocar_ros)!: the three stage nodes are chain_node with fixed stages` | same graph, same records, one implementation |
-| 7 | `feat(yolocar_ros): split stage 4-6, with per-stage timing` | `p2c2`/`p2c3` launchable |
-| 8 | `feat(yolocar_ros): the launch file composes a shape from a chain string` | `p1c0`/`p1c1`/`p2c0`/`p2c1` from one parameter |
-| 9 | `feat(yolocar_ros): group the stage-2 chain into several nodes` | `p3c1`/`p8c3` |
-| 10 | `test(yolocar_ros): every shape yields the same detections` | the D3 invariant, enforced |
-| 11 | `feat(bench): cells for the shape axis` | `bench/scenarios.json` + `N{x}`/`p{p}c{c}` validation |
-| 12 | `docs: re-measure and record the shape axis` | numbers, not predictions |
+| 5 | `feat(yolocar_ros): one stage-runner node for any contiguous stage span` | **done** -- `ChainNode`, engine loaded only by the `infer` span, terminal derived from `coord` |
+| 6 | `refactor(yolocar_ros)!: the three stage nodes are chain_node with fixed stages` | **done in 5**: the three executables are one-line entry points |
+| 7 | `feat(yolocar_ros): split stage 4-6, with per-stage timing` | **done in 5**: `post_stages`, `post_ops`, `stage_ms.postprocess_ops` |
+| 8 | `feat(yolocar_ros): the launch file composes a shape from a chain string` | **done** -- `chain:=` + `pre_groups:=`, partition policy as a pure function |
+| 9 | `feat(yolocar_ros): group the stage-2 chain into several nodes` | **done in 8**: `pre_groups:=2,5` etc. |
+| 10 | `test(yolocar_ros): every shape yields the same detections` | **done** -- 11 tests, all eight shapes |
+| 11 | `feat(bench): cells for the shape axis` | **done** -- 16 cells, cell name checked against the graph |
+| 12 | `docs: re-measure and record the shape axis` | **not done**: needs the machine for a few hours |
 
-Steps 1-4 have landed. The calibration changed one decision (the seventh op:
-`denoise` out, `unsharp` in) and confirmed the rest.
+Steps 1-11 have landed; step 12 is a measurement session, not a commit. The
+calibration changed one decision (the seventh op: `denoise` out, `unsharp` in)
+and confirmed the rest. Three things the implementation added to the design
+without changing it: the node learns nothing about the shape (only its own
+stage span), the terminal node is derived from running `coord`, and the cell
+name is validated against the graph before anything launches.
 
 ## Measurement design
 

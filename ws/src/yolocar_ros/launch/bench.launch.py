@@ -365,6 +365,9 @@ def _parameters() -> dict[str, object]:
         'summary': _typed('summary', str),
         'log_level': _typed('log_level', str),
         'chain': _typed('chain', str),
+        #: Provenance, not behaviour: the node writes it into the summary and
+        #: the detections sidecar so an artefact says which graph made it.
+        'shape': _typed('chain', str),
     }
 
 

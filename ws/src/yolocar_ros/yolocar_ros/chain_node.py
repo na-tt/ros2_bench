@@ -291,6 +291,7 @@ class ChainNode(Node):
             detections_header=Terminal.detections_header(
                 self.config, producer=self.shape or 'ros'
             ),
+            shape=self.shape,
         )
 
     def _declare_topics(self) -> None:

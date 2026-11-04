@@ -47,10 +47,12 @@ class Terminal:
         pre_ops: list[str],
         detections_header: dict[str, object],
         engine_loaded_t: float = 0.0,
+        shape: str = '',
     ) -> None:
         self.node = node
         self.config = config
         self.pre_ops = pre_ops
+        self.shape = shape
         self._t_start = time.monotonic()
 
         self.records = RecordWriter(config.records_path)
@@ -249,6 +251,7 @@ class Terminal:
             detections_per_frame=self._detections_per_frame,
             detections_by_class=self._detections_by_class,
             pre_ops=self.pre_ops,
+            shape=self.shape,
             records_path=self.config.records_path,
             detections_path=self.config.detections_path,
         )

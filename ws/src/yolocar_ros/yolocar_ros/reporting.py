@@ -166,6 +166,7 @@ def build_summary(
     records_path: Path | None,
     detections_path: Path | None = None,
     pre_ops: list[str] | None = None,
+    shape: str = '',
 ) -> dict[str, object]:
     """Assemble the ``summary.json`` payload (same shape as the monolith)."""
     fps = (frames / wall_time_s) if frames and wall_time_s > 0 else 0.0
@@ -224,7 +225,10 @@ def build_summary(
         'detections': detection_summary(
             frames, detections_per_frame, detections_by_class
         ),
-        'provenance': provenance(config, source),
+        #: Which partition of the pipeline produced this file. Without it a
+        #: twelve-process run and a four-process run are indistinguishable on
+        #: disk, which is exactly what the shape axis must not allow.
+        'provenance': {**provenance(config, source), 'shape': str(shape)},
         'records': None if records_path is None else str(records_path),
         #: Side artifact (final detections per frame), renderable offline.
         'detections_log': (
