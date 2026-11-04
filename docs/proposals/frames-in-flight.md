@@ -1,10 +1,9 @@
 # Frames in flight: trading latency for throughput
 
-Status: **mechanism implemented, harness and analyser wired, axis not yet
-measured.** The numbers in *First light* are a smoke run (2 passes, 200-frame
-windows, 180p) whose only job was to prove the mechanism end to end; they are
-not a result. Nothing below may be quoted as one until the matrix in
-*Measurement plan* has been run.
+Status: **mechanism implemented, harness and analyser wired, tier 1 measured
+once** (3 passes, 720p, `ros-4node`) -- on a board running at 94-97 % load, so
+the ladder's *shape* is informative and its absolute numbers are not. Tiers 2-3
+are unmeasured.
 
 Related: `chain-shapes.md` (which shape, i.e. how many processes), and
 `preprocessing-chain.md` (why the model contract lives in the inference node).
@@ -124,7 +123,7 @@ argument for partitioning, because latency only gets worse.
   mistaken for one that filled and bought nothing: the record carries the
   realized count and the report prints it as `fill`.
 
-## First light (smoke, not a result)
+## Mechanism check (180p smoke, not a result)
 
 `ros-4node` at 180p, no conditioning chain, 2 passes, 200-frame windows,
 `settle_s=5` (the ladder's real cells use 45 s):
@@ -135,7 +134,8 @@ argument for partitioning, because latency only gets worse.
 | 2 | 1.00 | 44.2 ± 1.5 | 39.8 ± 1.9 | 61.5 | 18.5 | 1.27 | 0.303 ± 0.008 |
 | 4 | 1.00 | 44.4 ± 1.4 | 85.8 ± 3.3 | 123.0 | 65.0 | 1.26 | 0.303 ± 0.007 |
 
-Read it as a mechanism check, and note how exactly it matches the model:
+Read it as a mechanism check, and note how closely it matched the model on a
+ladder whose hops were cheap:
 throughput doubles by `i=2` and is flat from there (H1), `p50` grows by ~46 ms
 between `i=2` and `i=4` while `fps` does not move (H2, with a bottleneck
 residency of ~23 ms), energy per frame falls 25 % then stops (H5). `fill = 1.00`,
@@ -146,11 +146,11 @@ residency of ~23 ms), energy per frame falls 25 % then stops (H5). `fill = 1.00`
 The ladder is `{1, 2, 4, 8}`; the `i1` cell of each family is the local zero and
 must be in the same invocation (the global `anchor` stays the monolith).
 
-| tier | cells | why | est. |
-| --- | --- | --- | --- |
-| 1 | `ros-4node-720p-n` × {1,2,4,8} + `monolith-720p-n` | the knee, at the resolution where hops cost bytes | ~40 min |
-| 2 | `ros-4node-180p-n` × {1,2,4,8} | H4: cheaper hops should lower `D*` and raise the peak | ~35 min |
-| 3 | `ros-N12-p8c3-720p-n` × {1,2,4} | 12 nodes, 6 cores: the *machine* saturates before the pipeline | ~60-70 min |
+| tier | cells | why | est. | state |
+| --- | --- | --- | --- | --- |
+| 1 | `ros-4node-720p-n` x {1,2,4,8} + `monolith-720p-n` | the knee, at the resolution where hops cost bytes | ~40 min | measured once, loaded board |
+| 2 | `ros-4node-180p-n` x {1,2,4,8} | H4: cheaper hops should lower `D*` and raise the peak | ~35 min | to do |
+| 3 | `ros-N12-p8c3-720p-n` x {1,2,4} | 12 nodes, 6 cores: the *machine* saturates before the pipeline | ~60-70 min | to do |
 
 ```bash
 bench/run.py --out results/fif1 --conditions \
@@ -158,10 +158,69 @@ bench/run.py --out results/fif1 --conditions \
 bench/analyze.py --dir results/fif1 --md results/fif1/report.md --json results/fif1/report.json
 ```
 
-Acceptance before quoting a number: `fill ≈ 1` and `drops = 0` in every windowed
+Acceptance before quoting a number: `fill ~ 1` and `drops = 0` in every windowed
 trial; `seq` contiguous; detections identical across windows for a fixed cell;
-`latency - acq - Σ stages - hop_ms` in `[0, ~2] ms` and flat in `D`; and no
+`latency - acq - sum stages - hop_ms` in `[0, ~2]` ms and flat in `D`; and no
 change to the machine policy (no affinity, governor, GC or clock pinning).
+
+## Tier 1, first pass (720p, 3 passes, loaded board)
+
+Same session throughout, cells interleaved in one block, so the within-pass
+deltas hold even though the board did not (see the caveats). `i1` is the same
+chain as the historical `ros-4node-720p-n`, so this run also re-measures it:
+
+| `i` | fill | frames | fps | p50 ms | p95 ms | p99 ms | hop ms | cpu ms/f | cores | W | J/f |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1.00 | 1766 | 8.97 +/- 0.15 | 101.1 | 157.6 | 178.8 | 74.7 | 64.1 | 0.58 | 9.9 | 1.107 |
+| 2 | 1.00 | 1732 | 14.24 +/- 0.16 | 126.4 | 202.3 | 235.0 | 98.6 | 61.0 | 0.87 | 10.2 | 0.721 |
+| 4 | 1.00 | 2181 | 20.45 +/- 0.24 | 180.9 | 259.5 | 303.4 | 154.5 | 58.9 | 1.20 | 10.6 | 0.521 |
+| 8 | 1.00 | 2500 | 28.65 +/- 4.48 | 268.0 | 352.6 | 394.3 | 215.7 | 54.8 | 1.56 | 11.0 | 0.394 |
+
+Anchor in the same run: `monolith-720p-n` 41.55 +/- 0.71 fps, p50 18.38 ms,
+J/f 0.274. Within-pass deltas against the family's own `i1`: `fps` +5.3 / +11.5
+/ +19.7, `p50` +25 / +80 / +167 ms, `J/f` -0.386 / -0.586 / -0.713 (all CIs
+exclude zero).
+
+What it establishes:
+
+* **the window is real and full** -- `fill = 1.00`, `drops = 0`, and `L*X/i`
+  between 0.91 and 0.93 in every row. So the added latency is queueing (p99
+  179 -> 394 ms) and not slower work.
+* **the dividend is large and it is energy**, not just throughput: 3.2x the
+  frames at 64 % less energy per frame. At `i=8` the ROS chain is at 28.7 fps
+  and 0.394 J/f, against the monolith's 41.6 fps and 0.274 J/f.
+
+What it contradicts, on this board:
+
+* **H1 fails at 720p.** Throughput is still rising at `D=8`, no plateau. The
+  knee is `sum s / max s`, and here `sum s` is dominated by the hop (74.7 ms of
+  ~111 ms at `i1`), so a big window keeps paying. This is why `D*` must be
+  computed per board/session instead of assumed: the 180p smoke reached its
+  knee at 2 because its hops were 15x cheaper.
+* **H3 fails, in the favourable direction.** `cpu ms/f` *falls* with the window
+  (64.1 -> 54.8) and the effective bottleneck residency shrinks, so extra frames
+  keep buying throughput rather than only adding latency. The plausible reading
+  is that a per-hop cost at `D=1` is partly a wakeup/idle tax that amortizes once
+  frames are resident -- i.e. the partitioning overhead is a function of
+  concurrency, not only of structure. That is a hypothesis, not a result: on a
+  loaded board CPU starvation and amortization are confounded.
+
+Caveats, attached rather than buried:
+
+1. **The board was at 94-97 % load** (load average 9-10 on 6 cores; the desktop
+   session, mostly the terminal emulator). Absolute values are therefore not
+   comparable to the baseline table -- the anchor confirms it (`monolith-720p-n`
+   41.6 fps here against 59.5 fps on a quiet board). Only the within-pass deltas
+   and the internal consistency checks mean anything.
+2. **Three of four ROS cells under-filled their 2500-frame window** (1766, 1732,
+   2181) because their `fps_hint` predates this load: the percentiles are over
+    different `n`. `i8` reached 2500.
+3. **`i8` `r1` is an outlier** (23.5 fps against 30.9 and 31.5), which is why
+   that row's std is 4.5 fps.
+
+Before tier 2 and any comparison across sessions: re-derive the ladder's
+`fps_hint` from a quiet board, add an `i16` point at 720p (the curve had not
+turned), and re-run tier 1.
 
 ## Why `FIF` is not the name
 
