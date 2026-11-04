@@ -1,10 +1,24 @@
 """
-Stage 1 node: drive a source and publish one ``ImageFrame`` at a time.
+Stage 1 node: drive a source and publish into a credit window of ``inflight``.
 
-The node owns the pacing. It publishes a frame and waits for the terminal
-node's ack before decoding the next one, so the graph is demand-driven exactly
-like the monolith's blocking loop: one frame in flight, no queue consuming the
-latency it is supposed to measure, no silently dropped frames.
+The node owns the pacing. It publishes while fewer than ``inflight`` of its
+frames are outstanding (published and not yet acknowledged by the terminal
+node), so the graph holds at most that many frames and never drops one:
+``inflight:=1`` is the demand-driven chain that measures latency in isolation,
+``inflight:=k`` is k frames resident, which spends latency to buy throughput.
+
+Frame 0 is published synchronously -- the node waits for its ack before opening
+the window -- because that ack is also the discovery gate (every downstream
+node has matched) and the engine-ready gate (it carries ``engine_loaded_t``,
+which starts the ``--duration`` clock). After that the window is filled
+greedily: the node never waits for an ack it does not need.
+
+The window is identified by ``seq``, not counted. One monotonic watermark
+releases every frame at or below it, so a duplicated or reordered ack is
+harmless; only the latest one has to arrive. A frame lost in the graph
+therefore never releases its credit, which surfaces as ``ack_timeout`` -- the
+honest failure, because a lost frame invalidates the measurement rather than
+quietly shrinking the sample.
 
 No image processing happens here beyond what :mod:`yolocar.acquisition` does
 (decode + the ``--rotate`` correction), which keeps ``acq_ms`` comparable to
@@ -27,6 +41,7 @@ from yolocar_interfaces.msg import FrameAck, ImageFrame
 
 from . import qos, topics
 from .conversions import frame_meta, image_frame
+from .window import CreditWindow
 
 LOGGER = logging.getLogger('yolocar')
 
@@ -34,7 +49,7 @@ _SENTINEL = object()
 
 
 class AcquisitionNode(Node):
-    """Publish the configured source as ``ImageFrame`` messages, one at a time."""
+    """Publish the configured source as ``ImageFrame`` messages, within a window."""
 
     def __init__(self) -> None:
         super().__init__('yolocar_acquisition')
@@ -50,34 +65,44 @@ class AcquisitionNode(Node):
         self.duration_s = duration if duration > 0.0 else None
         max_frames = int(self.declare_parameter('max_frames', -1).value)
         self.max_frames = max_frames if max_frames > 0 else None
+        #: Frames in flight. 1 = demand-driven (one frame resident, no window).
+        self.inflight = max(1, int(self.declare_parameter('inflight', 1).value))
         self.ack_timeout = float(self.declare_parameter('ack_timeout', 60.0).value)
         self.end_timeout = float(self.declare_parameter('end_timeout', 30.0).value)
         log_level = str(self.declare_parameter('log_level', 'INFO').value)
         LOGGER.setLevel(log_level.upper())
 
+        # The topic depth *is* the window: a smaller history would evict an
+        # unacked sample, a larger one could only hide a mistake.
         self.publisher = self.create_publisher(
-            ImageFrame, topics.FRAME_TOPIC, qos.latest()
+            ImageFrame, topics.FRAME_TOPIC, qos.latest(self.inflight)
         )
         self.stop_publisher = self.create_publisher(
             Empty, topics.STOP_TOPIC, qos.control(depth=1)
         )
         self.create_subscription(
-            FrameAck, topics.ACK_TOPIC, self._on_ack, qos.control()
+            FrameAck,
+            topics.ACK_TOPIC,
+            self._on_ack,
+            qos.control(max(10, self.inflight)),
         )
         self.create_subscription(
             Empty, topics.DONE_TOPIC, self._on_done, qos.control(depth=1)
         )
 
-        self._acked_seq = -1
+        #: The whole flow-control state: which seqs are in flight and whether
+        #: one more may be published. Nothing else paces the node.
+        self.window = CreditWindow(self.inflight)
+        self._published = 0
         self._done = False
         self._t_measure_start: float | None = None
-        self._frames = 0
         self._t_start = time.monotonic()
 
     # ------------------------------------------------------------- callbacks
     def _on_ack(self, msg: FrameAck) -> None:
-        if int(msg.seq) > self._acked_seq:
-            self._acked_seq = int(msg.seq)
+        # One watermark releases every frame up to it: acks that arrive out of
+        # order, or not at all, cost nothing as long as the latest one lands.
+        self.window.ack(int(msg.seq))
         # The inference node reports when its engine became ready; use it as
         # the measurement clock origin (the monolith starts at engine load).
         if self._t_measure_start is None and msg.engine_loaded_t > 0.0:
@@ -88,7 +113,7 @@ class AcquisitionNode(Node):
 
     # ------------------------------------------------------------------ loop
     def _should_stop(self) -> bool:
-        if self.max_frames is not None and self._frames >= self.max_frames:
+        if self.max_frames is not None and self._published >= self.max_frames:
             return True
         if (
             self.duration_s is not None
@@ -98,15 +123,35 @@ class AcquisitionNode(Node):
             return True
         return False
 
-    def _wait_for_ack(self, seq: int) -> bool:
-        """Spin until the terminal node acknowledges ``seq``."""
+    def _wait_for_release(self) -> bool:
+        """Spin until one outstanding frame is released (or the graph finishes)."""
+        target = len(self.window) - 1
         deadline = time.monotonic() + self.ack_timeout
-        while rclpy.ok() and not self._done and self._acked_seq < seq:
+        while rclpy.ok() and not self._done and len(self.window) > target:
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 return False
             rclpy.spin_once(self, timeout_sec=min(0.01, remaining))
-        return self._acked_seq >= seq
+        return len(self.window) <= target
+
+    def _drain(self) -> None:
+        """
+        Wait for every published frame, so the records are not short a tail.
+
+        The stop condition is on *published* frames; with a window there are up
+        to ``inflight - 1`` frames still in the graph when it triggers. Stopping
+        the terminal node before they land would truncate ``records.jsonl`` by
+        that many frames and hide a real result behind a ``window_short``
+        warning.
+        """
+        while rclpy.ok() and not self._done and len(self.window):
+            if not self._wait_for_release():
+                self.get_logger().error(
+                    f'{len(self.window)} frame(s) did not complete within '
+                    f'{self.ack_timeout:.1f} s while draining '
+                    '(is the downstream chain healthy?)'
+                )
+                return
 
     def _request_finish(self) -> None:
         """Tell the terminal node to write the summary, then wait for it."""
@@ -131,52 +176,69 @@ class AcquisitionNode(Node):
         duration = 'none' if self.duration_s is None else f'{self.duration_s:g}s'
         self.get_logger().info(
             f'source: {source.description} (kind={source.kind}, fps={source.fps:.1f}, '
-            f'rotate={self.rotate}, loops={self.loops}, duration={duration})'
+            f'rotate={self.rotate}, loops={self.loops}, duration={duration}, '
+            f'inflight={self.inflight})'
         )
         iterator = iter(source)
         try:
             while rclpy.ok() and not self._done:
-                if self._should_stop():
-                    break
+                if not self._should_stop() and self.window.has_room:
+                    # Capture timing starts before decoding, exactly like the
+                    # monolith: acq_ms is the decoder's + rotation's cost.
+                    t_acq = time.monotonic()
+                    frame = next(iterator, _SENTINEL)
+                    if frame is _SENTINEL:
+                        break
+                    acq_ms = (time.monotonic() - t_acq) * 1e3
 
-                # Capture timing starts before decoding, exactly like the
-                # monolith: acq_ms is the decoder's + rotation's cost.
-                t_acq = time.monotonic()
-                frame = next(iterator, _SENTINEL)
-                if frame is _SENTINEL:
-                    break
-                acq_ms = (time.monotonic() - t_acq) * 1e3
-
-                self._acked_seq = -1
-                self.publisher.publish(
-                    image_frame(
-                        frame.image,
-                        frame_meta(
-                            seq=frame.seq,
-                            loop=frame.loop,
-                            t_mono=t_acq,
-                            acq_ms=acq_ms,
-                        ),
+                    occupancy = self.window.add(frame.seq)
+                    self._published += 1
+                    meta = frame_meta(
+                        seq=frame.seq,
+                        loop=frame.loop,
+                        t_mono=t_acq,
+                        acq_ms=acq_ms,
+                        inflight=occupancy,
                     )
-                )
-                if not self._wait_for_ack(frame.seq):
+                    # Stamped before the payload is built: conversion is part of
+                    # what a hop costs, and hop_ms is measured up to it.
+                    meta.t_pub = time.monotonic()
+                    self.publisher.publish(image_frame(frame.image, meta))
+
+                    if self._published == 1:
+                        # Frame 0 is synchronous: its ack is the discovery gate
+                        # and the engine-ready gate, so no later frame is queued
+                        # in front of a graph that is still forming.
+                        if not self._wait_for_release():
+                            if rclpy.ok() and not self._done:
+                                self.get_logger().error(
+                                    f'frame {frame.seq} was not acknowledged within '
+                                    f'{self.ack_timeout:.1f} s '
+                                    '(is the downstream chain healthy?)'
+                                )
+                            break
+                    continue
+
+                if not len(self.window):
+                    break  # source exhausted (or stopped) with an empty window
+                if not self._wait_for_release():
                     if rclpy.ok() and not self._done:
                         self.get_logger().error(
-                            f'frame {frame.seq} was not acknowledged within '
-                            f'{self.ack_timeout:.1f} s '
+                            f'{len(self.window)} frame(s) were not acknowledged '
+                            f'within {self.ack_timeout:.1f} s '
                             '(is the downstream chain healthy?)'
                         )
                     break
-                self._frames += 1
         finally:
             source.close()
+            self._drain()
             self._request_finish()
 
         elapsed = time.monotonic() - self._t_start
-        fps = (self._frames / elapsed) if elapsed > 0 else 0.0
+        fps = (self._published / elapsed) if elapsed > 0 else 0.0
         self.get_logger().info(
-            f'published {self._frames} frames in {elapsed:.1f} s '
-            f'({fps:.2f} fps incl. startup)'
+            f'published {self._published} frames in {elapsed:.1f} s '
+            f'({fps:.2f} fps incl. startup, inflight={self.inflight})'
         )
 
 

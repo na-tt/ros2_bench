@@ -8,9 +8,11 @@ so a node that runs stages 2-6 and a node that runs only stage 6 write the same
 record from the same code. That is what lets a chain be cut anywhere without
 the contract drifting.
 
-It does hold ROS publishers (the ack paces the acquisition node, and a `done`
-signal closes the graph), but no stage logic: every function it calls lives in
-``yolocar``.
+It does hold ROS publishers (the ack releases one credit in the acquisition
+node's window, and a `done` signal closes the graph), but no stage logic: every
+function it calls lives in ``yolocar``. With a window of ``inflight`` frames the
+ack is still published after the record is flushed, so no credit is released for
+a frame whose line is not on disk.
 """
 
 from __future__ import annotations
@@ -48,11 +50,15 @@ class Terminal:
         detections_header: dict[str, object],
         engine_loaded_t: float = 0.0,
         shape: str = '',
+        inflight: int = 1,
     ) -> None:
         self.node = node
         self.config = config
         self.pre_ops = pre_ops
         self.shape = shape
+        #: Frames in flight, for provenance: a window of 4 and a window of 1 must
+        #: not be indistinguishable on disk, exactly like two chain shapes.
+        self.inflight = max(1, int(inflight))
         self._t_start = time.monotonic()
 
         self.records = RecordWriter(config.records_path)
@@ -185,8 +191,17 @@ class Terminal:
                 'present_ms': 0.0,
                 'latency_ms': round(latency_ms, 4),
                 'n_det': len(detections),
+                # ROS-only: frames outstanding when this one was published, so
+                # the report can tell a window that never filled from one that
+                # filled and bought nothing.
+                'inflight': int(meta.inflight),
+                # ROS-only: wait in front of each busy node, accumulated from
+                # the previous node's `t_pub`. At inflight=1 this is transport
+                # only; the growth with the window is the queueing delay.
+                'hop_ms': round(float(meta.hop_ms), 4),
                 # ROS-only: serialisation + transport + scheduling, i.e. what
-                # end-to-end latency has beyond the three stage timings.
+                # end-to-end latency has beyond the three stage timings. With a
+                # window it also carries the queueing the window introduced.
                 'transport_ms': round(transport_ms, 4),
             }
         )
@@ -200,8 +215,9 @@ class Terminal:
                 f'transport {transport_ms:.1f}), {len(detections)} dets'
             )
 
-        # The ack is what releases the acquisition node; send it only after the
-        # record is flushed, so one frame is truly in flight.
+        # The ack releases one credit in the acquisition node's window; send it
+        # only after the record is flushed, so no frame is ever released before
+        # its line is on disk.
         self.ack_publisher.publish(
             FrameAck(seq=int(meta.seq), engine_loaded_t=self.engine_loaded_t)
         )
@@ -254,6 +270,7 @@ class Terminal:
             shape=self.shape,
             records_path=self.config.records_path,
             detections_path=self.config.detections_path,
+            inflight=self.inflight,
         )
         write_summary(self.config.json_path, summary)
 

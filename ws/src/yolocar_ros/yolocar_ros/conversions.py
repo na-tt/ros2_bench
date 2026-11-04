@@ -31,6 +31,7 @@ def frame_meta(
     acq_ms: float = 0.0,
     pre_ms: float = 0.0,
     infer_ms: float = 0.0,
+    inflight: int = 0,
 ) -> FrameMeta:
     """Build the per-frame identity/timing block carried through the graph."""
     meta = FrameMeta()
@@ -40,6 +41,9 @@ def frame_meta(
     meta.acq_ms = float(acq_ms)
     meta.pre_ms = float(pre_ms)
     meta.infer_ms = float(infer_ms)
+    #: Frames outstanding at publish: the realized concurrency, so a window that
+    #: was never filled cannot be mistaken for one that bought nothing.
+    meta.inflight = int(inflight)
     return meta
 
 

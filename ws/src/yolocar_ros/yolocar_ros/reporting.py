@@ -167,6 +167,7 @@ def build_summary(
     detections_path: Path | None = None,
     pre_ops: list[str] | None = None,
     shape: str = '',
+    inflight: int = 1,
 ) -> dict[str, object]:
     """Assemble the ``summary.json`` payload (same shape as the monolith)."""
     fps = (frames / wall_time_s) if frames and wall_time_s > 0 else 0.0
@@ -227,8 +228,14 @@ def build_summary(
         ),
         #: Which partition of the pipeline produced this file. Without it a
         #: twelve-process run and a four-process run are indistinguishable on
-        #: disk, which is exactly what the shape axis must not allow.
-        'provenance': {**provenance(config, source), 'shape': str(shape)},
+        #: disk, which is exactly what the shape axis must not allow. The
+        #: frames-in-flight window gets the same treatment: a window of 4 and a
+        #: window of 1 differ in latency, throughput and joules per frame.
+        'provenance': {
+            **provenance(config, source),
+            'shape': str(shape),
+            'inflight': max(1, int(inflight)),
+        },
         'records': None if records_path is None else str(records_path),
         #: Side artifact (final detections per frame), renderable offline.
         'detections_log': (

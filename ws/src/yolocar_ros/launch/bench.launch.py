@@ -24,9 +24,11 @@ their span with ``pre_groups`` and by naming the post stages separately::
 
 The terminal node -- the one that runs ``coord`` -- is derived from the shape,
 not configured, and it is the only node that writes ``records.jsonl`` /
-``summary.json`` and acknowledges frames. Because the ack paces acquisition,
-exactly one frame is in flight and the graph is demand-driven like the
-monolith's loop, at any depth.
+``summary.json`` and acknowledges frames. The ack is a credit in the acquisition
+node's window, so ``inflight`` (default 1) sets how many frames the graph holds:
+1 is the demand-driven chain that measures latency in isolation, k spends
+latency to buy throughput. The one number paces acquisition *and* sets every
+data topic's history depth, so the two cannot disagree.
 
 Run it from the repository root (the default paths are relative to it), with
 the pipeline package importable:
@@ -365,6 +367,9 @@ def _parameters() -> dict[str, object]:
         'summary': _typed('summary', str),
         'log_level': _typed('log_level', str),
         'chain': _typed('chain', str),
+        #: Frames in flight: paces the acquisition node and sets the depth of
+        #: every data topic, so one number keeps the window and the QoS equal.
+        'inflight': _typed('inflight', int),
         #: Provenance, not behaviour: the node writes it into the summary and
         #: the detections sidecar so an artefact says which graph made it.
         'shape': _typed('chain', str),
@@ -458,6 +463,10 @@ def generate_launch_description() -> LaunchDescription:
         _argument('pre_split', 'false',
                   'shorthand for one stage-2 node per op (same as pre_groups:=1,1,...); '
                   'the chain itself still comes from pre_ops'),
+        _argument('inflight', 1,
+                  'frames in flight: the acquisition node keeps this many frames '
+                  'outstanding (it also sets every data topic history depth); '
+                  '1 = demand-driven, k = k frames resident'),
         _argument('device', 0, 'CUDA device ordinal'),
         _argument('classes', '0,1,2,3,5,6,7,9,11,12', 'comma separated COCO ids kept'),
         _argument('agnostic_nms', 'false', 'merge boxes across classes'),

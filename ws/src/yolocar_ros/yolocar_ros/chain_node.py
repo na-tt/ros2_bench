@@ -19,7 +19,7 @@ and inside the last of them, ``post_stages:=nms`` / ``filter,coord`` /
 and no shape gets its own binary: the launch file is the only thing that knows
 the shape.
 
-Three rules keep this honest rather than clever:
+Four rules keep this honest rather than clever:
 
 * **Only the node that runs ``infer`` loads the engine**, so the "one engine
   owner" rule survives every merge and ``stages:=pre`` still never touches
@@ -30,7 +30,16 @@ Three rules keep this honest rather than clever:
 * **Timings are additive**, not overwritten: a span that runs two stages adds to
   both buckets, and a stage cut over several nodes accumulates (``pre_ms``,
   ``post_ms`` and their per-op arrays), so the same work reports the same
-  numbers at any partition depth. The extra hops land in ``transport_ms``.
+  numbers at any partition depth. The extra hops land in ``transport_ms``, and
+  the wait in front of a busy node lands in ``hop_ms`` -- measured from the
+  previous node's ``t_pub`` at callback entry, not inferred from a residual.
+* **The window never changes the work, only how much of it is resident.**
+  ``inflight`` is one number from the launch file: it paces the acquisition node
+  and sets every data topic's history depth, and it is stamped into the frame so
+  the record says how many frames were outstanding when this one was published.
+  Ordering, each node's own service time and the additive timings are all
+  unaffected by it -- the chain stays single-threaded, one message at a time,
+  batch 1.
 
 The per-stage work itself is imported from ``yolocar``; nothing is
 reimplemented here.
@@ -141,6 +150,11 @@ class ChainNode(Node):
         #: The shape this process is part of, for provenance. The launch file
         #: sets it; empty means a hand-built graph.
         self.shape = str(self.declare_parameter('shape', '').value)
+        #: Frames in flight: the graph's credit window. Every node needs it,
+        #: because it is also the depth of its own topics -- a history smaller
+        #: than the window would evict an unacked sample and never release its
+        #: credit. One number from the launch file keeps pacing and depth equal.
+        self.inflight = max(1, int(self.declare_parameter('inflight', 1).value))
 
         self.in_topic = str(
             self.declare_parameter('in_topic', self._default_in_topic()).value
@@ -220,6 +234,8 @@ class ChainNode(Node):
             parts.append(f'[{", ".join(self.pre_ops) or "no conditioning ops"}]')
         if self.shape:
             parts.append(f'shape={self.shape}')
+        if self.inflight > 1:
+            parts.append(f'inflight={self.inflight}')
         return ' '.join(parts)
 
     def _load_engine(self) -> None:
@@ -292,26 +308,30 @@ class ChainNode(Node):
                 self.config, producer=self.shape or 'ros'
             ),
             shape=self.shape,
+            inflight=self.inflight,
         )
 
     def _declare_topics(self) -> None:
         self.publisher = None
         if self.output_kind == 'candidates':
             self.publisher = self.create_publisher(
-                CandidatesFrame, self.out_topic, qos.latest()
+                CandidatesFrame, self.out_topic, qos.latest(self.inflight)
             )
         elif self.output_kind == 'image':
             self.publisher = self.create_publisher(
-                ImageFrame, self.out_topic, qos.latest()
+                ImageFrame, self.out_topic, qos.latest(self.inflight)
             )
 
         if self.stages[0] == 'post':
             self.create_subscription(
-                CandidatesFrame, self.in_topic, self._on_candidates, qos.latest()
+                CandidatesFrame,
+                self.in_topic,
+                self._on_candidates,
+                qos.latest(self.inflight),
             )
         else:
             self.create_subscription(
-                ImageFrame, self.in_topic, self._on_image, qos.latest()
+                ImageFrame, self.in_topic, self._on_image, qos.latest(self.inflight)
             )
 
         if self.is_terminal:
@@ -326,9 +346,27 @@ class ChainNode(Node):
             )
 
     # ---------------------------------------------------------------- frames
+    def _note_hop(self, meta: FrameMeta) -> None:
+        """
+        Attribute the wait in front of this node to the frame's ``hop_ms``.
+
+        ``t_pub`` is stamped by whoever published this frame; the difference to
+        callback entry is delivery plus queueing. With one frame in flight it is
+        transport only, which is what lets the report read the growth of
+        ``hop_ms`` with the window as a queueing delay rather than a guess at
+        one.
+        """
+        if float(meta.t_pub) > 0.0:
+            meta.hop_ms = float(meta.hop_ms) + (time.monotonic() - float(meta.t_pub)) * 1e3
+
+    def _stamp_publish(self, meta: FrameMeta) -> None:
+        """Stamp the hand-off moment, before the payload is built (it costs too)."""
+        meta.t_pub = time.monotonic()
+
     def _on_image(self, msg: ImageFrame) -> None:
         """Run the ``pre`` and/or ``infer`` part of this span on a BGR frame."""
         meta = msg.meta
+        self._note_hop(meta)
         frame: np.ndarray | None = None
 
         if 'pre' in self.stages:
@@ -341,6 +379,7 @@ class ChainNode(Node):
             meta.pre_op_names = list(meta.pre_op_names) + list(op_ms)
             meta.pre_op_ms = list(meta.pre_op_ms) + list(op_ms.values())
             if 'infer' not in self.stages:
+                self._stamp_publish(meta)
                 self.publisher.publish(image_frame(frame, meta))
                 return
 
@@ -351,6 +390,7 @@ class ChainNode(Node):
         candidates, letterbox = self._run_infer(frame, meta)
 
         if 'post' not in self.stages:
+            self._stamp_publish(meta)
             self.publisher.publish(
                 candidates_frame(
                     candidates, meta, letterbox, engine_loaded_t=self.engine_loaded_t
@@ -364,6 +404,7 @@ class ChainNode(Node):
 
     def _on_candidates(self, msg: CandidatesFrame) -> None:
         """Run the ``post`` span on incoming candidates."""
+        self._note_hop(msg.meta)
         candidates, letterbox = candidates_from_frame(msg)
         self._run_post(
             candidates,
@@ -434,6 +475,7 @@ class ChainNode(Node):
         meta.post_op_ms = list(meta.post_op_ms) + list(timings.values())
 
         if not self.is_terminal:
+            self._stamp_publish(meta)
             self.publisher.publish(
                 candidates_frame(
                     candidates, meta, letterbox, engine_loaded_t=engine_loaded_t
