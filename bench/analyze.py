@@ -124,11 +124,11 @@ def _rate(values: Iterable[float]) -> float | None:
 
     ``GR3D_FREQ`` and ``cpu_load_pct`` are rates: a 100 ms sample either caught
     GPU work or did not, so at low duty the samples are bimodal and the median
-    lands on the zero mode. Measured on this board: ``ros-4node-720p-n`` reads
-    0 % by median while its non-zero samples are 22 % and its mean is 7 % -- and
-    ``infer_ms`` says the GPU is working 10 ms/frame. Rates are averaged; levels
-    (PSS, power, temperature) stay medians, where an outlier should not move the
-    number.
+    lands on the zero mode. Measured on this board (op-free matrix, before the
+    conditioning chain became a constant): the ROS chain reads 0 % by median
+    while its non-zero samples are 22 % and its mean is 7 % -- and ``infer_ms``
+    says the GPU is working 10 ms/frame. Rates are averaged; levels (PSS, power,
+    temperature) stay medians, where an outlier should not move the number.
     """
     data = [float(value) for value in values if value is not None]
     return statistics.fmean(data) if data else None
@@ -980,6 +980,297 @@ def demo_section(demo_dir: Path) -> str | None:
     return "\n".join(lines)
 
 
+# -------------------------------------------------------------------- glossary
+#: One entry per column the report prints, grouped by the table it appears in.
+#: Nothing here may restate a number: this is what an abbreviation means and how
+#: the value was obtained, so a reader does not have to read `summarise_trial`.
+_GLOSSARY: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    (
+        "Headline table",
+        (
+            (
+                "condition",
+                "cell name `<chain>-<resolution>-<model>[-i<D>]`: the command "
+                "template from `bench/scenarios.json`, plus the frames-in-flight "
+                "window when it is above 1. `–` anywhere in a table means the "
+                "value was not available (not measured, or not emitted by that "
+                "front-end).",
+            ),
+            (
+                "i",
+                "**frames in flight**: how many unacknowledged frames the "
+                "acquisition node may have outstanding. `1` is demand-driven, one "
+                "frame at a time; empty for the monolith, which has no window.",
+            ),
+            (
+                "passes",
+                "`n`: how many interleaved passes this cell was measured in, i.e. "
+                "the sample size behind every mean ± std in its row.",
+            ),
+            (
+                "frames",
+                "median number of frames inside the analysis window (the settle "
+                "seconds are dropped, then `analysis_frames` frames are taken). "
+                "These are the frames the percentiles are computed over.",
+            ),
+            (
+                "p50 / p95 / p99 ms",
+                "percentiles of `latency_ms`, the **median**, 95th and 99th "
+                "percentile frame latency: preprocessing + inference + "
+                "postprocessing of one frame, acquisition (decode) excluded on "
+                "purpose and presentation excluded because it is debug-only. In a "
+                "ROS cell the transport residual is inside it. `p50` is the "
+                "typical frame, `p99` the worst 1 %.",
+            ),
+            (
+                "fps",
+                "throughput: frames in the window divided by the window's span in "
+                "seconds. The pipeline's rate, not the clip's, and not the rate of "
+                "a time window: frames are the unit.",
+            ),
+            (
+                "cpu ms/f",
+                "workload CPU time per frame, from `/proc`: CPU milliseconds "
+                "consumed by the process group over the window divided by frames "
+                "delivered. It sums every thread, so it can far exceed the wall "
+                "latency of a frame.",
+            ),
+            (
+                "cores",
+                "average parallelism in use over the window: CPU time over wall "
+                "time (`cpu ms/f` x `fps` / 1000, which is what the sampler's "
+                "`cpu_used / span` reduces to). `1.0` saturates exactly one core; "
+                "`1.5` is one and a half cores busy.",
+            ),
+            (
+                "pss MB",
+                "peak **proportional set size** of the process group in MB over the "
+                "window: resident memory with shared pages divided among the "
+                "processes that map them, so a four-node chain does not pay for "
+                "the same library four times. Peak RSS is used when PSS is "
+                "unavailable.",
+            ),
+            (
+                "gpu %",
+                "GPU duty cycle from tegrastats `GR3D_FREQ`: the share of the "
+                "window the GPU spent clocked on, not occupancy. Averaged (mean, "
+                "not median) because at low duty the samples are bimodal -- GPU "
+                "work or no GPU work -- and a median would land on the zero mode. "
+                "A latency-bound chain reads low here even while TensorRT is the "
+                "bottleneck.",
+            ),
+            (
+                "load %",
+                "whole-board CPU load averaged across all cores over the window -- "
+                "every process, not just the pipeline. This is the comparability "
+                "column: identical code measured 27 % on a quiet desk and 95 % "
+                "with a browser open, 1.4x slower for it, so cells whose `load %` "
+                "differ are not comparable by absolute value (their within-pass "
+                "deltas still are).",
+            ),
+            (
+                "W",
+                "board power in watts: median of the tegrastats `VDD_IN` samples "
+                "over the window. One rail for the whole Jetson, so it cannot be "
+                "attributed to a pipeline stage.",
+            ),
+            (
+                "J/f",
+                "joules per frame: the trapezoidal integral of board power over "
+                "the window divided by the frames delivered, i.e. the energy of "
+                "one frame end to end.",
+            ),
+            (
+                "tj °C",
+                "junction temperature in °C, maximum over the window: how hot the "
+                "SoC got while the cell ran.",
+            ),
+            (
+                "mean ± std",
+                "mean across passes ± sample standard deviation (n − 1). A "
+                "dispersion of the passes, not a confidence interval: with n < 6 "
+                "the std itself is only good to ~40 %, which is why the per-trial "
+                "table prints the raw values.",
+            ),
+        ),
+    ),
+    (
+        "Stage table",
+        (
+            (
+                "acq",
+                "acquisition, median ms: read, decode and rotate one frame from the "
+                "source. It is the decoder's cost and is excluded from `latency_ms`.",
+            ),
+            (
+                "pre",
+                "preprocessing, median ms: the conditioning chain (CLAHE, "
+                "bilateral, ...) at source resolution. It means conditioning only "
+                "in both front-ends -- letterbox and tensor count inside `infer` "
+                "-- and the chain is the same constant in every cell "
+                "(`conditioning.ops`), so the column compares like with like. An "
+                "empty chain is identity and reads ~0, which is why the harness "
+                "rejects a cell that skips it.",
+            ),
+            (
+                "infer",
+                "inference, median ms: the model input contract (letterbox, BGR "
+                "to RGB, HWC to NCHW, dtype/scale), the engine call and "
+                "`decode_predictions` with thresholding. In the ROS chain the "
+                "inference node publishes decoded candidates, so compare `infer` "
+                "and `post` as one block against the monolith.",
+            ),
+            (
+                "post",
+                "postprocessing, median ms: NMS over all classes, then the domain "
+                "filter, then coordinate adaptation back to the input frame. The "
+                "order is canonical, so this value is not reorderable.",
+            ),
+            (
+                "xport",
+                "ROS only: `transport_ms`, the residual of serialisation + DDS + "
+                "scheduling, computed by the terminal node as `latency_ms - "
+                "(pre_ms + infer_ms + post_ms)`. Measured at ~7 ms fixed plus ~2.2 "
+                "ms/MB on this board. The monolith has no such stage.",
+            ),
+            (
+                "hop",
+                "ROS only: the measured wait in front of each busy node. It equals "
+                "`xport` at a window of one (all residual is delivery); its growth "
+                "beyond that is the queueing the window introduced.",
+            ),
+            (
+                "dets/frame",
+                "mean number of detections surviving the domain filter per frame. "
+                "Not a performance metric: it is the check that two front-ends "
+                "looked at the same picture (a wrong `rotate` shows up here).",
+            ),
+        ),
+    ),
+    (
+        "Per-op tables",
+        (
+            (
+                "op",
+                "one conditioning operator of the chain (`clahe`, `bilateral`, "
+                "`gaussian`, `gamma`, `hist_equalization`, `median`, `unsharp`), or "
+                "one of `nms` / `domain_filter` / `coordinate_adaptation`, median "
+                "ms over the frames that ran it.",
+            ),
+            (
+                "ms",
+                "median of that op's own timer. The `pre`/`post` value above is the "
+                "per-frame *sum* of the ops, so it exceeds the sum of these "
+                "medians.",
+            ),
+        ),
+    ),
+    (
+        "Per-trial detail",
+        (
+            (
+                "repeat",
+                "pass index (`r1`, `r2`, ...): the trial directory this row comes "
+                "from. Passes are interleaved, so each one carries the machine "
+                "state the other cells in the same pass also saw.",
+            ),
+            (
+                "replays",
+                "how many times the source clip was played end to end inside the "
+                "window (`loop` range). A fast cell replays it more often, which is "
+                "why the window is counted in frames: it keeps the content mix "
+                "comparable.",
+            ),
+            (
+                "_condition_ mean ± std",
+                "the same pass aggregate as the headline table, repeated under the "
+                "raw rows it was computed from.",
+            ),
+        ),
+    ),
+    (
+        "Deltas vs the anchor",
+        (
+            (
+                "Δp50 / Δp95 / Δfps / Δcpu ms/f / ΔJ/f",
+                "within-pass difference: this cell minus the anchor cell *in the "
+                "same pass*, reported as mean ± 95 % CI over the paired passes. "
+                "Differencing inside a pass cancels the machine state the two "
+                "trials shared (~8 % drift over a session), which is why a claim "
+                "is made from this column and not from two headline means.",
+            ),
+            (
+                "*",
+                "the 95 % CI excludes zero -- the only kind of difference worth a "
+                "sentence. No star means the effect is inside the noise floor.",
+            ),
+            (
+                "passes",
+                "how many paired passes the delta rests on: only passes in which "
+                "both this cell and the anchor produced a usable trial.",
+            ),
+        ),
+    ),
+    (
+        "Frames-in-flight curve",
+        (
+            (
+                "fill",
+                "realized window over requested: median `inflight` at publish "
+                "divided by `i`. Below 0.9 is a warning -- the acquisition node "
+                "never filled the window, so the cell did not measure what its "
+                "name says.",
+            ),
+            (
+                "L·X/i",
+                "Little's law on the closed loop, `p50 x fps / 1000 / i`: ~1 when "
+                "the window is genuinely full, reading slightly under 1 because "
+                "`p50` excludes acquisition.",
+            ),
+            (
+                "drops",
+                "gaps in the `seq` sequence inside the window. Must be 0: a "
+                "non-zero value means a topic history was shallower than the "
+                "window and silently evicted an unacknowledged sample.",
+            ),
+            (
+                "Δfps / Δp50 (curve)",
+                "within-pass difference against the *same cell* at `i=1` -- the "
+                "local zero of the curve, not the global anchor. `p50` is the "
+                "price of the window, `fps` and `J/f` the dividend.",
+            ),
+        ),
+    ),
+)
+
+
+def glossary_markdown() -> str:
+    """One section explaining every column the report prints.
+
+    Appended unconditionally: the report is a document that gets read months
+    later and out of context, so the units and the estimators have to travel with
+    the numbers they describe.
+    """
+    lines = [
+        "",
+        "## Glossary",
+        "",
+        "Every column the tables above print, in the order it appears. "
+        "The metric dictionary with the measurement policy behind it is "
+        "`bench/README.md` and `bench/METHOD.md`; this is the short version, "
+        "next to the numbers it explains.",
+    ]
+    for title, entries in _GLOSSARY:
+        lines.append("")
+        lines.append(f"**{title}**")
+        lines.append("")
+        lines.append("| column | meaning |")
+        lines.append("|---|---|")
+        for column, meaning in entries:
+            lines.append(f"| `{column}` | {meaning} |")
+    return "\n".join(lines) + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dir", type=Path, default=REPO / "results/bench")
@@ -1124,6 +1415,7 @@ def main(argv: list[str] | None = None) -> int:
     extra = demo_section(args.demo_dir)
     if extra:
         markdown += extra + "\n"
+    markdown += glossary_markdown()
     print(markdown)
 
     if args.timeline_out is not None:
