@@ -21,6 +21,12 @@ answer is known in advance and is boring (fewer hops, always). The point is:
 > **What does a process boundary cost, where is it cheapest, and does that
 > change with resolution?**
 
+Everything below is measured at one frame in flight. A shape's verdict can look
+different once the graph may hold more than one: a deep chain of cheap nodes is
+exactly what pays off when the pipeline can be filled, and that is a separate
+axis with its own instrument (`frames-in-flight.md`). No result here is a
+statement about it.
+
 A shape is a decomposition of fixed work. Because the work is identical, the
 only thing a shape changes is (a) how many times pixels or candidates are
 serialised across a process boundary and (b) how many times the scheduler is

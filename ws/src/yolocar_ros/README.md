@@ -8,7 +8,7 @@ contract.
 ```
 acquisition ──frame──> preprocessing ──frame──> inference ──candidates──> postprocessing
      ^                                                                          │
-     └──────────────────────────── ack (one frame in flight) ───────────────────┘
+     └────────────────── ack (one credit; inflight:=D frames) ──────────────────┘
 
 with pre_split:=true, the middle stage may be cut into one node per op:
 
@@ -33,17 +33,34 @@ Messages live in `../yolocar_interfaces`; the `FrameMeta` sub-message carries
 stage contributes, so latency is measured **across** processes instead of
 around a callback.
 
-## Why the ack
+## Why the ack, and what `inflight` does with it
 
-The acquisition node publishes one frame and waits for the postprocessing
-node to acknowledge it before decoding the next. Without that, a fast
-publisher would either fill queues (adding queueing latency that is not the
-pipeline's) or drop frames on a depth-1 subscription (silently shrinking the
-sample). The ack makes the graph demand-driven exactly like the monolith's
-blocking loop. It is what makes `records.jsonl` comparable at all: every
-published frame is processed, none are discarded at runtime.
+The ack is a **credit**. The acquisition node holds a window of `inflight`
+frames (default 1): it publishes while fewer than that many of its frames are
+unacknowledged, and each ack from the terminal node releases one. Without any
+pacing a fast publisher would either fill queues with work the rest of the chain
+has not reached (adding queueing latency that is not the pipeline's) or drop
+frames on a shallow subscription (silently shrinking the sample).
 
-The ack is only sent after the frame's record has been flushed to disk.
+* `inflight:=1` is the demand-driven chain: exactly like the monolith's blocking
+  loop, one frame resident, nothing queued, `p50` is the pipeline's residency.
+  Every cell measured before this parameter existed ran at this setting.
+* `inflight:=k` keeps `k` frames resident. Throughput rises until the slowest
+  node saturates and latency grows by that node's service time per extra frame
+  after that; the curve and its model are in
+  [`docs/proposals/frames-in-flight.md`](../../docs/proposals/frames-in-flight.md).
+
+The credit is identified by `seq`, not counted: the acquisition keeps one
+monotonic watermark, so a duplicated or reordered ack changes nothing. The ack
+is only sent after the frame's record has been flushed to disk. The same number
+is the history depth of every data topic (`depth < inflight` would evict an
+unacked sample and never release its credit), and the acquisition drains the
+window before the terminal node writes `summary.json`, so a stop never truncates
+the records.
+
+Frame 0 is always published synchronously: its ack is also the discovery gate
+(every downstream node has matched) and the engine-ready gate (it carries
+`engine_loaded_t`, which starts the `duration` clock).
 
 ## Stage-boundary caveat
 
@@ -124,9 +141,12 @@ bench/analyze.py --from 10 --to 30
 | `yolocar/stop` | `std_msgs/Empty` | acquisition → postprocessing |
 | `yolocar/done` | `std_msgs/Empty` | postprocessing → acquisition |
 
-All data topics use reliable, keep-last-1, `TRANSIENT_LOCAL` QoS: one frame is
-in flight, and a node that is still discovering does not lose the first
-message. Topics are relative, so the whole chain can be put in a namespace.
+All data topics use reliable, keep-last-`inflight`, `TRANSIENT_LOCAL` QoS: the
+history is exactly the window, and a node that is still discovering does not
+lose the first message. A history shallower than the window would silently
+evict an unacked sample, which is why the depth is derived from the one
+`inflight` number instead of being set per topic. Topics are relative, so the
+whole chain can be put in a namespace.
 
 When the source ends (or `duration`/`max_frames` is reached) the acquisition
 node publishes `stop`, waits for the terminal node to write `summary.json` and
@@ -150,8 +170,17 @@ colcon test-result --verbose
 * `test_stage_split.py` — **hardware**: walks the same message round trips and
   stage calls the nodes use on a real frame and asserts the detections are
   bit-for-bit identical to `YoloCarProcessor.process_frame()`.
-* `test_stage_split.py` skips when the engine, the clip or TensorRT is absent.
-  The stock `ament_flake8` / `ament_pep257` tests also run.
+* `test_flight_window.py` — the credit window as a pure state machine: capacity,
+  out-of-order and duplicate acks, and the fact that a lost frame is released by
+  a later ack (so contiguity is checked on the records, not here).
+* `test_flight_contract.py` — the window as data: topic depth equals `inflight`,
+  the launch argument reaches every node, and the count travels with the frame.
+* `test_no_drops.py` — **hardware, real graph**: launches the chain at
+  `inflight:=3` and asserts the `seq` set is exactly `0..n-1` with no short tail
+  (a topic shallower than the window would surface here and nowhere else), and
+  that the detections are identical to the same run at `inflight:=1`.
+* The hardware tests skip when the engine, the clip, `ros2` or TensorRT is
+  absent. The stock `ament_flake8` / `ament_pep257` tests also run.
 
 The tests set `PYTHONPATH` for `monolith/yolocar/src` themselves (see
 `test/conftest.py`), because the pipeline project is not installed into the ROS

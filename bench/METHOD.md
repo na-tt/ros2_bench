@@ -49,6 +49,16 @@ inherits is randomised rather than fixed.
 their `latency_ms`. One trial therefore contributes exactly one `p50`, one `p95`,
 one `fps` — not 2500.
 
+Three ROS-only quantities are attached to the same window, and each one is a
+*median over the window's frames* like the stage buckets: `inflight` (realized
+concurrency at publish, aggregated into the report as `fill` = realized /
+requested), `hop_ms` (the measured wait in front of each node) and `drops` (a
+count of `seq` gaps, which must be 0 -- a gap means a topic history was
+shallower than the window and evicted an unacked sample). `L·X/i` is not a
+per-frame quantity at all: it is Little's law evaluated on the window
+(`p50 · fps / 1000 / i`), and it is there to catch a window that is configured
+but never resident.
+
 The 2500 frames are **not** independent observations: consecutive frames share a
 thermal state, a GC epoch and a cache state. Pooling them as if they were gives
 absurdly tight error bars and false claims. On this cell the three trials agree on

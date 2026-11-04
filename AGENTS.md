@@ -249,11 +249,18 @@ never imports pipeline code. Details and the metric dictionary are in
   directly against `sampler.csv`. A ROS node must carry the equivalent
   timestamp *in the message*, not re-time around its own callback. Extra keys
   are allowed: the ROS front-end adds `transport_ms` (serialisation + DDS +
-  scheduling) and `analyze.py` reports it as `xport` when present.
+  scheduling, reported as `xport`), `hop_ms` (the measured wait in front of each
+  busy node: equals `transport_ms` at `inflight=1`, its growth beyond that is the
+  queueing the window introduced) and `inflight` (frames outstanding when this
+  one was published -- the realized window, so a cell that never filled it cannot
+  be mistaken for one that bought nothing).
 * `summary.json`: latency stats, `stage_ms`
   (`acquisition/preprocess/inference/postprocess/presentation`; the ROS
   front-end adds `transport`), `events`
   (start/engine_loaded/first_frame/end), `provenance`, `fps`/`fps_wall`.
+  `provenance` carries `shape` (the `chain:=` string) and `inflight` (the
+  frames-in-flight window) in the ROS front-end: two runs that differ only in
+  partition depth or window are otherwise indistinguishable on disk.
 * `sampler.csv` is produced by the harness, not by the workload.
 * `detections.jsonl` is an **artifact, not contract**: the final detections per
   frame, written only when asked for, consumed by `yolocar.demo` to render a run
@@ -360,6 +367,7 @@ One module per upstream/downstream boundary; the facade only wires them.
 | detections sidecar (offline artifact) | `yolocar.detections` (`DetectionLog`, `iter_records`, `build_header`) |
 | ROS node (any stage span) | `yolocar_ros.chain_node` (`ChainNode`, `parse_stages`, `entry_point`) |
 | ROS terminal (records/summary/ack) | `yolocar_ros.terminal` (`Terminal`) |
+| ROS flow control (frames in flight) | `yolocar_ros.window` (`CreditWindow`), `yolocar_ros.qos` (`latest(depth)`) |
 | offline renderer (demo material) | `yolocar.demo` (`python -m yolocar.demo`) |
 | single-process wiring | `yolocar.processor.YoloCarProcessor` |
 
@@ -423,6 +431,26 @@ type only at the very end.
   payloads and no relevant code change. Whether that was DDS falling back to
   loopback instead of shared memory, or a busier desktop session, is unresolved
   -- which is exactly why the report is built on within-pass deltas.
+* **Frames in flight (`inflight:=D`) is the concurrency axis, and it is the one
+  form of parallelism allowed.** The ack is a credit: the acquisition node
+  publishes while fewer than `D` of its frames are unacknowledged
+  (`CreditWindow`), the same number is the history depth of every data topic
+  (`qos.latest(D)` -- a shallower history evicts an unacked sample even under
+  `RELIABLE`, and the window would not notice), frame 0 is synchronous
+  (discovery + engine-ready gate) and the window is drained before the terminal
+  node writes the summary. **No other concurrency is permitted**: every node
+  stays single-threaded, one mutually exclusive callback group, batch 1, no
+  reentrant callbacks, no deferred frames. That constraint is what makes the
+  closed-loop model exact (`X = min(D/Σs, 1/max s)`, knee at `D* = Σs/max s`,
+  which is *not* the node count) and what keeps `records.jsonl` ordered by `seq`
+  with non-decreasing `t_mono` at any `D` -- queues preserve order, a bigger
+  window only changes how many frames are in them. Cell token `-i{D}`, appended
+  only when `D > 1`, and `run.py` rejects a name that disagrees with the
+  command. Ladder {1,2,4,8} on `ros-4node` both resolutions and {1,2,4} on
+  `ros-N12-p8c3`; `docs/proposals/frames-in-flight.md` has the model, the five
+  predictions and the measurement plan. **Not measured yet** (a 180p smoke run
+  confirmed the mechanism: 29.5 -> 44.2 -> 44.4 fps at `D` = 1/2/4 with p50
+  29.5 -> 39.8 -> 85.8 ms, i.e. the knee is at 2 as predicted).
 * **Presentation is offline, never a fifth node.** A run can write
   `detections.jsonl` next to `records.jsonl` (`--detections` on the monolith,
   `detections:=` on the launch file) and `python -m yolocar.demo` renders it onto
@@ -494,8 +522,11 @@ type only at the very end.
   to compare against it later; nothing in it is source.
 * Test counts at the end of this session: 202 (`pytest monolith/yolocar`,
   including 18 hardware tests against the real engine, the detections sidecar,
-  the offline renderer and the CLI `--pre` path); 60 passed + 1 skipped
-  (`colcon test --packages-select yolocar_ros`): ament lint, the records/summary
-  contract, sidecar/records parity, the real-engine stage-split test, the launch
-  file's partition policy for all eight shapes, and the shape-identity test that
-  every partition finds exactly the same detections.
+  the offline renderer and the CLI `--pre` path); 82 passed + 1 skipped
+  (`colcon test --packages-select yolocar_interfaces yolocar_ros`): ament lint,
+  the records/summary contract, sidecar/records parity, the real-engine
+  stage-split test, the launch file's partition policy for all eight shapes, the
+  shape-identity test that every partition finds exactly the same detections, the
+  credit-window state machine and its contract (topic depth == window), and a
+  real-graph test that a windowed chain loses no frame (contiguous `seq`, no
+  short tail) and finds exactly the same detections at `inflight:=1` and `:=3`.

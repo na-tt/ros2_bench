@@ -296,12 +296,23 @@ them, so a record written before they existed still analyses:
   for stages 4-6, which `post_stages` can split over several nodes. Unlike
   `pre_ops` it is present whenever the ROS front-end ran the stage, because the
   stage always runs: the unsplit breakdown is the control for the split one.
+* **`inflight`** -- ROS only: how many frames were outstanding (published and not
+  yet acknowledged) when this one was published. It is the *realized* window, so
+  a cell that never filled its window cannot be mistaken for one that filled it
+  and bought nothing. `analyze.py` reports it as `fill` (realized/requested).
+* **`hop_ms`** -- ROS only: the wait in front of every busy node, accumulated
+  from each publisher's `t_pub` stamp at the next node's callback entry. At
+  `inflight=1` it is transport and nothing else (the whole residual is delivery),
+  which is what lets the growth with the window be read as queueing. It closes
+  the decomposition: `latency_ms - acq_ms - Σ stage_ms - hop_ms` is conversion
+  overhead and should stay under a millisecond.
 
-`summary.json` carries one extra provenance field in the ROS front-end:
+`summary.json` carries two extra provenance fields in the ROS front-end:
 `provenance.shape` is the `chain` string that built the graph (`acq|pre|infer|post`),
-and it is also the `producer` of the detections sidecar. Two runs of the same
-cells at different partition depths would otherwise be indistinguishable on
-disk: identical stage buckets, different transport.
+and it is also the `producer` of the detections sidecar; `provenance.inflight` is
+the frames-in-flight window. Two runs of the same cells at different partition
+depths -- or at different windows -- would otherwise be indistinguishable on
+disk: identical stage buckets, different transport, different residency.
 
 Stage attribution is the same in both front-ends: `pre_ms` is conditioning at
 source resolution, `infer_ms` is the model input contract (letterbox + tensor)
@@ -347,7 +358,12 @@ Three things, in this order.
 | `gpu %` | tegrastats | `GR3D_FREQ` duty cycle, not occupancy; a latency-bound chain reads low. Mean over the samples, not median: at low duty the 100 ms samples are bimodal (GPU work / no GPU work) and the median lands on the zero mode — `ros-4node-720p-n` reads 7 % by mean and 0 % by median |
 | `W`, `J/f` | tegrastats | board-level `VDD_IN`; energy is the trapezoidal integral over the window |
 | `tj °C` | tegrastats | junction temperature, max over the window |
-| `xport` | records | ROS only: `transport_ms`, i.e. serialisation + DDS + scheduling |
+| `xport` | records | ROS only: `transport_ms`, i.e. serialisation + DDS + scheduling (plus, at `inflight > 1`, the queueing the window introduced) |
+| `hop` | records | ROS only: `hop_ms`, the measured wait in front of each node. Equals `xport` at `inflight=1`; growth beyond it is the queueing delay |
+| `i`, `fill` | provenance, records | requested frames in flight and the realized/requested ratio. `fill < 0.9` is a warning: the acquisition node never filled the window, so the cell did not measure what its name says |
+| `Δfps`, `Δp50` (curve) | records | within-pass difference against the *same cell* at `i=1`, printed in the frames-in-flight section |
+| `L·X/i` | records | Little's law on the closed loop. ≈1 when the window is genuinely full; reads slightly under 1 because `latency_ms` excludes acquisition |
+| `drops` | records | gaps in the `seq` set inside the window. Must be 0: a non-zero value means a topic history was shallower than the window and silently evicted an unacked sample |
 
 Board power is a single rail, so energy can only be attributed per frame
 end-to-end — never per pipeline stage. `tegrastats` lines carry a 1-second
@@ -438,11 +454,46 @@ bench/run.py --conditions monolith-720p-n,monolith-180p-n,ros-N2-p1c0-720p-n,ros
 bench/run.py --conditions ros-N12-p8c3-720p-n,ros-N12-p8c3-180p-n,monolith-720p-n
 ```
 
+### The frames-in-flight axis
+
+`inflight:=D` (cell token `-i{D}`, omitted at 1) is how many frames the graph may
+hold: the acquisition node publishes while fewer than `D` of its frames are
+unacked, and every ack releases one. `D=1` is the demand-driven chain every
+earlier cell measured, so those cells keep their names and their numbers; `D>1`
+spends latency to buy throughput. The mechanism, the closed-loop model
+(`X = min(D/Σs, 1/max s)`, knee at `D* = Σs/max s`, which is *not* the node
+count) and the predictions live in `docs/proposals/frames-in-flight.md`.
+
+What the harness pins, so a mislabelled cell cannot survive:
+
+* `run.py` rejects a design cell whose `-iD` disagrees with the `inflight:=` in
+  its command, in either direction -- the same rule as `N == p+c+1`.
+* the same number is the depth of every data topic (`qos.latest(D)`), derived,
+  never hand-set, so a window deeper than a history cannot be configured.
+* the acquisition node drains the window before the terminal node writes the
+  summary, so a `max_frames` stop does not truncate the tail.
+
+Run a ladder with its own `i1` cell in the same invocation -- that is the local
+zero for every window delta:
+
+```bash
+bench/run.py --out results/fif1 --conditions \
+  monolith-720p-n,ros-4node-720p-n,ros-4node-720p-n-i2,ros-4node-720p-n-i4,ros-4node-720p-n-i8
+```
+
+The ladder cells set `settle_s: 45` in `cells`: a 20 fps cell and a 50 fps cell
+are different power and thermal states on the same board, so the ramp is longer
+than the 30 s the rest of the matrix uses. They also set a pessimistic
+`fps_hint` -- the closed-loop prediction is the starting point, not a measurement.
+
 ### Pruning
 
-18 cells is ~61 min per pass at the current budget (2 passes ~2.0 h, 3 passes
-~3.1 h) before engine load and gaps, and the spread is wide: `monolith-180p-n`
-is ~85 s while `ros-4node-720p-x` is ~336 s. `--conditions` selects by cell name:
+The 18-cell factorial is ~61 min per pass at the current budget (2 passes ~2.0 h,
+3 passes ~3.1 h) before engine load and gaps, and the spread is wide:
+`monolith-180p-n` is ~85 s while `ros-4node-720p-x` is ~336 s. The full `design`
+is 42 cells once the shape and window axes are included, which is why neither is
+meant to run in the same pass as the model matrix. `--conditions` selects by
+cell name:
 
 ```bash
 bench/run.py --dry-run --conditions monolith-720p-n,ros-4node-720p-n
