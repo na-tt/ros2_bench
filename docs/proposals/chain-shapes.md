@@ -484,6 +484,30 @@ and `analyze.py` warns when a window came up short.
 | D5 | `in-flight > 1` is a different experiment and is not smuggled into this one. |
 | D6 | The anchor stays `monolith-720p-n`; shape deltas are within-pass against `ros-4node`, never against a mean from another session. |
 
+## First light (not a measurement)
+
+One pass, 150-frame windows, 5 s settle, 180p, `n` -- run to prove the harness
+drives the shapes and that the records mean what the report thinks they mean.
+**Not quotable**: one pass, no interleaving, a settle far below the 30 s the
+design uses, and windows that cover different parts of the clip (dets/frame
+therefore differs between cells for reasons that have nothing to do with the
+shape).
+
+| cell | hops | xport ms | xport/hop | p50 ms |
+| --- | --- | --- | --- | --- |
+| `p1c0` | 1 | 2.47 | 2.47 | 39.76 |
+| `p1c1` | 2 | 6.52 | 3.26 | 44.88 |
+| `p2c0` | 2 | 6.53 | 3.27 | 47.14 |
+| `p2c1` | 3 | 10.12 | 3.37 | 53.36 |
+| `p8c3` | 11 | 34.50 | 3.14 | 76.98 |
+
+The structure is what the model predicts: transport is linear in hop count and
+the per-hop cost is flat across shapes, ~3.2 ms at 180p (the model said 3.9).
+`p1c1` and `p2c0` -- same node count, different payload -- agree to 0.01 ms,
+which is *not* the H1 prediction (they were expected 2.6 ms apart); at one pass
+and 150 frames that difference is below the noise floor, so H1 remains the
+thing the first real pass has to decide.
+
 ## Expected outcome (for the record, before measuring)
 
 1. Two branches leave `p2c1` with very different slopes. Coarsening falls
