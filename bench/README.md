@@ -292,6 +292,16 @@ them, so a record written before they existed still analyses:
   stage bucket means the same thing with a chain, with one op, or with none.
   Both front-ends emit it, including when the chain is split across several
   nodes (`analyze.py` prints a per-op table for cells that have it).
+* **`post_ops`** -- `{"nms": 0.5, "filter": 0.2, "coord": 0.2}`: the same thing
+  for stages 4-6, which `post_stages` can split over several nodes. Unlike
+  `pre_ops` it is present whenever the ROS front-end ran the stage, because the
+  stage always runs: the unsplit breakdown is the control for the split one.
+
+`summary.json` carries one extra provenance field in the ROS front-end:
+`provenance.shape` is the `chain` string that built the graph (`acq|pre|infer|post`),
+and it is also the `producer` of the detections sidecar. Two runs of the same
+cells at different partition depths would otherwise be indistinguishable on
+disk: identical stage buckets, different transport.
 
 Stage attribution is the same in both front-ends: `pre_ms` is conditioning at
 source resolution, `infer_ms` is the model input contract (letterbox + tensor)
@@ -388,6 +398,45 @@ chain (down from 24.2 / 18.4), and ~4.0 ms added by each extra hop at 180p.
 A single unsplit-vs-split smoke run measured +1.8 ms for one extra hop, which
 is inside the noise of one non-interleaved pair: quote only interleaved
 `bench/run.py` deltas, never that pair.
+
+### The chain-shape axis
+
+The second axis is the partition itself, written as a `chain` factor:
+`acq|pre|infer|post` (four processes, the default) up to the twelve-process
+shape. `|` separates processes, `+` merges stages inside one, and the label is
+the coordinate `p{p}c{c}` -- p hops carry pixels, c carry candidates, and
+`N = p+c+1` processes. The full table, the predictions and the reasoning live in
+`docs/proposals/chain-shapes.md`; what matters for the harness is:
+
+| cell prefix | N | p | c | one line |
+| --- | --- | --- | --- | --- |
+| `ros-N2-p1c0` | 2 | 1 | 0 | the monolith in a second process: prices one boundary |
+| `ros-N3-p1c1` | 3 | 1 | 1 | pixels cross once |
+| `ros-N3-p2c0` | 3 | 2 | 0 | same N, pixels cross twice -- the H1 pair with p1c1 |
+| `ros-N4-p2c1` | 4 | 2 | 1 | the current chain, with the seven-op conditioning chain |
+| `ros-N5-p3c1` | 5 | 3 | 1 | one pixel hop more than p2c1: the additivity check |
+| `ros-N5-p2c2` | 5 | 2 | 2 | first cut inside stages 4-6 |
+| `ros-N6-p2c3` | 6 | 2 | 3 | stages 4-6 fully split |
+| `ros-N12-p8c3` | 12 | 8 | 3 | one process per op: the transport extreme |
+
+These cells all run the seven-op chain, so they are **not** comparable to the
+`ros-4node-*` cells, which run none: `ros-N4-p2c1` exists to be their baseline.
+`run.py` validates the name against the command before launching anything (N
+must equal p+c+1, and the `chain:=` string must have N groups), because the cell
+name is what the report is built from.
+
+Recommended subsets, in the order they pay off:
+
+```bash
+# H1 -- same node count, different payload: ~40 min for one pass at 720p
+bench/run.py --conditions ros-N3-p1c1-720p-n,ros-N3-p2c0-720p-n,monolith-720p-n
+
+# the ladder, both resolutions (the resolution axis needs the pair)
+bench/run.py --conditions monolith-720p-n,monolith-180p-n,ros-N2-p1c0-720p-n,ros-N2-p1c0-180p-n,ros-N4-p2c1-720p-n,ros-N4-p2c1-180p-n
+
+# the extreme, to test linearity in the hop count
+bench/run.py --conditions ros-N12-p8c3-720p-n,ros-N12-p8c3-180p-n,monolith-720p-n
+```
 
 ### Pruning
 

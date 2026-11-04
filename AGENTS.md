@@ -358,6 +358,8 @@ One module per upstream/downstream boundary; the facade only wires them.
 | coordinate adaptation | `yolocar.postprocessing.coordinate_adaptation` |
 | annotation / sinks (optional) | `yolocar.render` (`draw_detections`, `draw_hud`, `open_sink`) |
 | detections sidecar (offline artifact) | `yolocar.detections` (`DetectionLog`, `iter_records`, `build_header`) |
+| ROS node (any stage span) | `yolocar_ros.chain_node` (`ChainNode`, `parse_stages`, `entry_point`) |
+| ROS terminal (records/summary/ack) | `yolocar_ros.terminal` (`Terminal`) |
 | offline renderer (demo material) | `yolocar.demo` (`python -m yolocar.demo`) |
 | single-process wiring | `yolocar.processor.YoloCarProcessor` |
 
@@ -441,13 +443,23 @@ type only at the very end.
   `docs/proposals/preprocessing-chain.md` as a deferred experiment, because
   letting `imgsz` track resolution makes inference cost O(pixels) and swamps
   the conditioning ops the resolution axis is meant to measure.
-* **Chain shape is proposed as a second axis, not implemented.**
-  `docs/proposals/chain-shapes.md` enumerates 2-node -> 12-node configurations,
-  predicts each one's delta from the per-hop model, and lists what a
-  generalisation would need (one `chain` launch argument, a stage-runner
-  postprocessing node with `post_ops`, the shape in the provenance). Nothing in
-  that document is built: today only stage 2 is splittable (`pre_split`) and
-  stage 4-6 always runs as one node.
+* **The chain shape is a launch argument, and every shape is one executable.**
+  `chain:=acq|pre|infer|post` (default, p2c1) up to
+  `chain:=acq|pre|pre|pre|pre|pre|pre|pre|infer|nms|filter|coord` (p8c3, twelve
+  processes); `|` separates processes, `+` merges stages, and `pre_groups:=2,5`
+  cuts the conditioning chain inside stage 2. `ws/src/yolocar_ros/yolocar_ros/
+  chain_node.py` runs any contiguous span (`stages:=pre,infer,post`) and the
+  three historic executables are one-line entry points for one span each, so
+  there is a single implementation. Three properties are derived, not
+  configured: the engine is loaded only by the span that contains `infer`, the
+  terminal node is the one that ends on `coord` (it alone writes records,
+  summary, ack and the detections sidecar), and timings accumulate so a split
+  stage reports the same number as an unsplit one. The cell name
+  `ros-N{x}-p{p}c{c}` is validated against the graph in `bench/run.py` (N must
+  be p+c+1 and the `chain:=` string must have N groups) and the shape lands in
+  `summary.provenance.shape`. `docs/proposals/chain-shapes.md` has the full
+  table, the predictions and the two-tier measurement design. **The axis has
+  not been measured yet** -- the cells exist, the numbers do not.
 * **Run the launch from the repository root.** Default source/model/records
   paths are relative, and `yolocar` must be on `PYTHONPATH`
   (`PYTHONPATH=monolith/yolocar/src:$PYTHONPATH`) because there is no `pip` on
@@ -480,9 +492,10 @@ type only at the very end.
   pass: a diff there means detection behaviour changed.
 * **`results/` is generated and gitignored.** Keep a run's directory if you want
   to compare against it later; nothing in it is source.
-* Test counts at the end of this session: 197 (`pytest monolith/yolocar`,
+* Test counts at the end of this session: 202 (`pytest monolith/yolocar`,
   including 18 hardware tests against the real engine, the detections sidecar,
-  the offline renderer and the CLI `--pre` path); 31 passed + 1 skipped
-  (`colcon test --packages-select yolocar_ros`: ament lint, the records/summary
-  contract, sidecar/records parity, the real-engine stage-split test, and the
-  launch file's partition policy).
+  the offline renderer and the CLI `--pre` path); 60 passed + 1 skipped
+  (`colcon test --packages-select yolocar_ros`): ament lint, the records/summary
+  contract, sidecar/records parity, the real-engine stage-split test, the launch
+  file's partition policy for all eight shapes, and the shape-identity test that
+  every partition finds exactly the same detections.
