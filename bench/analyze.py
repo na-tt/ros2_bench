@@ -264,16 +264,15 @@ def summarise_trial(
     # Stage-2 breakdown: one entry per conditioning op the workload ran. Absent
     # when it ran none, exactly like transport_ms, so an older records.jsonl
     # still analyses.
-    if all("pre_ops" in record for record in window):
-        names = sorted({name for record in window for name in record["pre_ops"]})
-        result["stage_ms"]["pre_ops"] = {
-            name: _median(
-                record["pre_ops"][name]
-                for record in window
-                if name in record["pre_ops"]
-            )
-            for name in names
-        }
+    for key, stage in (("pre_ops", "pre_ops"), ("post_ops", "post_ops")):
+        if all(key in record for record in window):
+            names = sorted({name for record in window for name in record[key]})
+            result["stage_ms"][stage] = {
+                name: _median(
+                    record[key][name] for record in window if name in record[key]
+                )
+                for name in names
+            }
 
     samples = [
         row
@@ -390,16 +389,17 @@ def aggregate(trials: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             stage: _median(trial["stage_ms"].get(stage) for trial in group)
             for stage in ("acq_ms", "pre_ms", "infer_ms", "post_ms", "transport_ms")
         }
-        # Stage-2 per-op medians, aggregated the same way as the stage buckets.
-        op_trials = [trial for trial in group if trial["stage_ms"].get("pre_ops")]
-        if op_trials:
+        # Per-op medians for the stages that can be split, aggregated the same
+        # way as the stage buckets themselves.
+        for stage in ("pre_ops", "post_ops"):
+            op_trials = [trial for trial in group if trial["stage_ms"].get(stage)]
+            if not op_trials:
+                continue
             names = sorted(
-                {name for trial in op_trials for name in trial["stage_ms"]["pre_ops"]}
+                {name for trial in op_trials for name in trial["stage_ms"][stage]}
             )
-            entry["stage_ms"]["pre_ops"] = {
-                name: _median(
-                    trial["stage_ms"]["pre_ops"].get(name) for trial in op_trials
-                )
+            entry["stage_ms"][stage] = {
+                name: _median(trial["stage_ms"][stage].get(name) for trial in op_trials)
                 for name in names
             }
         report[condition] = entry
@@ -605,17 +605,22 @@ def to_markdown(
     # Only cells that ran a conditioning chain have a breakdown; print the
     # section only then (and note that the op medians need not sum to `pre`,
     # because the stage total is a sum of per-frame sums, not a sum of medians).
-    op_rows = [
-        (condition, name, value)
-        for condition, entry in report.items()
-        for name, value in (entry["stage_ms"].get("pre_ops") or {}).items()
-    ]
-    if op_rows:
+    for key, stage, label in (
+        ("pre_ops", "pre", "Stage 2 (conditioning chain)"),
+        ("post_ops", "post", "Stages 4-6 (NMS / filter / coordinate)"),
+    ):
+        op_rows = [
+            (condition, name, value)
+            for condition, entry in report.items()
+            for name, value in (entry["stage_ms"].get(key) or {}).items()
+        ]
+        if not op_rows:
+            continue
         out.append("")
         out.append(
-            "Stage-2 chain (median ms per op, from the records' `pre_ops`). "
-            "`pre` above is the per-frame sum, so it exceeds the sum of these "
-            "medians."
+            f"{label}, median ms per op, from the records' `{key}`. "
+            f"`{stage}` above is the per-frame sum, so it exceeds the sum of "
+            "these medians."
         )
         out.append("")
         out.append("| condition | op | ms |")

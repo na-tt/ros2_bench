@@ -45,6 +45,7 @@ import json
 import math
 import os
 import random
+import re
 import shlex
 import signal
 import subprocess
@@ -180,8 +181,60 @@ def matrix_conditions(
             condition["clip_frames"] = resolution_spec["clip_frames"]  # type: ignore[index]
         if model_spec.get("note"):
             condition["note"] = model_spec["note"]  # type: ignore[index]
+        check_cell_shape(name, condition)
         out.append((name, condition))
     return out
+
+
+# ------------------------------------------------------------ cell naming
+#: `ros-N{x}-p{p}c{c}`: x processes, p pixel-carrying hops, c candidate hops.
+#: The two halves of that claim are redundant on purpose (x == p + c + 1) and
+#: both are checkable before anything launches, which is the only thing keeping
+#: the names honest -- the report is built from them.
+SHAPE_NAME = re.compile(r'(?:^|-)N(\d+)-p(\d+)c(\d+)(?:-|$)')
+
+
+def _command_text(condition: dict[str, object]) -> str:
+    """The condition's command as one string, for keyword sniffing."""
+    shell = condition.get("shell")
+    if shell:
+        return str(shell)
+    return " ".join(str(part) for part in condition.get("cmd") or [])  # type: ignore[union-attr]
+
+
+def check_cell_shape(name: str, condition: dict[str, object]) -> None:
+    """Reject a cell whose name and command disagree about its shape.
+
+    A cell called ``ros-N12-p8c3-720p-n`` claims twelve processes, eight hops
+    carrying pixels and three carrying candidates. ``N == p + c + 1`` is
+    arithmetic; the group count in the ``chain:=`` string is the graph itself.
+    Both are checked here, before a single process is started, because a
+    mislabelled cell is a mistake that survives all the way into the report.
+    """
+    match = SHAPE_NAME.search(name)
+    if not match:
+        return
+    nodes, pixel, candidate = (int(part) for part in match.groups())
+    if nodes != pixel + candidate + 1:
+        raise SystemExit(
+            f"{name}: N{nodes} contradicts p{pixel}c{candidate} "
+            f"(N should be p+c+1 = {pixel + candidate + 1})"
+        )
+    text = _command_text(condition)
+    shape = re.search(r'chain:=([^ ]+)', text)
+    if shape:
+        value = shape.group(1).rstrip('\'"')
+        groups = [group for group in value.split('|') if group]
+        if len(groups) != nodes:
+            raise SystemExit(
+                f"{name}: chain {value!r} has {len(groups)} process(es) "
+                f"but the name says N{nodes}"
+            )
+    elif "ros2 launch" in text:
+        raise SystemExit(
+            f"{name}: a ros-N cell must pass chain:=... so the shape it names "
+            "is the shape it runs"
+        )
 
 
 # ------------------------------------------------------------- trial order
