@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import statistics
 import sys
 from pathlib import Path
@@ -70,6 +71,19 @@ def _rows(path: Path) -> list[dict[str, Any]]:
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def _summary_provenance(trial_dir: Path) -> dict[str, Any]:
+    """The workload's own summary, for what only it knows (the window it ran)."""
+    path = trial_dir / "summary.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    provenance = payload.get("provenance") if isinstance(payload, dict) else None
+    return provenance if isinstance(provenance, dict) else {}
 
 
 def _csv_rows(path: Path) -> list[dict[str, float]]:
@@ -261,6 +275,33 @@ def summarise_trial(
         result["stage_ms"]["transport_ms"] = _median(
             record["transport_ms"] for record in window
         )
+    # ROS-only: wait in front of every busy node (delivery + queueing). At a
+    # window of one this is transport; its growth with the window is the cost.
+    if all("hop_ms" in record for record in window):
+        result["stage_ms"]["hop_ms"] = _median(
+            record["hop_ms"] for record in window
+        )
+    # Frames in flight: `inflight` is the realized concurrency at publish, so a
+    # window that was never filled cannot be mistaken for one that filled and
+    # bought nothing. `drops` counts holes in the seq set -- the failure mode a
+    # window introduces when a topic's history is shallower than the window.
+    seqs = [int(record["seq"]) for record in window]
+    result["drops"] = sum(1 for a, b in zip(seqs, seqs[1:]) if b != a + 1)
+    if all("inflight" in record for record in window):
+        realized = _median(record["inflight"] for record in window)
+        result["inflight_real"] = realized
+        requested = _summary_provenance(trial_dir).get("inflight")
+        if requested:
+            requested = int(requested)
+            result["inflight_requested"] = requested
+            result["fill"] = (realized / requested) if realized else None
+            # Little's law on the closed loop: L * X / D ~ 1 when the window is
+            # genuinely full and stable. Latency excludes decode (as everywhere
+            # in this contract), so it reads slightly under 1.
+            p50 = result["latency"].get("p50") or 0.0
+            result["little"] = (p50 * throughput / 1000.0 / requested) if throughput else None
+            result["window_not_full"] = bool(realized and realized < 0.9 * requested)
+
     # Stage-2 breakdown: one entry per conditioning op the workload ran. Absent
     # when it ran none, exactly like transport_ms, so an older records.jsonl
     # still analyses.
@@ -387,8 +428,21 @@ def aggregate(trials: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         ]
         entry["stage_ms"] = {
             stage: _median(trial["stage_ms"].get(stage) for trial in group)
-            for stage in ("acq_ms", "pre_ms", "infer_ms", "post_ms", "transport_ms")
+            for stage in (
+                "acq_ms", "pre_ms", "infer_ms", "post_ms", "transport_ms", "hop_ms"
+            )
         }
+        # The window: requested (provenance) and realized (records), the fill
+        # ratio and the closed-loop consistency check.
+        entry["inflight"] = _median(
+            trial.get("inflight_requested") for trial in group
+        )
+        entry["inflight_real"] = _median(
+            trial.get("inflight_real") for trial in group
+        )
+        entry["fill"] = _median(trial.get("fill") for trial in group)
+        entry["little"] = _median(trial.get("little") for trial in group)
+        entry["drops"] = sum(int(trial.get("drops") or 0) for trial in group)
         # Per-op medians for the stages that can be split, aggregated the same
         # way as the stage buckets themselves.
         for stage in ("pre_ops", "post_ops"):
@@ -526,21 +580,120 @@ def delta_markdown(
     return out
 
 
+#: `-i{D}` suffix: the cells of one chain/resolution/model at different windows.
+WINDOW_SUFFIX = re.compile(r"-i(\d+)$")
+
+
+def window_groups(report: dict[str, dict[str, Any]]) -> dict[str, dict[int, str]]:
+    """Group cells that differ *only* in frames in flight."""
+    groups: dict[str, dict[int, str]] = {}
+    for condition, entry in report.items():
+        match = WINDOW_SUFFIX.search(condition)
+        base = condition[: match.start()] if match else condition
+        declared = entry.get("inflight")
+        inflight = int(declared) if declared else (int(match.group(1)) if match else 1)
+        groups.setdefault(base, {})[inflight] = condition
+    return {base: cells for base, cells in groups.items() if len(cells) > 1}
+
+
+def operating_curve_markdown(
+    report: dict[str, dict[str, Any]], trials: list[dict[str, Any]]
+) -> list[str]:
+    """One table per cell family: the (throughput, latency, joules) curve in D.
+
+    This is the frames-in-flight result: latency is the *price* of a window and
+    throughput/energy the dividend, so neither number means anything alone. The
+    deltas are within-pass differences against the same cell at a window of one,
+    which is the only reference measured on the same clock -- the global anchor
+    stays the monolith.
+    """
+    groups = window_groups(report)
+    if not groups:
+        return []
+    out = [
+        "",
+        "Frames in flight: the closed-loop operating curve",
+        "",
+        "Rows are one cell family at increasing windows; `i` is the requested "
+        "window and `fill` the realized one (`inflight` at publish, median), so "
+        "a window that never opened is visible as `fill` below 1. Deltas are "
+        "within-pass differences against the same cell at `i=1` (mean ± 95 % CI; "
+        "`*` = CI excludes zero). `L·X/i` is Little's law on the closed loop: "
+        "≈1 when the window is genuinely full.",
+        "",
+    ]
+    for base, cells in sorted(groups.items()):
+        reference = cells.get(1)
+        deltas = paired_deltas(trials, reference) if reference else {}
+        out.append(
+            f"| {base} | i | fill | fps | Δfps | p50 ms | Δp50 | p99 ms "
+            "| hop ms | J/f | ΔJ/f | cores | L·X/i | drops |"
+        )
+        out.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for inflight in sorted(cells):
+            condition = cells[inflight]
+            entry = report[condition]
+            stats = entry.get("stats") or {}
+            delta = deltas.get(condition, {})
+            out.append(
+                "| "
+                + " | ".join(
+                    [
+                        condition,
+                        str(inflight),
+                        _fmt(entry.get("fill"), 2),
+                        _fmt_stats(stats.get("fps"), 2),
+                        _fmt_delta(delta.get("fps")),
+                        _fmt_stats(stats.get("p50_ms"), 2),
+                        _fmt_delta(delta.get("p50_ms")),
+                        _fmt(entry.get("p99_ms"), 2),
+                        _fmt(entry["stage_ms"].get("hop_ms"), 2),
+                        _fmt_stats(stats.get("j_f"), 3),
+                        _fmt_delta(delta.get("j_f"), 3),
+                        _fmt(entry.get("cores"), 2),
+                        _fmt(entry.get("little"), 2),
+                        str(entry.get("drops") or 0),
+                    ]
+                )
+                + " |"
+            )
+        if reference is None:
+            out.append(
+                f"| _{base}_ | | | | | | | | | | | | | |"
+            )
+            out.append("")
+            out.append(
+                f"`{base}` has no `i=1` cell in this run: no local zero, so the "
+                "deltas are missing (measure it, it is the demand-driven reference)."
+            )
+        out.append("")
+    out.append(
+        "Reading: throughput rises with `i` until the bottleneck node saturates "
+        "(the knee is at `D* = Σ residency / max residency`, not at the process "
+        "count), after which `p50` keeps growing by one bottleneck service time "
+        "per extra frame while `fps` does not move. Energy per frame improves "
+        "from 1 to the knee and is flat after it -- which is the real argument "
+        "for a window, since latency only gets worse."
+    )
+    return out
+
+
 def to_markdown(
     report: dict[str, dict[str, Any]],
     window: str,
     *,
     deltas: dict[str, dict[str, Any]] | None = None,
     anchor: str | None = None,
+    trials: list[dict[str, Any]] | None = None,
 ) -> str:
     def stats_of(entry: dict[str, Any], metric: str) -> dict[str, Any] | None:
         return (entry.get("stats") or {}).get(metric)
 
     header = (
-        "| condition | passes | frames | p50 ms | p95 ms | p99 ms | fps "
+        "| condition | i | passes | frames | p50 ms | p95 ms | p99 ms | fps "
         "| cpu ms/f | cores | pss MB | gpu % | load % | W | J/f | tj °C |"
     )
-    rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+    rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     lines = [header, rule]
     for condition, entry in report.items():
         lines.append(
@@ -548,6 +701,7 @@ def to_markdown(
             + " | ".join(
                 [
                     condition,
+                    _fmt(entry.get("inflight"), 0),
                     str(entry["trials"]),
                     str(entry["frames"]),
                     _fmt_stats(stats_of(entry, "p50_ms"), 2),
@@ -579,11 +733,16 @@ def to_markdown(
     ]
     out.append(
         "Stages (median ms): pre / infer / post, acquisition separately. "
-        "`xport` is the ROS-only serialisation + DDS + scheduling residual."
+        "`xport` is the ROS-only serialisation + DDS + scheduling residual and "
+        "`hop` the wait in front of each busy node: at a window of one they are "
+        "the same number (all residual is delivery), beyond it `hop` grows by "
+        "the queueing the window introduced."
     )
     out.append("")
-    out.append("| condition | acq | pre | infer | post | xport | dets/frame |")
-    out.append("|---|---|---|---|---|---|---|")
+    out.append(
+        "| condition | i | acq | pre | infer | post | xport | hop | dets/frame |"
+    )
+    out.append("|---|---|---|---|---|---|---|---|---|")
     for condition, entry in report.items():
         stages = entry["stage_ms"]
         out.append(
@@ -591,11 +750,13 @@ def to_markdown(
             + " | ".join(
                 [
                     condition,
+                    _fmt(entry.get("inflight"), 0),
                     _fmt(stages.get("acq_ms"), 2),
                     _fmt(stages.get("pre_ms"), 2),
                     _fmt(stages.get("infer_ms"), 2),
                     _fmt(stages.get("post_ms"), 2),
                     _fmt(stages.get("transport_ms"), 2),
+                    _fmt(stages.get("hop_ms"), 2),
                     _fmt(entry.get("detections_per_frame"), 2),
                 ]
             )
@@ -664,6 +825,8 @@ def to_markdown(
     if deltas is not None:
         passes = max((entry.get("trials", 0) for entry in report.values()), default=0)
         out.extend(delta_markdown(deltas, anchor, passes))
+    if trials is not None:
+        out.extend(operating_curve_markdown(report, trials))
     return "\n".join(out) + "\n"
 
 
@@ -933,6 +1096,23 @@ def main(argv: list[str] | None = None) -> int:
                 "(trial stopped too early: lower the fps hint or raise the ceiling)",
                 file=sys.stderr,
             )
+    for trial in trials:
+        if trial.get("drops"):
+            print(
+                f"warning: {trial['condition']}/{trial['repeat']} has "
+                f"{trial['drops']} gap(s) in the seq set: a frame was lost in the "
+                "graph (a topic history shallower than the window evicts samples)",
+                file=sys.stderr,
+            )
+        if trial.get("window_not_full"):
+            print(
+                f"warning: {trial['condition']}/{trial['repeat']} only realized "
+                f"a window of {trial.get('inflight_real')} of "
+                f"{trial.get('inflight_requested')} frames (fill "
+                f"{(trial.get('fill') or 0):.2f}): the acquisition node never "
+                "filled it, so this cell did not measure what its name says",
+                file=sys.stderr,
+            )
     anchor = args.anchor or scenario.get("anchor")
     deltas = paired_deltas(trials, anchor)
     if args.anchor and anchor not in report:
@@ -940,7 +1120,7 @@ def main(argv: list[str] | None = None) -> int:
             f"warning: anchor {anchor!r} has no usable pass; no deltas reported",
             file=sys.stderr,
         )
-    markdown = to_markdown(report, window, deltas=deltas, anchor=anchor)
+    markdown = to_markdown(report, window, deltas=deltas, anchor=anchor, trials=trials)
     extra = demo_section(args.demo_dir)
     if extra:
         markdown += extra + "\n"

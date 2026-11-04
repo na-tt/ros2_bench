@@ -123,6 +123,11 @@ def matrix_conditions(
     ``rotate`` / ``model``. Those are the same placeholders a hand-written
     condition already uses, so everything downstream is unchanged -- the matrix
     only decides *which* combinations exist and what their assets are.
+
+    A fourth coordinate, ``inflight``, is optional and defaults to 1. It is not
+    a shape (the process plan does not change) but it is part of the cell's
+    identity: the same chain, resolution and model at two windows are two
+    different measurements of the same work, and the name has to say which.
     """
     factors = scenario.get("factors") or {}
     if not factors:
@@ -146,9 +151,15 @@ def matrix_conditions(
     out: list[tuple[str, dict[str, object]]] = []
     seen: set[str] = set()
     for cell in cells:  # type: ignore[union-attr]
-        if not isinstance(cell, (list, tuple)) or len(cell) != 3:
-            raise SystemExit(f"design cell must be [chain, resolution, model]: {cell!r}")
-        chain_name, resolution_name, model_name = (str(part) for part in cell)
+        if not isinstance(cell, (list, tuple)) or len(cell) not in (3, 4):
+            raise SystemExit(
+                "design cell must be [chain, resolution, model] or "
+                f"[chain, resolution, model, inflight]: {cell!r}"
+            )
+        chain_name, resolution_name, model_name = (str(part) for part in cell[:3])
+        inflight = int(cell[3]) if len(cell) == 4 else 1
+        if inflight < 1:
+            raise SystemExit(f"inflight must be >= 1, got {inflight} in {cell!r}")
         for label, table, value in (
             ("chain", chains, chain_name),
             ("resolution", resolutions, resolution_name),
@@ -158,6 +169,8 @@ def matrix_conditions(
                 raise SystemExit(f"design cell names unknown {label}: {value!r}")
 
         name = f"{chain_name}-{resolution_name}-{model_name}"
+        if inflight != 1:
+            name = f"{name}-i{inflight}"
         if name in seen:
             raise SystemExit(f"design lists {name} twice")
         seen.add(name)
@@ -174,7 +187,9 @@ def matrix_conditions(
             "chain": chain_name,
             "resolution": resolution_name,
             "model": model_name,
+            "inflight": inflight,
         }
+        condition["inflight"] = inflight
         if resolution_spec.get("fps_scale"):  # type: ignore[union-attr]
             condition["fps_scale"] = resolution_spec["fps_scale"]  # type: ignore[index]
         if resolution_spec.get("clip_frames"):  # type: ignore[union-attr]
@@ -192,6 +207,10 @@ def matrix_conditions(
 #: both are checkable before anything launches, which is the only thing keeping
 #: the names honest -- the report is built from them.
 SHAPE_NAME = re.compile(r'(?:^|-)N(\d+)-p(\d+)c(\d+)(?:-|$)')
+
+#: `-i{D}`: frames in flight, appended only when D > 1 so the window of one --
+#: the demand-driven chain every earlier cell measured -- keeps its old name.
+INFLIGHT_NAME = re.compile(r'(?:^|-)i(\d+)(?:-|$)')
 
 
 def _command_text(condition: dict[str, object]) -> str:
@@ -221,6 +240,7 @@ def check_cell_shape(name: str, condition: dict[str, object]) -> None:
             f"(N should be p+c+1 = {pixel + candidate + 1})"
         )
     text = _command_text(condition)
+    check_cell_inflight(name, condition, text)
     shape = re.search(r'chain:=([^ ]+)', text)
     if shape:
         value = shape.group(1).rstrip('\'"')
@@ -234,6 +254,37 @@ def check_cell_shape(name: str, condition: dict[str, object]) -> None:
         raise SystemExit(
             f"{name}: a ros-N cell must pass chain:=... so the shape it names "
             "is the shape it runs"
+        )
+
+
+def check_cell_inflight(
+    name: str, condition: dict[str, object], text: str
+) -> None:
+    """Reject a cell whose name and command disagree about the window.
+
+    Same rule as the shape, for the same reason: a cell called ``...-i4`` that
+    launches ``inflight:=1`` (or the reverse) produces a number that is filed
+    under the wrong window, and nothing downstream can tell.
+    """
+    declared = int(condition.get("inflight", 1))
+    named = INFLIGHT_NAME.search(name)
+    named_value = int(named.group(1)) if named else 1
+    passed = re.search(r'inflight:=["\']?(\d+)', text)
+    passed_value = int(passed.group(1)) if passed else None
+    if passed_value is not None and passed_value != declared:
+        raise SystemExit(
+            f"{name}: command passes inflight:={passed_value} but the cell "
+            f"declares inflight={declared}"
+        )
+    if declared != 1 and named is None:
+        raise SystemExit(
+            f"{name}: a windowed cell must say so in its name (expected "
+            f"-i{declared})"
+        )
+    if named_value != declared:
+        raise SystemExit(
+            f"{name}: name says i{named_value} but the cell declares "
+            f"inflight={declared}"
         )
 
 
@@ -746,6 +797,7 @@ def main(argv: list[str] | None = None) -> int:
                 "condition": name,
                 "repeat": str(repeat + 1),
                 "loops": str(budget["loops"]),
+                "inflight": str(condition.get("inflight", 1)),
             }
             command = build_argv(condition, context)
             env = os.environ.copy()
