@@ -122,10 +122,10 @@ That is what makes partition depth a measurable axis rather than a different
 experiment.
 
 The benchmark harness uses exactly this entry point through
-`bench/scenarios.json` (`ros-4node`). A smoke comparison:
+`bench/scenarios.json` (`ros-N4-p2c1`). A smoke comparison:
 
 ```bash
-bench/run.py --conditions monolith,ros-4node --repeats 1 --duration 30
+bench/run.py --conditions monolith,ros-N4-p2c1 --repeats 1 --duration 30
 bench/analyze.py --from 10 --to 30
 ```
 

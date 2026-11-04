@@ -72,7 +72,7 @@ Implemented in `yolocar.detections` (stdlib only, so the ROS node does not pull
 ```json
 {"kind":"detections","v":1,"source":"assets/video/0000f77c-6257be58.mov","rotate":180,
  "model":"assets/models/yolov8n_fp16.engine","imgsz":640,"conf":0.25,"iou":0.45,
- "agnostic":false,"classes":[0,1,2,3,5,7,9,11,12],"producer":"ros-4node"}
+ "agnostic":false,"classes":[0,1,2,3,5,7,9,11,12],"producer":"acq|pre|infer|post"}
 {"seq":0,"loop":0,"t_mono":12345.678,"det":[[96.4,412.9,180.2,512.0,0.87,2]]}
 {"seq":1,"loop":0,"t_mono":12345.706,"det":[]}
 ```
@@ -104,17 +104,17 @@ the HUD live in `yolocar.render`).
 # one run -> one video
 python -m yolocar.demo \
   --source assets/video/0000f77c-6257be58.mov --rotate 180 \
-  --detections results/demo/ros-4node/detections.jsonl \
-  --records    results/demo/ros-4node/records.jsonl \
-  --out        results/demo/ros-4node.mp4 \
+  --detections results/demo/ros-N4-p2c1/detections.jsonl \
+  --records    results/demo/ros-N4-p2c1/records.jsonl \
+  --out        results/demo/ros-N4-p2c1.mp4 \
   --timing wall --hud
 
 # two runs -> one composite (align wall: each panel at its own pace)
 python -m yolocar.demo \
   --source assets/video/0000f77c-6257be58.mov --rotate 180 \
   --compare monolith=results/demo/monolith/detections.jsonl,results/demo/monolith/records.jsonl \
-            ros-4node=results/demo/ros-4node/detections.jsonl,results/demo/ros-4node/records.jsonl \
-  --out results/demo/compare-monolith-vs-ros-4node.mp4 \
+            ros-N4-p2c1=results/demo/ros-N4-p2c1/detections.jsonl,results/demo/ros-N4-p2c1/records.jsonl \
+  --out results/demo/compare-monolith-vs-ros-N4-p2c1.mp4 \
   --timing wall --hud
 ```
 
@@ -160,11 +160,11 @@ results/demo/
 ├── run.json                       # separate from results/bench/run.json
 ├── <condition>/                   # records + detections + summary, one replay
 └── <condition>.mp4
-results/demo/compare-monolith-vs-ros-4node.mp4
+results/demo/compare-monolith-vs-ros-N4-p2c1.mp4
 ```
 
 `--demo` is a separate invocation from a measurement (`bench/run.py --demo
---conditions monolith,ros-4node`), supports `--dry-run`, and cannot fail a
+--conditions monolith,ros-N4-p2c1`), supports `--dry-run`, and cannot fail a
 measurement run because it never runs inside one. `monolith-ctrl` is included:
 two visually identical control videos are the noise floor, made visible.
 
@@ -197,13 +197,16 @@ Implemented as described; deviations and additions, all additive:
 * **`bench/run.py --demo` skips the compare step** when a condition it needs was
   not selected or did not complete, instead of failing the whole pass.
 
-Measured on this board, one full `--demo` pass (10 min 29 s):
+Measured on this board, one full `--demo` pass (10 min 29 s) -- **before the
+conditioning chain became a constant of the experiment**, so the demo now runs the
+seven ops in every panel and these durations are roughly 2-3x longer (the video
+timeline is the records' pace, so the rendered length moves with it):
 
 | | run | video | render |
 | --- | --- | --- | --- |
 | `monolith` | 1217 frames, 37.1 fps, p50 15.7 ms | 3940 frames, 120 fps, 32.8 s, 98 MB | 63 s |
 | `monolith-ctrl` | 1217 frames, 37.0 fps, p50 16.1 ms | 32.9 s, 99 MB | 61 s |
-| `ros-4node` | 1217 frames, 8.9 fps, p50 94.8 ms | 16327 frames, 136.1 s, 223 MB | 177 s |
+| `ros-N4-p2c1` | 1217 frames, 8.9 fps, p50 94.8 ms | 16327 frames, 136.1 s, 223 MB | 177 s |
 | `compare` (`--align wall`) | — | 16327 frames, 136.1 s, 188 MB | 119 s |
 
 The 4.1x longer ROS video is the headline: same clip, same detections, visibly

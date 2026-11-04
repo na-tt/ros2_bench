@@ -108,8 +108,12 @@ node count says nothing about that ratio, which is the whole point.
 
 The **shape string** stays the canonical identity (`acq|pre|infer|post`): it is
 what the launch argument takes and what the provenance records, and the label is
-its short form for humans and directory names. `ros-4node` is kept as an alias
-for `p2c1` so existing result paths keep their meaning.
+its short form for humans and directory names. The **conditioning chain is not
+part of the label** because it is not an axis: every cell runs the same seven
+ops (`conditioning.ops` in `bench/scenarios.json`), the monolith spells them as
+repeated `--pre` and the launch file takes `pre_ops:=`, and `run.py` rejects any
+cell whose command disagrees. A cell name therefore encodes architecture,
+resolution, model and frames in flight, and nothing else.
 
 ## The configurations
 
@@ -124,7 +128,7 @@ conditioning ops.
 | **`p1c0`** | `acq` \| `pre+infer+post` | 2 | 1 | 0 | **the process boundary alone** |
 | **`p2c0`** | `acq` \| `pre` \| `infer+post` | 3 | 2 | 0 | ...vs cutting *before* the model |
 | **`p1c1`** | `acq` \| `pre+infer` \| `post` | 3 | 1 | 1 | ...vs cutting *after* it |
-| **`p2c1`** | `acq` \| `pre` \| `infer` \| `post` | 4 | 2 | 1 | current chain (`ros-4node`) |
+| **`p2c1`** | `acq` \| `pre` \| `infer` \| `post` | 4 | 2 | 1 | current chain (`ros-N4-p2c1`) |
 | `p2c2` | `acq` \| `pre` \| `infer` \| `nms` \| `filter+coord` | 5 | 2 | 2 | cheap cut, one hop |
 | `p2c3` | `acq` \| `pre` \| `infer` \| `nms` \| `filter` \| `coord` | 6 | 2 | 3 | candidate side exhausted |
 | **`p3c1`** | `acq` \| `op1+op2` \| `op3..op7` \| `infer` \| `post` | 5 | 3 | 1 | **one pixel hop more than `p2c1`** (one step up the pixel side) |
@@ -195,8 +199,8 @@ baseline without any new measurement:
 
 | cell | xport | p50 | share |
 | --- | --- | --- | --- |
-| ros-4node-720p-n | 24.2 ms | 42.4 ms | 57 % |
-| ros-4node-180p-n | 18.4 ms | 36.2 ms | 51 % |
+| `ros-4node-720p-n` (op-free, historic) | 24.2 ms | 42.4 ms | 57 % |
+| `ros-4node-180p-n` (op-free, historic) | 18.4 ms | 36.2 ms | 51 % |
 
 and it is the quantitative form of "an op should only get its own node if it
 costs more than the hop it needs". On the calibrated six-op chain that is a
@@ -435,21 +439,22 @@ process count and the label is the coordinate from the naming section:
 is what a human reads first in a directory listing ("twelve processes"), and
 the coordinate is what the analysis needs; a mismatch between them is a bug in
 the scenario file that `bench/run.py` can check before launching anything.
-`ros-4node` stays as an alias for `ros-N4-p2c1` so existing paths keep meaning.
+There is one `p2c1` cell, not two: the seven-op chain is a constant of the
+experiment, so the model matrix and the shape axis share `ros-N4-p2c1`.
 The `chain` factor in `bench/scenarios.json` selects which command template
 runs, so a shape is one extra entry per resolution, not a new harness, and the
 shape string goes in the summary provenance.
 
 **Tier 1 -- the decisive minimum** (10 cells, 5 shapes x 720p and 180p):
-`monolith`, `ros-p1c0`, `ros-p2c0`, `ros-p1c1`, `ros-p2c1`. This answers H1
-(the `p2c0` vs `p1c1` pair, 720p alone) and H2 (adding 180p). Dropping to 720p
-only -- 5 cells -- still answers H1, which is the cheaper first step if the
-budget is tight.
-Run `ros-p1c0` first: it is the highest information per minute, because
+`monolith`, `ros-N2-p1c0`, `ros-N3-p2c0`, `ros-N3-p1c1`, `ros-N4-p2c1`. This
+answers H1 (the `p2c0` vs `p1c1` pair, 720p alone) and H2 (adding 180p). Dropping
+to 720p only -- 5 cells -- still answers H1, which is the cheaper first step if
+the budget is tight.
+Run `ros-N2-p1c0` first: it is the highest information per minute, because
 everything the repo claims about "ROS overhead is transport" rests on the
 assumption that a process boundary with a single hop costs what the model says.
 
-**Tier 2 -- the long tail** (2 cells): `ros-p8c3` at 720p and 180p. This
+**Tier 2 -- the long tail** (2 cells): `ros-N12-p8c3` at 720p and 180p. This
 validates linearity in `k` at the extreme where the additive model is most
 likely to break (DDS participants, executor wakeups, memory pressure from 12
 processes). If `xport(p8c3) / xport(p2c1)` comes out well above the hop ratio it
@@ -462,10 +467,13 @@ this already) -- the whole point is that the deltas are within-pass.
 
 Budget: the ceiling is `settle + 1.1 * analysis_frames / fps_hint`. Slow shapes
 do not cost fewer frames, they cost more seconds, so a pass containing
-`ros-p8c3` at 720p (~7 fps predicted, ~430 s ceiling) is ~5x the wall time of
-the current `ros-4node` cell. `--dry-run` prints the ceilings per cell; the
-`fps_hint`s for new cells start from the `p2c1` value scaled by predicted hop cost,
-and `analyze.py` warns when a window came up short.
+`ros-N12-p8c3` at 720p (~4.8 fps predicted, ~950 s ceiling) is ~5x the wall time
+of the current `ros-N4-p2c1` cell. These cells all carry the same seven-op chain,
+so the op cost is common and the deltas still isolate the partition -- but the
+absolute per-frame cost is ~100 ms higher than an op-free run, and the ceilings
+reflect that. `--dry-run` prints the ceilings per cell; the `fps_hint`s for new
+cells start from the `p2c1` value scaled by predicted hop cost, and `analyze.py`
+warns when a window came up short.
 
 ## What this axis cannot answer
 
@@ -488,7 +496,7 @@ and `analyze.py` warns when a window came up short.
 | D3 | Every shape must be **detection-identical**; enforced by a test, not by review. |
 | D4 | A shape is named `p{p}c{c}` (the pixel-hop and candidate-hop counts, `N = p+c+1`); the full shape string goes in the provenance of every artefact. |
 | D5 | `in-flight > 1` is a different experiment and is not smuggled into this one. |
-| D6 | The anchor stays `monolith-720p-n`; shape deltas are within-pass against `ros-4node`, never against a mean from another session. |
+| D6 | The anchor stays `monolith-720p-n`; shape deltas are within-pass against `ros-N4-p2c1`, never against a mean from another session. |
 
 ## First light (not a measurement)
 

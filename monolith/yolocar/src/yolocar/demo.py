@@ -28,14 +28,14 @@ Timing (``--timing``)
 Examples::
 
     python -m yolocar.demo --source assets/video/0000f77c-6257be58.mov \\
-        --rotate 180 --detections results/demo/ros-4node/detections.jsonl \\
-        --records results/demo/ros-4node/records.jsonl \\
-        --out results/demo/ros-4node.mp4 --hud
+        --rotate 180 --detections results/demo/ros-N4-p2c1/detections.jsonl \\
+        --records results/demo/ros-N4-p2c1/records.jsonl \\
+        --out results/demo/ros-N4-p2c1.mp4 --hud
 
     python -m yolocar.demo --source assets/video/0000f77c-6257be58.mov \\
         --rotate 180 --compare \\
             monolith=results/demo/monolith/detections.jsonl,results/demo/monolith/records.jsonl \\
-            ros-4node=results/demo/ros-4node/detections.jsonl,results/demo/ros-4node/records.jsonl \\
+            ros-N4-p2c1=results/demo/ros-N4-p2c1/detections.jsonl,results/demo/ros-N4-p2c1/records.jsonl \\
         --out results/demo/compare.mp4 --hud
 
     python -m yolocar.demo ... --play      # window, paced by the real timestamps
@@ -684,7 +684,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "side-by-side mode: LABEL=DETECTIONS_JSONL[,RECORDS_JSONL] twice "
-            "(e.g. monolith=... ros-4node=...)"
+            "(e.g. monolith=... ros-N4-p2c1=...)"
         ),
     )
     parser.add_argument(

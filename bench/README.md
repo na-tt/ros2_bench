@@ -104,30 +104,33 @@ demo video look wrong.
 ### 2. Smoke test first (~40 s)
 
 Cheap and it catches a moved engine, a stale workspace or a broken topic before
-you spend half an hour:
+you spend an hour:
 
 ```bash
 bench/run.py --repeats 1 --gap 2 --out results/smoke \
   --settle 3 --analysis-frames 200 \
-  --conditions monolith-720p-n,ros-4node-720p-n
+  --conditions monolith-720p-n,ros-N4-p2c1-720p-n
 bench/analyze.py --dir results/smoke
 rm -rf results/smoke          # gitignored, but do not let it be read as data
 ```
 
 Expect `2/2 trials ok`; if a trial exits non-zero, read
-`results/smoke/<condition>/r1/workload.log`.
+`results/smoke/<condition>/r1/workload.log`. Both cells now run the seven-op
+conditioning chain, so a smoke cell is ~120-150 ms/frame at 720p, not ~15.
 
-### 3. The full run (3 cells x 3 passes x 180 s ≈ 28 min)
+### 3. The full run (the headline pair, 3 passes ≈ 1 h)
 
 ```bash
 bench/run.py --repeats 3 --gap 5 --out results/bench \
-  --conditions monolith-720p-n,ros-4node-720p-n
+  --conditions monolith-720p-n,ros-N4-p2c1-720p-n
 ```
 
 A matrix run is `--conditions` on a subset, not always the whole product; see
 *The matrix* for the axes and pruning recipes. Wall clock per trial is the cell's
 computed time ceiling (*Trial budget*) plus engine load (~1.5 s for `yolov8n`,
-tens of seconds for `yolov8x`) plus `--gap`.
+tens of seconds for `yolov8x`) plus `--gap`. The conditioning chain dominates a
+720p cell (~103.5 ms/frame of ops), so the headline pair runs at roughly 8 and
+6.5 fps against 59.5 and 20.1 before it.
 Re-running into the same `--out` **overwrites** `<out>/<condition>/r<N>/`, so
 give each session its own directory if you want to keep the old numbers
 (`--out results/bench-$(date +%m%d-%H%M)`).
@@ -139,7 +142,7 @@ nohup env -i HOME="$HOME" TERM=dumb \
   PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   bash -ic 'cd ~/Memoria/ros2_bench && python3 bench/run.py --repeats 3 --gap 5 \
     --out results/bench \
-    --conditions monolith-720p-n,ros-4node-720p-n' > results/full-run.log 2>&1 &
+    --conditions monolith-720p-n,ros-N4-p2c1-720p-n' > results/full-run.log 2>&1 &
 tail -f results/full-run.log
 ```
 
@@ -202,7 +205,7 @@ the per-condition sidecars.
 
 ```bash
 bench/run.py --demo                                   # all artifact conditions
-bench/run.py --demo --conditions monolith,ros-4node   # just the headline pair
+bench/run.py --demo --conditions monolith,ros-N4-p2c1 # just the headline pair
 bench/run.py --demo --dry-run                         # print the steps
 ```
 
@@ -215,22 +218,23 @@ results/demo/
 ├── run.json                                   # demo steps + return codes
 ├── <condition>/{records,detections,summary}.json[ l]
 ├── <condition>.mp4
-└── compare-monolith-vs-ros-4node.mp4          # --align wall: each panel at its own pace
+└── compare-monolith-vs-ros-N4-p2c1.mp4       # --align wall: each panel at its own pace
 ```
 
 `detections.jsonl` is **not** part of the benchmark contract and is documented in
 `monolith/yolocar/README.md` (*Seeing a run*). A front-end that never writes one
 is still compliant; `records.jsonl`/`summary.json` are unchanged by its presence.
 
-Wall clock for a full `--demo` pass on this board: ~10 min (monolith 34 s run +
-61 s render, control likewise, ROS chain 140 s run + 179 s render, compare
-118 s).
+Wall clock for a full `--demo` pass on this board: ~15 min (monolith ~2 min run
++ 1 min render, control likewise, ROS chain ~3 min run + 3 min render, compare
+~2 min). The seven-op chain is inside every demo run as well, so the panels look
+like the measured workload.
 
 Common variants:
 
 ```bash
 bench/run.py --dry-run                                  # what would be launched
-bench/run.py --conditions monolith-720p-n,ros-4node-720p-n --repeats 4  # headline pair
+bench/run.py --conditions monolith-720p-n,ros-N4-p2c1-720p-n --repeats 4  # headline pair
 bench/run.py --repeats 1 --settle 5 --analysis-frames 500  # quick look
 ```
 
@@ -355,7 +359,7 @@ Three things, in this order.
 | `cpu ms/f`, `cores` | `/proc` | workload CPU time per frame; `cores` = cpu/wall |
 | `pss MB` | `/proc` | peak PSS of the process group (accounts for shared pages) |
 | `load %` | tegrastats | whole-board CPU load, averaged across cores over the window. This is the column that says whether a run is comparable to another: the same design measured 27 % (range 16-36) on a quiet desk and 95 % with a browser open, and the pipeline ran 1.4x slower for it |
-| `gpu %` | tegrastats | `GR3D_FREQ` duty cycle, not occupancy; a latency-bound chain reads low. Mean over the samples, not median: at low duty the 100 ms samples are bimodal (GPU work / no GPU work) and the median lands on the zero mode — `ros-4node-720p-n` reads 7 % by mean and 0 % by median |
+| `gpu %` | tegrastats | `GR3D_FREQ` duty cycle, not occupancy; a latency-bound chain reads low. Mean over the samples, not median: at low duty the 100 ms samples are bimodal (GPU work / no GPU work) and the median lands on the zero mode — the ROS chain read 7 % by mean and 0 % by median on the op-free matrix (measured before conditioning became a constant, so the values move; the estimator does not) |
 | `W`, `J/f` | tegrastats | board-level `VDD_IN`; energy is the trapezoidal integral over the window |
 | `tj °C` | tegrastats | junction temperature, max over the window |
 | `xport` | records | ROS only: `transport_ms`, i.e. serialisation + DDS + scheduling (plus, at `inflight > 1`, the queueing the window introduced) |
@@ -370,21 +374,39 @@ end-to-end — never per pipeline stage. `tegrastats` lines carry a 1-second
 wall-clock prefix, so the sampler timestamps the line when it reads it; a board
 column can be up to one interval (default 100 ms) older than its `t_mono`.
 
+This table is the reference; `analyze.py` also appends a condensed version to
+every generated report (`glossary_markdown`, one entry per column of each table
+it printed), so a `report.md` read months later carries the definition of its
+own columns. The two are kept in sync by hand — add the column to both.
+
 ## The matrix (factors + design)
 
 The experiment is written once as **factors** and a **design** list, not as N
 hand-copied command templates:
 
 ```
-factors.resolution  720p | 360p | 180p   -> source file, rotate, clip_frames
-factors.model       n    | m    | x      -> TensorRT engine path
-factors.chain       monolith | ros-4node -> cmd / shell template
+factors.resolution   720p | 360p | 180p   -> source file, rotate, clip_frames
+factors.model        n    | m    | x      -> TensorRT engine path
+factors.chain        monolith | ros-N4-p2c1 | ros-N12-p8c3 -> cmd / shell
+conditioning.ops     the one stage-2 chain, run by every cell
 ```
 
-A cell is `<chain>-<resolution>-<model>` (`monolith-720p-n`,
-`ros-4node-180p-x`). `design.cells` is the list of combos that actually exist
-(the full factorial is 2 x 3 x 3 = 18); leave the list out and `run.py`
+A cell is `<chain>-<resolution>-<model>[-i<D>]` (`monolith-720p-n`,
+`ros-N4-p2c1-180p-x`, `ros-N4-p2c1-720p-n-i4`): architecture, source
+resolution, model variant and frames in flight -- and nothing else.
+`design.cells` is the list of combos that actually exist (40: the 18-cell model
+matrix, 14 shape cells and 8 window cells); leave the list out and `run.py`
 generates the full product.
+
+**The conditioning chain is a constant, not a coordinate.** Every cell -- both
+front-ends, every shape, resolution, model and window -- runs the same seven ops
+in the same order, declared once under `conditioning` in `scenarios.json`. It is
+spliced into the ROS templates as `pre_ops:={pre_ops}` and spelled out as
+repeated `--pre` in the monolith template, and `run.py` checks both forms against
+that list before launching anything. A cell that ran a different (or empty)
+stage 2 would not be a point on an axis, it would be a different experiment, and
+the records could not tell you: `pre_ms` is a sum, so a missing chain reads ~0
+and looks like an improvement.
 
 What each axis can and cannot move (all three engines take FLOAT
 `(1,3,640,640)` and emit FLOAT `(1,84,8400)`, and `imgsz` is no longer a
@@ -429,22 +451,25 @@ the coordinate `p{p}c{c}` -- p hops carry pixels, c carry candidates, and
 | `ros-N2-p1c0` | 2 | 1 | 0 | the monolith in a second process: prices one boundary |
 | `ros-N3-p1c1` | 3 | 1 | 1 | pixels cross once |
 | `ros-N3-p2c0` | 3 | 2 | 0 | same N, pixels cross twice -- the H1 pair with p1c1 |
-| `ros-N4-p2c1` | 4 | 2 | 1 | the current chain, with the seven-op conditioning chain |
+| `ros-N4-p2c1` | 4 | 2 | 1 | the current chain: matrix cell and shape baseline |
 | `ros-N5-p3c1` | 5 | 3 | 1 | one pixel hop more than p2c1: the additivity check |
 | `ros-N5-p2c2` | 5 | 2 | 2 | first cut inside stages 4-6 |
 | `ros-N6-p2c3` | 6 | 2 | 3 | stages 4-6 fully split |
 | `ros-N12-p8c3` | 12 | 8 | 3 | one process per op: the transport extreme |
 
-These cells all run the seven-op chain, so they are **not** comparable to the
-`ros-4node-*` cells, which run none: `ros-N4-p2c1` exists to be their baseline.
-`run.py` validates the name against the command before launching anything (N
-must equal p+c+1, and the `chain:=` string must have N groups), because the cell
-name is what the report is built from.
+Every cell -- these shapes, the model matrix and the window ladder -- runs the
+same seven-op chain (the constant in `scenarios.json`), so `ros-N4-p2c1` is at
+once the matrix's ROS cell and the shape axis's four-node baseline. The design
+lists it once; there is no op-free copy to keep in step. `run.py` validates the
+name against the command before launching anything (N must equal p+c+1, the
+`chain:=` string must have N groups, `-iD` must equal `inflight:=`, and both
+front-ends must carry the canonical chain), because the cell name is what the
+report is built from.
 
 Recommended subsets, in the order they pay off:
 
 ```bash
-# H1 -- same node count, different payload: ~40 min for one pass at 720p
+# H1 -- same node count, different payload: ~1 h for one pass at 720p
 bench/run.py --conditions ros-N3-p1c1-720p-n,ros-N3-p2c0-720p-n,monolith-720p-n
 
 # the ladder, both resolutions (the resolution axis needs the pair)
@@ -478,26 +503,34 @@ zero for every window delta:
 
 ```bash
 bench/run.py --out results/fif1 --conditions \
-  monolith-720p-n,ros-4node-720p-n,ros-4node-720p-n-i2,ros-4node-720p-n-i4,ros-4node-720p-n-i8
+  monolith-720p-n,ros-N4-p2c1-720p-n,ros-N4-p2c1-720p-n-i2,ros-N4-p2c1-720p-n-i4,ros-N4-p2c1-720p-n-i8
 ```
 
-The ladder cells set `settle_s: 45` in `cells`: a 20 fps cell and a 50 fps cell
+The ladder cells set `settle_s: 45` in `cells`: a 6 fps cell and a 25 fps cell
 are different power and thermal states on the same board, so the ramp is longer
 than the 30 s the rest of the matrix uses. They also set a pessimistic
 `fps_hint` -- the closed-loop prediction is the starting point, not a measurement.
+Note that the conditioning chain changes the shape of the curve rather than just
+its scale: at 720p the `pre` node alone costs ~103.5 ms, so it becomes the
+bottleneck and the window stops buying throughput after two frames; at 180p the
+ops are ~13.6 ms and the model still sets the pace.
 
 ### Pruning
 
-The 18-cell factorial is ~61 min per pass at the current budget (2 passes ~2.0 h,
-3 passes ~3.1 h) before engine load and gaps, and the spread is wide:
-`monolith-180p-n` is ~85 s while `ros-4node-720p-x` is ~336 s. The full `design`
-is 42 cells once the shape and window axes are included, which is why neither is
-meant to run in the same pass as the model matrix. `--conditions` selects by
-cell name:
+The 18-cell model matrix is ~2.1 h per pass at the current budget (3 passes
+~6.5 h), the 14 shape cells ~1.8 h, the 8 window cells ~0.9 h, so the full
+40-cell design is ~4.8 h per pass (~14.5 h for 3) before engine load and gaps.
+Those are ceilings: a trial stops as soon as its window is full, which is usually
+earlier. The spread is wide: `monolith-180p-n` is ~140 s while
+`ros-N4-p2c1-720p-x` is ~950 s, and the conditioning chain is what moved both
+(the ops cost 103.5 ms at 720p and 13.6 at 180p, so the resolution axis now
+changes the *per-frame cost*, not only the payload). That is also why the shape
+and window axes are meant to run as their own `--conditions` subsets rather than
+in one pass with the model matrix. `--conditions` selects by cell name:
 
 ```bash
-bench/run.py --dry-run --conditions monolith-720p-n,ros-4node-720p-n
-bench/run.py --conditions monolith-720p-n,monolith-360p-n,monolith-180p-n,ros-4node-720p-n,ros-4node-360p-n,ros-4node-180p-n
+bench/run.py --dry-run --conditions monolith-720p-n,ros-N4-p2c1-720p-n
+bench/run.py --conditions monolith-720p-n,monolith-360p-n,monolith-180p-n,ros-N4-p2c1-720p-n,ros-N4-p2c1-360p-n,ros-N4-p2c1-180p-n
 ```
 
 A design that answers one factor beats a design that answers none: keep the
@@ -510,24 +543,31 @@ The two failure modes here have different currencies, so the design uses both.
 
 * **Frames** are the statistical unit: `p50/p95/p99` are computed from a frame
   count, so every cell gets the same `analysis_frames` and the percentiles are
-  comparable across a matrix whose cells differ by 4x in speed. This also fixes a
-  content-mix bias: a fixed 180 s window is 8.9 clip passes at 59.5 fps but 3.0 at
-  20.1 fps, so dense-traffic passages weigh ~3x more in the monolith trial than
-  in the ROS trial.
+  comparable across a matrix whose cells differ by 5x in speed. This also fixes a
+  content-mix bias: a fixed 180 s window held 8.9 clip passes at the old op-free
+  59.5 fps but 3.0 at 20.1 fps, so dense-traffic passages weighed ~3x more in the
+  monolith trial than in the ROS trial. With the conditioning chain in every cell
+  the fastest and slowest cells still differ ~3x (about 8 fps at `monolith-720p-n`
+  against ~3 fps at `ros-N12-p8c3-720p-n`), so the bias the frame budget removes
+  is smaller than it was, not gone.
 * **Seconds** are the machine-state unit: the ~8 % drift and the thermal ramp are
   functions of elapsed time, so a pure frame budget would measure the fast cells
   cold. `settle_s` is dropped by the analyser, and each trial gets a time ceiling
   derived from its frame budget.
 
 `scenarios.json` therefore carries `trial.settle_s`, `trial.analysis_frames` and
-`trial.fps_hint` (`chain -> model`, scaled by `fps_scale` per resolution). The
-hints are **0.7x** the 720p rates measured on a quiet board (59.5 fps for
-`monolith-720p-n`), not 0.9x: the same desk with a browser and an editor open
-measured 1.4x slower with identical code, which turned a full window into a
-`window_short` warning. An over-estimate shortens the ceiling until the window
-goes short; an under-estimate only runs a little longer. Re-derive them from a
-clean run, keep the margin, and treat a `window_short` warning as "the hint is
-now wrong". Per trial, `run.py` derives:
+`trial.fps_hint` (a table per chain, resolution and model). The
+hints are **0.7x** the estimated rate *with the seven-op chain*, not 0.9x, and
+they are re-derived whenever the chain or the box changes: the same desk with a
+browser and an editor open measured 1.4x slower with identical code, which turned
+a full window into a `window_short` warning. The resolution is a level of the
+table rather than a scale on the 720p row because the ops and the model do not
+scale with pixels the same way: at 720p the chain is ~7x the inference of the n
+engine, at 180p they are comparable, so the model spread widens as the resolution
+falls. An over-estimate shortens the ceiling until the window goes short; an
+under-estimate only runs a little longer. Re-derive from a clean run, keep the
+margin, and treat a `window_short` warning as "the hint is now wrong". Per trial,
+`run.py` derives:
 
 ```
 duration  = settle_s + 1.1 * analysis_frames / fps_hint     # stop condition

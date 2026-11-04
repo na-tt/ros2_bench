@@ -51,14 +51,17 @@ Three steps: build the workspace, measure, analyse.
 ```bash
 cd ws && colcon build --symlink-install && cd ..   # once, or after touching ws/
 
-bench/run.py --repeats 3 --duration 180 --gap 5 --out results/bench   # ~28 min
-bench/analyze.py --from 30 --to 170 --md results/report.md --json results/report.json
+bench/run.py --repeats 3 --gap 5 --out results/bench   # 40 cells, ~4.8 h/pass
+bench/analyze.py --md results/report.md --json results/report.json
 ```
 
-`bench/run.py` interleaves the conditions (`monolith`, `monolith-ctrl`, `ros-4node`)
-and samples board + process telemetry; `bench/analyze.py` picks the analysis
-window afterwards, so the same trials can be re-read with different `--from/--to`
-without re-measuring. Quick checks:
+`bench/run.py` interleaves the conditions (`monolith`, `ros-N4-p2c1`, the shape
+cells) and samples board + process telemetry; `bench/analyze.py` picks the
+analysis window afterwards, so the same trials can be re-read with a different
+window without re-measuring. Every cell runs the same seven-op conditioning
+chain, declared once in `bench/scenarios.json`: a cell varies only in
+architecture, source resolution, model variant and frames in flight, and
+`--conditions` selects a subset by name. Quick checks:
 
 ```bash
 bench/run.py --dry-run                                # print what would launch

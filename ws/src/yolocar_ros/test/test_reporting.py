@@ -82,7 +82,7 @@ def test_detections_sidecar_stays_in_lockstep_with_records(tmp_path: Path) -> No
             iou_threshold=0.45,
             agnostic_nms=False,
             class_ids=ROAD_CLASS_IDS,
-            producer='ros-4node',
+            producer='ros-N4-p2c1',
         ),
     ).open_file()
     found = Detection(

@@ -185,11 +185,11 @@ source install/setup.bash
   covers the real driver, not just fakes).
 
 * **To run a full measurement** (interleaved passes + telemetry, see
-  *Measurement Protocol* below). Cells are `<chain>-<resolution>-<model>`, so a
-  run selects them explicitly; `--settle`/`--analysis-frames` override the trial
-  budget only for smoke runs:
+  *Measurement Protocol* below). Cells are `<chain>-<resolution>-<model>[-i<D>]`,
+  so a run selects them explicitly; `--settle`/`--analysis-frames` override the
+  trial budget only for smoke runs:
   ```bash
-  bench/run.py --repeats 3 --conditions monolith-720p-n,ros-4node-720p-n
+  bench/run.py --repeats 3 --conditions monolith-720p-n,ros-N4-p2c1-720p-n
   bench/analyze.py --md results/report.md --json results/report.json
   ```
 
@@ -268,6 +268,14 @@ never imports pipeline code. Details and the metric dictionary are in
 
 **Non-negotiable policy** -- these are decisions, not defaults to "improve":
 
+* **Conditioning is a constant of the experiment.** Every cell -- both
+  front-ends, every shape, resolution, model and window -- runs the same seven
+  ops in the same order, declared once under `conditioning` in
+  `bench/scenarios.json` (ROS templates splice `pre_ops:={pre_ops}`, the monolith
+  spells them as repeated `--pre`). `run.py` rejects a cell whose command omits
+  or alters it, before launching anything. A cell is therefore architecture x
+  resolution x model x frames in flight, nothing else. The check exists because
+  `pre_ms` is a sum: a skipped chain reads ~0 and looks like an improvement.
 * **No clock pinning, no governor changes, no CPU affinity, no GC tuning, no
   headless mode.** The desktop session's background activity is the noise floor
   and is part of the measurement.
@@ -305,19 +313,23 @@ never imports pipeline code. Details and the metric dictionary are in
   is reported as `stage_ms.presentation` and subtracted from `fps`
   (`fps_wall` keeps the raw rate).
 
-**Baseline** (Orin Nano, full matrix, 3 interleaved passes, `settle_s=30` +
-`analysis_frames=2500`, rotation-corrected footage). Mean ± sample std across
-passes; the anchor is bold. Measured on the chain *before* the model contract
-moved into the inference node, so the `ros-4node` p50 includes the 4.9 MB
-tensor hop that no longer exists -- treat it as the historical reference, not
-as the current graph (see *Current State*, `pre_ms` attribution):
+**Baseline — historic, measured with an empty stage 2; superseded by the
+conditioning constant.** Orin Nano, full matrix, 3 interleaved passes,
+`settle_s=30` + `analysis_frames=2500`, rotation-corrected footage. Mean ± sample
+std across passes; the anchor is bold. The ROS rows are the cell now called
+`ros-N4-p2c1-*`, and they predate both the model contract move (so their p50
+includes the 4.9 MB tensor hop that no longer exists) and the rule that every
+cell runs the seven-op conditioning chain (which adds ~103.5 ms/frame at 720p and
+~13.6 at 180p). **Do not compare a fresh run against these numbers**: the cells
+have the same names, the workloads do not. They are kept as the only measured
+reference for the graph, not as a current result.
 
 | cell | p50 ms | fps | cpu ms/f | cores | gpu % | W | J/f | pss MB |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | **monolith-720p-n** | **12.57 ± 0.19** | **59.5** | 25.6 | 1.53 | 28 | 9.6 | 0.165 | 639 |
 | monolith-180p-n | 12.71 ± 0.06 | 70.3 | 14.4 | 1.01 | 33 | 9.6 | 0.140 | 607 |
-| ros-4node-720p-n | 42.40 ± 0.93 | 20.1 | 70.2 | 1.41 | 6 | 8.1 | 0.408 | 923 |
-| ros-4node-180p-n | 36.16 ± 0.90 | 26.3 | 49.8 | 1.31 | 8 | 8.2 | 0.316 | 871 |
+| ros-N4-p2c1-720p-n | 42.40 ± 0.93 | 20.1 | 70.2 | 1.41 | 6 | 8.1 | 0.408 | 923 |
+| ros-N4-p2c1-180p-n | 36.16 ± 0.90 | 26.3 | 49.8 | 1.31 | 8 | 8.2 | 0.316 | 871 |
 
 Reading. At fixed `imgsz=640` the resolution axis moves **CPU, not latency**:
 720p→180p leaves p50 flat (`+0.14 ± 0.33 ms`, not significant) while CPU per
@@ -331,6 +343,13 @@ Acquisition is 2.8 ms (11 % of CPU) at 720p and 0.4 ms at 180p, so the old
 pay. ROS 2 overhead lands on the saturated resource: ~70 ms of CPU per frame
 across 4 processes.
 
+That reading is about the workload *without* conditioning, and the chain changes
+it: with 103.5 ms of ops at 720p against 13.6 at 180p, resolution no longer
+leaves latency flat -- it moves per-frame cost ~7x. What survives is the
+comparison: the ops are common to every cell, so a within-pass monolith-vs-ROS
+delta still isolates transport and process overhead, and the model axis still
+only moves inference. Re-measure before quoting any of the absolute numbers.
+
 ## Pipelines
 ### yolocar
 #### Description
@@ -338,7 +357,7 @@ Road objects video detection with yolo on dashcam footage.
 
 #### Specification
 - (1) **acquisition:** read frame from video file. bgr frame at experimental resolution
-- (2) **preprocessing:** general image conditioning at **source resolution**, as a chain of ops (CLAHE, bilateral, gaussian, gamma, histogram equalisation, median, unsharp). BGR uint8 in, BGR uint8 out, geometry unchanged. Stage 2 says *how the image should look*; it does not know the model. Empty chain = identity (bit-exact, zero-copy), which is the baseline.
+- (2) **preprocessing:** general image conditioning at **source resolution**, as a chain of ops (CLAHE, bilateral, gaussian, gamma, histogram equalisation, median, unsharp). BGR uint8 in, BGR uint8 out, geometry unchanged. Stage 2 says *how the image should look*; it does not know the model. Empty chain = identity (bit-exact, zero-copy) at the function level, but the benchmark never measures it: every cell runs the seven-op chain, declared once under `conditioning` in `bench/scenarios.json` (see *Measurement Protocol*).
 - (2b) **model input contract:** letterbox + BGR→RGB + HWC→NCHW + dtype/scale. Parameterised only by the engine's `InputSpec`, and therefore part of the inference stage, not of preprocessing.
 - (3) **inference:** run yolo and produce candidate detection boxes.
 - (4) **NMS:** perform Non Maximum Supression to reduce detections.
@@ -385,9 +404,9 @@ type only at the very end.
   function and adds only ROS 2 boilerplate. The acquisition node publishes one
   frame and waits for the terminal node's ack, so the graph is demand-driven
   like the monolith (one frame in flight, no silent drops).
-  `bench/scenarios.json` (the `ros-4node` chain, i.e. every `ros-4node-*` cell)
-  drives it through `launch/bench.launch.py`; any node exiting shuts the launch
-  down.
+  `bench/scenarios.json` (the `ros-N4-p2c1` chain, i.e. every `ros-N4-p2c1-*`
+  cell) drives it through `launch/bench.launch.py`; any node exiting shuts the
+  launch down.
 * **Stage 2 is splittable by launch data, not by code.** `pre_ops` says *what*
   conditioning runs (`;` separated, empty = identity); `pre_split:=true` cuts
   it into one `preprocessing` process per op, wired head to tail through
@@ -446,11 +465,13 @@ type only at the very end.
   with non-decreasing `t_mono` at any `D` -- queues preserve order, a bigger
   window only changes how many frames are in them. Cell token `-i{D}`, appended
   only when `D > 1`, and `run.py` rejects a name that disagrees with the
-  command. Ladder {1,2,4,8} on `ros-4node` both resolutions and {1,2,4} on
+  command. Ladder {1,2,4,8} on `ros-N4-p2c1` both resolutions and {1,2,4} on
   `ros-N12-p8c3`; `docs/proposals/frames-in-flight.md` has the model, the five
-  predictions and the measurement plan. **Not measured yet** (a 180p smoke run
-  confirmed the mechanism: 29.5 -> 44.2 -> 44.4 fps at `D` = 1/2/4 with p50
-  29.5 -> 39.8 -> 85.8 ms, i.e. the knee is at 2 as predicted).
+  predictions and the measurement plan. **Not measured yet with the chain** (an
+  op-free 180p smoke run confirmed the mechanism: 29.5 -> 44.2 -> 44.4 fps at
+  `D` = 1/2/4 with p50 29.5 -> 39.8 -> 85.8 ms, i.e. the knee was at 2; the
+  seven ops move it, because at 720p the `pre` node becomes the bottleneck and
+  the window has nothing left to overlap).
 * **Presentation is offline, never a fifth node.** A run can write
   `detections.jsonl` next to `records.jsonl` (`--detections` on the monolith,
   `detections:=` on the launch file) and `python -m yolocar.demo` renders it onto
@@ -484,7 +505,10 @@ type only at the very end.
   summary, ack and the detections sidecar), and timings accumulate so a split
   stage reports the same number as an unsplit one. The cell name
   `ros-N{x}-p{p}c{c}` is validated against the graph in `bench/run.py` (N must
-  be p+c+1 and the `chain:=` string must have N groups) and the shape lands in
+  be p+c+1, the `chain:=` string must have N groups, and every ROS cell must
+  pass `chain:=` at all -- a cell that inherits the launch default cannot be
+  checked, and the window token `-i{D}` is validated for every cell, not only
+  those whose name carries a shape) and the shape lands in
   `summary.provenance.shape`. `docs/proposals/chain-shapes.md` has the full
   table, the predictions and the two-tier measurement design. **The axis has
   not been measured yet** -- the cells exist, the numbers do not.
@@ -492,7 +516,7 @@ type only at the very end.
   paths are relative, and `yolocar` must be on `PYTHONPATH`
   (`PYTHONPATH=monolith/yolocar/src:$PYTHONPATH`) because there is no `pip` on
   the Jetson's `/usr/bin/python3` and the pipeline project is not installed
-  into the ROS workspace. The bench `ros-4node-*` cells do both.
+  into the ROS workspace. The bench `ros-N4-p2c1-*` cells do both.
 * **Never name a ROS package `yolocar`.** The scaffold was originally created as
   `yolocar`, which shares the import name of `monolith/yolocar/src/yolocar`, and
   because `~/.bashrc` sources `ws/install/setup.bash` the empty scaffold shadowed
@@ -522,7 +546,10 @@ type only at the very end.
   to compare against it later; nothing in it is source.
 * Test counts at the end of this session: 202 (`pytest monolith/yolocar`,
   including 18 hardware tests against the real engine, the detections sidecar,
-  the offline renderer and the CLI `--pre` path); 82 passed + 1 skipped
+  the offline renderer and the CLI `--pre` path); 10 (`pytest bench`, the scenario
+  contract: one conditioning chain in every cell, no legacy or duplicate names,
+  shape/window naming validated against the command, the per-(chain, resolution,
+  model) hint table); 82 passed + 1 skipped
   (`colcon test --packages-select yolocar_interfaces yolocar_ros`): ament lint,
   the records/summary contract, sidecar/records parity, the real-engine
   stage-split test, the launch file's partition policy for all eight shapes, the

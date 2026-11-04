@@ -320,9 +320,9 @@ def test_walk_drains_entries_the_log_does_not_cover(tmp_path: Path) -> None:
 def test_hud_reports_latency_and_transport(tmp_path: Path) -> None:
     clip = _clip(tmp_path / "clip.mp4")
     dets = _sidecar(tmp_path / "d.jsonl", clip)
-    side = load_side(f"ros-4node={dets},{_records(tmp_path / 'r.jsonl', transport=True)}")
+    side = load_side(f"ros-N4-p2c1={dets},{_records(tmp_path / 'r.jsonl', transport=True)}")
     lines = _hud_lines(side, 3, side.rows(3), side.times[3])
-    assert lines[0].startswith("ros-4node  seq 3")
+    assert lines[0].startswith("ros-N4-p2c1  seq 3")
     assert "lat 17.0 ms" in lines[1]
     assert "xport 60.0 ms" in lines[2]
 

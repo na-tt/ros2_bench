@@ -32,10 +32,10 @@ template, so the monolith and a ROS 2 launch file are configured the same way.
 
 Usage::
 
-    bench/run.py --repeats 3 --conditions monolith-720p-n,ros-4node-720p-n
+    bench/run.py --repeats 3 --conditions monolith-720p-n,ros-N4-p2c1-720p-n
     bench/run.py --dry-run                      # the whole matrix, planned
     bench/run.py --scenario bench/scenarios.json --out results/bench
-    bench/run.py --demo --conditions monolith,ros-4node
+    bench/run.py --demo --conditions monolith,ros-N4-p2c1
 """
 
 from __future__ import annotations
@@ -128,10 +128,17 @@ def matrix_conditions(
     a shape (the process plan does not change) but it is part of the cell's
     identity: the same chain, resolution and model at two windows are two
     different measurements of the same work, and the name has to say which.
+
+    The conditioning chain is **not** a coordinate: it is a constant of the
+    experiment, declared once under ``conditioning`` and injected into every
+    command. Every front-end, at every shape/resolution/model/window, has to
+    condition the frame identically, so the only axes a cell name may encode are
+    architecture, resolution, model and frames in flight.
     """
     factors = scenario.get("factors") or {}
     if not factors:
         return []  # legacy flat `conditions` scenario
+    ops = conditioning_ops(scenario)
     resolutions = factors.get("resolution") or {}  # type: ignore[union-attr]
     models = factors.get("model") or {}  # type: ignore[union-attr]
     chains = factors.get("chain") or {}  # type: ignore[union-attr]
@@ -190,6 +197,10 @@ def matrix_conditions(
             "inflight": inflight,
         }
         condition["inflight"] = inflight
+        #: The one conditioning chain, in the form the ROS launch takes. The
+        #: monolith template spells the same ops as repeated `--pre`; both are
+        #: checked against this list before anything launches.
+        condition["pre_ops"] = ";".join(ops)
         if resolution_spec.get("fps_scale"):  # type: ignore[union-attr]
             condition["fps_scale"] = resolution_spec["fps_scale"]  # type: ignore[index]
         if resolution_spec.get("clip_frames"):  # type: ignore[union-attr]
@@ -197,8 +208,23 @@ def matrix_conditions(
         if model_spec.get("note"):
             condition["note"] = model_spec["note"]  # type: ignore[index]
         check_cell_shape(name, condition)
+        check_cell_conditioning(name, condition, ops)
         out.append((name, condition))
     return out
+
+
+def conditioning_ops(scenario: dict[str, object]) -> list[str]:
+    """The experiment's one conditioning chain, in canonical order.
+
+    Declared once in ``scenarios.json`` under ``conditioning.ops``. It is not a
+    factor: a cell that ran a different chain would not be a different point on
+    an axis, it would be a different experiment, and the records cannot tell the
+    two apart (stage 2 is reported as a sum, so an empty chain reads ~0 and
+    looks faster).
+    """
+    block = scenario.get("conditioning") or {}
+    ops = block.get("ops") if isinstance(block, dict) else block
+    return [str(op) for op in (ops or [])]  # type: ignore[union-attr]
 
 
 # ------------------------------------------------------------ cell naming
@@ -229,31 +255,86 @@ def check_cell_shape(name: str, condition: dict[str, object]) -> None:
     arithmetic; the group count in the ``chain:=`` string is the graph itself.
     Both are checked here, before a single process is started, because a
     mislabelled cell is a mistake that survives all the way into the report.
+
+    The window (``-i{D}``) is checked for **every** cell, not only the ones whose
+    shape is in the name: the frames-in-flight curve is indexed by that token, so
+    a ``-i4`` cell that launches a window of one is misfiled silently. A ROS cell
+    must always pass ``chain:=``, for the same reason: the launch default is a
+    shape, and a cell that inherits it cannot be validated against its name.
     """
-    match = SHAPE_NAME.search(name)
-    if not match:
-        return
-    nodes, pixel, candidate = (int(part) for part in match.groups())
-    if nodes != pixel + candidate + 1:
-        raise SystemExit(
-            f"{name}: N{nodes} contradicts p{pixel}c{candidate} "
-            f"(N should be p+c+1 = {pixel + candidate + 1})"
-        )
     text = _command_text(condition)
     check_cell_inflight(name, condition, text)
-    shape = re.search(r'chain:=([^ ]+)', text)
-    if shape:
-        value = shape.group(1).rstrip('\'"')
-        groups = [group for group in value.split('|') if group]
-        if len(groups) != nodes:
+    match = SHAPE_NAME.search(name)
+    declared = None
+    if match:
+        nodes, pixel, candidate = (int(part) for part in match.groups())
+        if nodes != pixel + candidate + 1:
             raise SystemExit(
-                f"{name}: chain {value!r} has {len(groups)} process(es) "
-                f"but the name says N{nodes}"
+                f"{name}: N{nodes} contradicts p{pixel}c{candidate} "
+                f"(N should be p+c+1 = {pixel + candidate + 1})"
             )
-    elif "ros2 launch" in text:
+        declared = nodes
+    shape = re.search(r'chain:=([^ ]+)', text)
+    if shape is None:
+        if "ros2 launch" in text:
+            raise SystemExit(
+                f"{name}: a ROS cell must pass chain:=... so the shape it runs "
+                "is the shape it declares"
+            )
+        return
+    value = shape.group(1).rstrip('\'"')
+    groups = [group for group in value.split('|') if group]
+    if declared is not None and len(groups) != declared:
         raise SystemExit(
-            f"{name}: a ros-N cell must pass chain:=... so the shape it names "
-            "is the shape it runs"
+            f"{name}: chain {value!r} has {len(groups)} process(es) "
+            f"but the name says N{declared}"
+        )
+
+
+def check_cell_conditioning(
+    name: str, condition: dict[str, object], ops: list[str]
+) -> None:
+    """Reject a cell that does not run the experiment's conditioning chain.
+
+    The chain is a constant, so there is nothing to encode in the name -- which
+    is exactly why it needs a check: a cell that silently skipped stage 2 is
+    still a valid-looking name and still produces records, and because
+    ``pre_ms`` is a sum, the missing ops read as *better* performance. Both
+    front-ends are checked in the form they actually take: repeated ``--pre`` for
+    the monolith, ``pre_ops:=`` for the launch file.
+    """
+    if not ops:
+        raise SystemExit(
+            "scenario has no 'conditioning.ops': the conditioning chain is a "
+            "constant of the experiment, not an optional knob"
+        )
+    text = _command_text(condition).replace("{pre_ops}", ";".join(ops))
+    if "ros2 launch" in text:
+        match = re.search(r'pre_ops:=([^ ]+)', text)
+        if match is None:
+            raise SystemExit(
+                f"{name}: a ROS cell must pass pre_ops:=... "
+                f"(the chain has {len(ops)} ops)"
+            )
+        actual = [op for op in match.group(1).rstrip('\'"').split(';') if op]
+    else:
+        cmd = condition.get("cmd")
+        if not isinstance(cmd, list):
+            raise SystemExit(
+                f"{name}: cannot check the conditioning chain of a command "
+                "that is not an argv list"
+            )
+        actual = []
+        for index, part in enumerate(cmd):
+            if str(part) != "--pre":
+                continue
+            if index + 1 >= len(cmd):
+                raise SystemExit(f"{name}: --pre with no value")
+            actual.append(str(cmd[index + 1]))
+    if actual != ops:
+        raise SystemExit(
+            f"{name}: conditioning chain is {actual!r}, but the experiment's "
+            f"constant is {ops!r}"
         )
 
 
@@ -269,8 +350,17 @@ def check_cell_inflight(
     declared = int(condition.get("inflight", 1))
     named = INFLIGHT_NAME.search(name)
     named_value = int(named.group(1)) if named else 1
-    passed = re.search(r'inflight:=["\']?(\d+)', text)
-    passed_value = int(passed.group(1)) if passed else None
+    # The command is a template at this point: `inflight:={inflight}` has not
+    # been expanded yet, and the placeholder is the truthful form (it is what
+    # the trial loop will substitute).
+    text = text.replace("{inflight}", str(declared))
+    passed = re.search(r'inflight:=(["\']?)(\d+)', text)
+    passed_value = int(passed.group(2)) if passed else None
+    if passed_value is None and "ros2 launch" in text and declared != 1:
+        raise SystemExit(
+            f"{name}: a windowed ROS cell must pass inflight:={declared} "
+            "(the launch default is 1, so the name would be a lie)"
+        )
     if passed_value is not None and passed_value != declared:
         raise SystemExit(
             f"{name}: command passes inflight:={passed_value} but the cell "
@@ -410,12 +500,13 @@ DEFAULT_FPS_HINT = 30.0
 def _fps_hint(condition: dict[str, object], scenario: dict[str, object]) -> float:
     """Best available guess of this cell's frame rate, only ever used to size a box.
 
-    Order: an explicit per-cell override, the scenario's chain/model table scaled
-    by the resolution, then a flat default. The table should be a *measured* rate
-    with a little taken off: over-estimating shortens the time ceiling until the
-    window comes up short (``analyze.py`` warns), while under-estimating only
-    costs a few seconds of extra run. See ``trial_budget`` for why a wrong hint
-    also puts the frame cap in the wrong place.
+    Order: an explicit per-cell override, the scenario's
+    ``chain -> resolution -> model`` table (or the older ``chain -> model`` form
+    with a ``fps_scale`` on the resolution), then a flat default. The table should
+    be a *measured* rate with a little taken off: over-estimating shortens the
+    time ceiling until the window comes up short (``analyze.py`` warns), while
+    under-estimating only costs a few seconds of extra run. See ``trial_budget``
+    for why a wrong hint also puts the frame cap in the wrong place.
     """
     if condition.get("fps_hint"):
         return float(condition["fps_hint"])  # type: ignore[arg-type]
@@ -424,6 +515,12 @@ def _fps_hint(condition: dict[str, object], scenario: dict[str, object]) -> floa
     cell = condition.get("cell") or {}
     if isinstance(table, dict) and cell:
         row = table.get(cell.get("chain")) or {}
+        # Nested form: the resolution is a level of the table, because the ops
+        # and the model do not scale with pixels the same way -- one scalar per
+        # chain cannot describe both ends of the resolution axis.
+        resolution = cell.get("resolution")
+        if isinstance(row, dict) and isinstance(row.get(resolution), dict):
+            row = row[resolution]  # type: ignore[index]
         base = row.get(cell.get("model")) if isinstance(row, dict) else None
         if base:
             return float(base) * float(condition.get("fps_scale", 1.0))
@@ -513,6 +610,7 @@ def run_demo(scenario: dict[str, object], args: argparse.Namespace) -> int:
         "source": str(scenario.get("source", "")),
         "loops": str(artifacts.get("loops", 1)),  # type: ignore[union-attr]
         "demo": str(out_root),
+        "pre_ops": ";".join(conditioning_ops(scenario)),
     }
 
     steps: list[tuple[str, dict[str, object], dict[str, str], Path]] = []
@@ -798,6 +896,7 @@ def main(argv: list[str] | None = None) -> int:
                 "repeat": str(repeat + 1),
                 "loops": str(budget["loops"]),
                 "inflight": str(condition.get("inflight", 1)),
+                "pre_ops": str(condition.get("pre_ops", "")),
             }
             command = build_argv(condition, context)
             env = os.environ.copy()

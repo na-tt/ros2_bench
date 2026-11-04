@@ -9,10 +9,15 @@ something. Read it once before quoting a number from a report.
 Every number used as a worked example below is from `results/bench/` of the
 first full matrix run (3 passes, window = `settle_s 30` + `analysis_frames 2500`,
 anchor `monolith-720p-n`), so you can recompute all of it with `analyze.py` from
-the same directory. The one exception is the A/A pair in *Level 3*, which comes
-from the retired `monolith-ctrl` cell of an earlier session and is labelled as
-such -- it is kept because a duplicate cell is the clearest way to show a delta
-that is *not* a difference.
+the same directory. That run predates the conditioning chain becoming a constant
+of the experiment: its cells ran stage 2 empty and the ROS ones are filed under
+the then-current name `ros-4node-*` (now `ros-N4-p2c1-*`). The artefacts are
+still on disk under those names, so the examples keep them; a re-run under the
+current scenario is a *different workload* (the seven ops cost ~103.5 ms/frame at
+720p) and its numbers are not comparable to these. The other exception is the
+A/A pair in *Level 3*, which comes from the retired `monolith-ctrl` cell of an
+earlier session and is labelled as such -- it is kept because a duplicate cell is
+the clearest way to show a delta that is *not* a difference.
 
 ## Words
 

@@ -228,7 +228,7 @@ python3 -m yolocar.demo \
 # two runs -> one composite, each panel at its own pace
 python3 -m yolocar.demo --source assets/video/0000f77c-6257be58.mov --rotate 180 \
     --compare monolith=results/demo/monolith/detections.jsonl,results/demo/monolith/records.jsonl \
-              ros-4node=results/demo/ros-4node/detections.jsonl,results/demo/ros-4node/records.jsonl \
+              ros-N4-p2c1=results/demo/ros-N4-p2c1/detections.jsonl,results/demo/ros-N4-p2c1/records.jsonl \
     --out results/demo/compare.mp4 --timing wall --hud
 
 # watch a finished run at its real pace (no file, no viewer node needed)

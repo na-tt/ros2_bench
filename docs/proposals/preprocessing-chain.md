@@ -202,6 +202,6 @@ interleaving, no anchor delta. The k x A grid below is what would make it one.
 * In-flight depth > 1 (the only configuration in which partitioning can win).
 * The dynamic-shape engine / per-resolution `imgsz` run (Decision 2).
 * `bench/scenarios.json` cells for the k x A grid: they are `pre_ops`/
-  `pre_split` values on the existing `ros-4node` template, so they can be added
+  `pre_split` values on the existing `ros-N4-p2c1` template, so they can be added
   without touching the harness -- but the budget question (3 ops x 3 chain
   depths x 3 resolutions x 3 passes) is an operator decision, not a code one.

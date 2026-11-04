@@ -1,9 +1,12 @@
 # Frames in flight: trading latency for throughput
 
 Status: **mechanism implemented, harness and analyser wired, tier 1 measured
-once** (3 passes, 720p, `ros-4node`) -- on a board running at 94-97 % load, so
-the ladder's *shape* is informative and its absolute numbers are not. Tiers 2-3
-are unmeasured.
+once** (3 passes, 720p, the cell now called `ros-N4-p2c1`) -- on a board running
+at 94-97 % load, so the ladder's *shape* is informative and its absolute numbers
+are not. That run predates the conditioning chain becoming a constant of the
+experiment: its `i1` cell ran stage 2 empty, so every measured number here is
+about 100 ms/frame cheaper at 720p than the ladder the harness now launches.
+Tiers 2-3 are unmeasured.
 
 Related: `chain-shapes.md` (which shape, i.e. how many processes), and
 `preprocessing-chain.md` (why the model contract lives in the inference node).
@@ -83,9 +86,17 @@ D* = Σ s_i / max s_i
 
 `D*` is *not* the node count. It equals `N` only for a perfectly balanced chain;
 this one is not, because inference plus its inbound hop is roughly half the
-residency. From the measured `ros-4node` cells (`Σ ≈ 34-50 ms`,
-`max ≈ 17-20 ms`) the prediction is **`D* ≈ 2`**, i.e. the whole throughput
-dividend arrives at a window of two and everything beyond it is pure cost.
+residency. From the measured op-free cells (`Σ ≈ 34-50 ms`, `max ≈ 17-20 ms`)
+the prediction was **`D* ≈ 2`**, i.e. the whole throughput dividend arrives at a
+window of two and everything beyond it is pure cost.
+
+**The conditioning chain moves that knee, because it unbalances the chain.**
+Every cell now runs the seven ops, and they cost 103.5 ms/frame at 720p against a
+~20 ms inference node: `pre` becomes the bottleneck, `Σs / max s` falls to
+≈1.3, so the whole dividend arrives at `D=2` and every extra frame beyond it is
+pure latency. The ceiling there is flat at `1/103.5 ms ≈ 9.7 fps` whatever `D`
+is. At 180p the ops are 13.6 ms and the op-free estimate roughly holds. The model
+is unchanged; the per-stage residencies it consumes are not.
 
 ## Predictions (written before the matrix, so they can fail)
 
@@ -125,8 +136,9 @@ argument for partitioning, because latency only gets worse.
 
 ## Mechanism check (180p smoke, not a result)
 
-`ros-4node` at 180p, no conditioning chain, 2 passes, 200-frame windows,
-`settle_s=5` (the ladder's real cells use 45 s):
+`ros-N4-p2c1` at 180p, **no conditioning chain** (historic: this was the chain
+before stage 2 became a constant, so the ladder now runs ~13.6 ms/frame more),
+2 passes, 200-frame windows, `settle_s=5` (the ladder's real cells use 45 s):
 
 | `i` | fill | fps | p50 ms | p99 ms | hop ms | cores | J/f |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -148,13 +160,13 @@ must be in the same invocation (the global `anchor` stays the monolith).
 
 | tier | cells | why | est. | state |
 | --- | --- | --- | --- | --- |
-| 1 | `ros-4node-720p-n` x {1,2,4,8} + `monolith-720p-n` | the knee, at the resolution where hops cost bytes | ~40 min | measured once, loaded board |
-| 2 | `ros-4node-180p-n` x {1,2,4,8} | H4: cheaper hops should lower `D*` and raise the peak | ~35 min | to do |
+| 1 | `ros-N4-p2c1-720p-n` x {1,2,4,8} + `monolith-720p-n` | the knee, at the resolution where hops cost bytes | ~2 h | measured once, loaded board, op-free |
+| 2 | `ros-N4-p2c1-180p-n` x {1,2,4,8} | H4: cheaper hops should lower `D*` and raise the peak | ~1 h | to do |
 | 3 | `ros-N12-p8c3-720p-n` x {1,2,4} | 12 nodes, 6 cores: the *machine* saturates before the pipeline | ~60-70 min | to do |
 
 ```bash
 bench/run.py --out results/fif1 --conditions \
-  monolith-720p-n,ros-4node-720p-n,ros-4node-720p-n-i2,ros-4node-720p-n-i4,ros-4node-720p-n-i8
+  monolith-720p-n,ros-N4-p2c1-720p-n,ros-N4-p2c1-720p-n-i2,ros-N4-p2c1-720p-n-i4,ros-N4-p2c1-720p-n-i8
 bench/analyze.py --dir results/fif1 --md results/fif1/report.md --json results/fif1/report.json
 ```
 
@@ -167,7 +179,9 @@ change to the machine policy (no affinity, governor, GC or clock pinning).
 
 Same session throughout, cells interleaved in one block, so the within-pass
 deltas hold even though the board did not (see the caveats). `i1` is the same
-chain as the historical `ros-4node-720p-n`, so this run also re-measures it:
+graph as `ros-N4-p2c1-720p-n` was under the old, op-free scenario, so this run
+also re-measures it -- but **it is not the cell the harness now launches**: add
+~103.5 ms/frame for the conditioning chain before comparing a fresh `i1` to it.
 
 | `i` | fill | frames | fps | p50 ms | p95 ms | p99 ms | hop ms | cpu ms/f | cores | W | J/f |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
