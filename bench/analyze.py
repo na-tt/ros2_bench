@@ -351,6 +351,28 @@ def summarise_trial(
     return result
 
 
+def _budgeted_settle(trial_dir: Path) -> float | None:
+    """Settling seconds the orchestrator actually gave this trial.
+
+    ``run.py`` writes its resolved budget into ``run.meta.json``, and the budget
+    is per cell: a windowed cell (``-iD``) settles longer than a demand-driven one
+    because it is a different power and thermal state. Reading it back is what
+    keeps a mixed run honest -- one global settle for the whole report would
+    leave 15 s of the longer ramp inside the window of every ``-iD`` cell, and
+    the matrix now has hundreds of them.
+    """
+    path = trial_dir / "run.meta.json"
+    if not path.is_file():
+        return None
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    budget = meta.get("budget")
+    value = budget.get("settle_s") if isinstance(budget, dict) else None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
 def collect(
     root: Path,
     *,
@@ -359,14 +381,20 @@ def collect(
     to_s: float | None,
     records_name: str,
     sampler_name: str,
+    use_budget: bool = False,
 ) -> list[dict[str, Any]]:
     trials: list[dict[str, Any]] = []
     for trial_dir in sorted(root.glob("*/r*")):
         if not trial_dir.is_dir():
             continue
+        settle = settle_s
+        if use_budget:
+            budgeted = _budgeted_settle(trial_dir)
+            if budgeted is not None:
+                settle = budgeted
         trial = summarise_trial(
             trial_dir,
-            settle_s=settle_s,
+            settle_s=settle,
             frames=frames,
             to_s=to_s,
             records_name=records_name,
@@ -868,6 +896,7 @@ def plot_timelines(
     to_s: float | None,
     out_dir: Path,
     records_name: str,
+    use_budget: bool = False,
 ) -> list[Path]:
     """One two-panel latency figure per condition (first usable trial).
 
@@ -901,6 +930,11 @@ def plot_timelines(
         records = _rows(trial / records_name)
         if not records:
             continue
+        settle = settle_s
+        if use_budget:
+            budgeted = _budgeted_settle(trial)
+            if budgeted is not None:
+                settle = budgeted
 
         origin = records[0]["t_mono"]
         seconds = [record["t_mono"] - origin for record in records]
@@ -925,7 +959,7 @@ def plot_timelines(
                 )
 
             low, high = window_indices(
-                records, settle_s=settle_s, frames=frames, to_s=to_s
+                records, settle_s=settle, frames=frames, to_s=to_s
             )
             if low < high and (low > 0 or high < len(records)):
                 start, window_end = seconds[low], seconds[high - 1]
@@ -1338,6 +1372,10 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError):
         defaults = {}
     settle_s = args.from_s if args.from_s is not None else args.settle
+    #: With no explicit window, each trial is analysed with the settle it was
+    #: actually budgeted with (30 s, 45 s for a windowed cell); the scenario's
+    #: value is only the fallback for trials that predate `run.meta.json`.
+    use_budget = settle_s is None
     if settle_s is None:
         settle_s = defaults.get("settle_s")
     window_frames = args.frames if args.frames is not None else defaults.get("analysis_frames")
@@ -1349,6 +1387,7 @@ def main(argv: list[str] | None = None) -> int:
         to_s=args.to_s,
         records_name=args.records,
         sampler_name=args.sampler,
+        use_budget=use_budget,
     )
     if not trials:
         raise SystemExit(
@@ -1368,9 +1407,14 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("no usable trials: every trial was excluded (see warnings above)")
     spans = [trial["window_s"] for trial in trials if trial.get("window_s")]
     span_note = f" (median span {statistics.median(spans):.1f}s)" if spans else ""
+    settle_label = (
+        f"each trial's budgeted settle (scenario default {settle_s or 0:g}s)"
+        if use_budget
+        else f"{settle_s or 0:g}s of settling"
+    )
     if window_frames:
         window = (
-            f"first {int(window_frames)} frames after {settle_s or 0:g}s of settling"
+            f"first {int(window_frames)} frames after {settle_label}"
             + span_note
         )
     else:
@@ -1426,6 +1470,7 @@ def main(argv: list[str] | None = None) -> int:
             to_s=args.to_s,
             out_dir=args.timeline_out,
             records_name=args.records,
+            use_budget=use_budget,
         )
         for path in written:
             print(f"timeline -> {path}", file=sys.stderr)

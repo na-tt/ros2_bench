@@ -34,8 +34,17 @@ Usage::
 
     bench/run.py --repeats 3 --conditions monolith-720p-n,ros-N4-p2c1-720p-n
     bench/run.py --dry-run                      # the whole matrix, planned
+    bench/run.py --design full                  # every combination: 297 cells
     bench/run.py --scenario bench/scenarios.json --out results/bench
     bench/run.py --demo --conditions monolith,ros-N4-p2c1
+
+``--design`` picks which cells exist: ``scenario`` (default) measures the pruned
+``design.cells`` list -- the cheap matrix, run as subsets -- while ``full``
+expands every chain x resolution x model x window combination. The full matrix is
+a long haul (297 cells, 891 trials at three passes) and is meant for a dedicated
+session with its own ``--out``; ``--conditions`` still selects a subset of it, so
+a full-design session can be done in pieces as long as every piece contains the
+anchor.
 """
 
 from __future__ import annotations
@@ -113,10 +122,70 @@ def build_argv(condition: dict[str, object], context: dict[str, str]) -> list[st
     return [str(part) for part in expanded]
 
 
+def chain_windows(chain_spec: dict[str, object]) -> list[int]:
+    """The frames-in-flight values a chain may be measured at.
+
+    Declared per chain factor as ``windows`` (``[1]`` for the monolith, which is
+    one thread by construction). It is the domain of the fourth coordinate: the
+    pruned ``design.cells`` list picks points out of it, ``--design full``
+    expands all of it. A design cell outside the domain is rejected, so the two
+    cannot drift apart.
+    """
+    windows = chain_spec.get("windows") or [1]
+    values = sorted({int(window) for window in windows})  # type: ignore[union-attr]
+    if not values or values[0] < 1:
+        raise SystemExit(f"chain 'windows' must be >= 1, got {windows!r}")
+    return values
+
+
+def full_design(
+    resolutions: dict[str, object],
+    models: dict[str, object],
+    chains: dict[str, object],
+    reference: object = None,
+) -> list[list[object]]:
+    """Every combination the factors admit: chain x resolution x model x window.
+
+    This is what ``--design full`` (and a scenario with no ``design.cells``)
+    measures -- 9 monolith cells plus 8 ROS shapes x 3 resolutions x 3 models x
+    4 windows = 297 here. It is ordered ``resolution -> model -> chain ->
+    window`` on purpose: ``order.block_by: [resolution, model]`` then puts each
+    (resolution, model) block's cells in *family* order, so a chain's window
+    ladder stays contiguous inside the block. ``reference`` (the scenario's
+    ``reference_chain``) is placed first among the chains, which puts the
+    headline pair -- the monolith and the four-node chain, same footage, same
+    model, window of one -- in adjacent slots of every block instead of ten
+    trials apart.
+    """
+    order = [
+        name for name, spec in chains.items() if isinstance(spec, dict)
+    ]  # skip the table's `note`
+    if reference in order:
+        order.remove(str(reference))
+        # Immediately after the first declared chain (the monolith), so the
+        # headline pair shares a slot boundary in every block.
+        order.insert(1 if order else 0, str(reference))
+    return [
+        [chain_name, resolution_name, model_name, inflight]
+        for resolution_name, resolution_spec in resolutions.items()
+        if isinstance(resolution_spec, dict)
+        for model_name, model_spec in models.items()
+        if isinstance(model_spec, dict)
+        for chain_name in order
+        for inflight in chain_windows(chains[chain_name])  # type: ignore[arg-type]
+    ]
+
+
 def matrix_conditions(
-    scenario: dict[str, object],
+    scenario: dict[str, object], design: str = "scenario"
 ) -> list[tuple[str, dict[str, object]]]:
     """Expand ``factors`` x ``design`` into ``(cell name, condition)`` pairs.
+
+    ``design`` selects the cell list: ``scenario`` (the pruned ``design.cells``
+    in ``scenarios.json``, the cheap matrix every ordinary run measures) or
+    ``full`` (every factor combination, windows included -- ``full_design``).
+    An absent ``design.cells`` means ``full`` too, so the file can say "all of
+    it" by saying nothing.
 
     A cell inherits the command template of its chain and gets the resolution's
     source/rotation and the model's engine path injected as ``source`` /
@@ -127,7 +196,8 @@ def matrix_conditions(
     A fourth coordinate, ``inflight``, is optional and defaults to 1. It is not
     a shape (the process plan does not change) but it is part of the cell's
     identity: the same chain, resolution and model at two windows are two
-    different measurements of the same work, and the name has to say which.
+    different measurements of the same work, and the name has to say which. Its
+    domain comes from the chain factor's ``windows`` list.
 
     The conditioning chain is **not** a coordinate: it is a constant of the
     experiment, declared once under ``conditioning`` and injected into every
@@ -144,16 +214,20 @@ def matrix_conditions(
     chains = factors.get("chain") or {}  # type: ignore[union-attr]
     if not (resolutions and models and chains):
         raise SystemExit("factors needs 'chain', 'resolution' and 'model' tables")
+    if design not in ("scenario", "full"):
+        raise SystemExit(f"unknown design {design!r} (expected scenario or full)")
 
-    design = scenario.get("design") or {}
-    cells = design.get("cells") if isinstance(design, dict) else design
+    block = scenario.get("design") or {}
+    cells = block.get("cells") if isinstance(block, dict) else block
+    if design == "full":
+        cells = None
     if not cells:
-        cells = [
-            [chain, resolution, model]
-            for chain in chains
-            for resolution in resolutions
-            for model in models
-        ]
+        cells = full_design(
+            resolutions,
+            models,
+            chains,
+            scenario.get("reference_chain"),
+        )
 
     out: list[tuple[str, dict[str, object]]] = []
     seen: set[str] = set()
@@ -174,6 +248,13 @@ def matrix_conditions(
         ):
             if value not in table:  # type: ignore[operator]
                 raise SystemExit(f"design cell names unknown {label}: {value!r}")
+        windows = chain_windows(chains[chain_name])  # type: ignore[index]
+        if inflight not in windows:
+            raise SystemExit(
+                f"design cell {chain_name}-{resolution_name}-{model_name} wants "
+                f"inflight={inflight}, but {chain_name} declares windows "
+                f"{windows}"
+            )
 
         name = f"{chain_name}-{resolution_name}-{model_name}"
         if inflight != 1:
@@ -184,7 +265,12 @@ def matrix_conditions(
 
         resolution_spec = resolutions[resolution_name]  # type: ignore[index]
         model_spec = models[model_name]  # type: ignore[index]
-        condition = dict(chains[chain_name])  # type: ignore[index]
+        # ``windows`` is metadata about the factor, not a field of the command.
+        condition = {
+            key: value
+            for key, value in chains[chain_name].items()  # type: ignore[union-attr]
+            if key != "windows"
+        }
         condition["rotate"] = resolution_spec.get("rotate", 0)  # type: ignore[union-attr]
         condition["source"] = resolution_spec.get(  # type: ignore[union-attr]
             "source", scenario.get("source", "")
@@ -205,6 +291,8 @@ def matrix_conditions(
             condition["fps_scale"] = resolution_spec["fps_scale"]  # type: ignore[index]
         if resolution_spec.get("clip_frames"):  # type: ignore[union-attr]
             condition["clip_frames"] = resolution_spec["clip_frames"]  # type: ignore[index]
+        if resolution_spec.get("frame_mb"):  # type: ignore[union-attr]
+            condition["frame_mb"] = resolution_spec["frame_mb"]  # type: ignore[index]
         if model_spec.get("note"):
             condition["note"] = model_spec["note"]  # type: ignore[index]
         check_cell_shape(name, condition)
@@ -496,17 +584,198 @@ def build_schedule(
 # --------------------------------------------------------------- trial budget
 DEFAULT_FPS_HINT = 30.0
 
+#: Stages that emit a BGR frame onto the wire, and stages that emit
+#: ``Candidates`` (kilobytes). ``coord`` is the terminal stage: it publishes
+#: nothing, so it contributes no hop.
+PIXEL_PUBLISHERS = ("acq", "pre")
+CANDIDATE_PUBLISHERS = ("infer", "nms", "filter")
+
+#: The single-process pipeline, as one "group" of stages.
+MONOLITH_STAGES = ("acq", "pre", "infer", "post")
+
+
+def _stage_ms(
+    stage: str, cell: dict[str, object], scenario: dict[str, object]
+) -> float | None:
+    """Cost of one pipeline stage, from ``fps_model.stage_ms``.
+
+    The table is keyed by whichever factor the stage scales with: resolution for
+    decode/conditioning/postprocessing, model for the engine.
+    """
+    model = scenario.get("fps_model") or {}
+    table = model.get("stage_ms") if isinstance(model, dict) else None
+    row = table.get(stage) if isinstance(table, dict) else None
+    if not isinstance(row, dict):
+        return None
+    for key in (cell.get("resolution"), cell.get("model")):
+        if key is None:
+            continue
+        value = row.get(str(key))
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _hop_ms(
+    publisher: str, condition: dict[str, object], scenario: dict[str, object]
+) -> float | None:
+    """Cost of one hop, priced by the payload its publisher emits.
+
+    Same shape as the fitted transport model in ``bench/README.md``: a fixed
+    cost per hop plus a per-megabyte term for a frame. A candidate hop carries
+    kilobytes, so it is a one-number entry.
+    """
+    model = scenario.get("fps_model") or {}
+    hop = model.get("hop_ms") if isinstance(model, dict) else None
+    if not isinstance(hop, dict):
+        return None
+    if publisher in CANDIDATE_PUBLISHERS:
+        value = hop.get("candidate")
+        return float(value) if isinstance(value, (int, float)) else None
+    if publisher in PIXEL_PUBLISHERS:
+        fixed = hop.get("fixed")
+        per_mb = hop.get("per_mb")
+        frame_mb = condition.get("frame_mb")
+        numbers = (fixed, per_mb, frame_mb)
+        if not all(isinstance(number, (int, float)) for number in numbers):
+            return None
+        return float(fixed) + float(per_mb) * float(frame_mb)  # type: ignore[arg-type]
+    return None  # terminal stage: nothing published
+
+
+def _chain_groups(condition: dict[str, object]) -> list[list[str]] | None:
+    """The process plan, read off the ``chain:=`` string a ROS cell passes.
+
+    ``acq|pre|infer|post`` is four processes, ``acq|pre+infer+post`` is two. This
+    is the same string ``check_cell_shape`` validates against the cell name, so a
+    shape that can be launched can also be costed.
+    """
+    match = re.search(r'chain:=([^ "\']+)', _command_text(condition))
+    if match is None:
+        return None
+    groups = [group.split("+") for group in match.group(1).split("|") if group]
+    return groups or None
+
+
+def _residencies(
+    condition: dict[str, object], scenario: dict[str, object]
+) -> list[float] | None:
+    """Per-process residency of one frame, in milliseconds.
+
+    Each process pays for the stages it runs plus the hop out of it (the
+    serialisation happens in its thread) plus a small per-process overhead, and a
+    hop costs what its publisher's payload costs. One subtlety: ``pre`` is the
+    *whole* conditioning chain, so a stage-2 split (``chain:=acq|pre|pre|...`` or
+    ``pre_groups:=2,5``) divides that cost across the groups that run it --
+    otherwise the twelve-process shape would be charged seven full chains.
+
+    ``None`` whenever a number the model needs is missing: a guess is worse than
+    falling back to the flat default.
+    """
+    groups = _chain_groups(condition)
+    if groups is None:
+        if "ros2 launch" in _command_text(condition):
+            return None
+        groups = [list(MONOLITH_STAGES)]
+    cell = condition.get("cell") or {}
+    if not isinstance(cell, dict):
+        return None
+    model = scenario.get("fps_model") or {}
+    if not isinstance(model, dict):
+        model = {}
+    node_ms = float(model.get("node_ms", 0.0))  # type: ignore[arg-type]
+    pre_total = _stage_ms("pre", cell, scenario)
+    pre_groups = sum(group.count("pre") for group in groups)
+    out: list[float] = []
+    for index, group in enumerate(groups):
+        total = node_ms
+        for stage in group:
+            if stage == "pre" and pre_groups > 1 and pre_total is not None:
+                total += pre_total / pre_groups
+                continue
+            cost = _stage_ms(stage, cell, scenario)
+            if cost is None:
+                return None
+            total += cost
+        if index + 1 < len(groups):
+            hop = _hop_ms(group[-1], condition, scenario)
+            if hop is None:
+                return None
+            total += hop
+        out.append(total)
+    return out
+
+
+def _fps_from_model(
+    condition: dict[str, object], scenario: dict[str, object]
+) -> float | None:
+    """Derive a frame-rate hint from the closed-loop model.
+
+    *``X = min(D / sum(residency), 1 / max(residency))``*: with ``D`` frames in
+    flight the loop cannot go faster than the frame that takes longest, and the
+    knee is at ``D* = sum(residency) / max(residency)``. Two corrections keep the
+    number on the safe side, because only an *over*-estimate costs data (the
+    ceiling truncates the window; an under-estimate just runs a little longer):
+    a ``pessimism`` factor on the rate, and ``window_gain_cap`` on what a window
+    may buy -- the one window gain measured on this board was 1.5x (op-free at
+    180p, 29.5 -> 44.2 fps), well under what the closed model allows, because
+    queueing and DDS overhead grow with the window too.
+
+    This is what makes ``--design full`` measurable: 297 cells cannot all have a
+    hand-measured hint, and an *optimistic* hint is the failure that costs data
+    (the ceiling truncates the window), while an under-estimate only runs a
+    little longer. Cells the ``trial.fps_hint`` table does cover never reach
+    here -- a measured number always wins over a derived one.
+    """
+    model = scenario.get("fps_model") or {}
+    if not isinstance(model, dict) or not model.get("stage_ms"):
+        return None
+    residencies = _residencies(condition, scenario)
+    if not residencies or min(residencies) <= 0:
+        return None
+    pessimism = float(model.get("pessimism", 0.6))  # type: ignore[arg-type]
+    total = sum(residencies) / 1000.0
+    gain = _window_gain(condition, scenario)
+    return max(0.5, round(pessimism * gain / total, 2))
+
+
+def _window_gain(
+    condition: dict[str, object], scenario: dict[str, object]
+) -> float:
+    """How much throughput a window of ``D`` can add over the same cell at 1.
+
+    From the same closed loop as ``_fps_from_model``: ``X(D) / X(1)`` collapses to
+    ``min(D, D*)`` with the knee ``D* = sum(residency) / max(residency)`` -- no
+    window buys more than the loop's slowest frame allows, which is why the
+    process count is not the knee. Used to carry a *measured* window-of-one hint
+    to a windowed cell of the same family instead of measuring every rung.
+    """
+    inflight = int(condition.get("inflight", 1))
+    if inflight <= 1:
+        return 1.0
+    residencies = _residencies(condition, scenario)
+    if not residencies or min(residencies) <= 0:
+        return 1.0
+    knee = sum(residencies) / max(residencies)
+    model = scenario.get("fps_model") or {}
+    cap = float(model.get("window_gain_cap", 1.5)) if isinstance(model, dict) else 1.5
+    return max(1.0, min(float(inflight), knee, cap))
+
 
 def _fps_hint(condition: dict[str, object], scenario: dict[str, object]) -> float:
     """Best available guess of this cell's frame rate, only ever used to size a box.
 
     Order: an explicit per-cell override, the scenario's
     ``chain -> resolution -> model`` table (or the older ``chain -> model`` form
-    with a ``fps_scale`` on the resolution), then a flat default. The table should
-    be a *measured* rate with a little taken off: over-estimating shortens the
-    time ceiling until the window comes up short (``analyze.py`` warns), while
-    under-estimating only costs a few seconds of extra run. See ``trial_budget``
-    for why a wrong hint also puts the frame cap in the wrong place.
+    with a ``fps_scale`` on the resolution), the derived closed-loop model
+    (``_fps_from_model``), then a flat default. The first two are measurements
+    with the margin already taken off; the third is a derivation used where no
+    measurement exists yet (every cell of ``--design full`` that is not in the
+    pruned matrix). An over-estimate shortens a trial's ceiling until the window
+    comes up short (``analyze.py`` warns), while under-estimating only costs a
+    few seconds of extra run -- so the fallbacks are deliberately conservative.
+    See ``trial_budget`` for why a wrong hint also puts the frame cap in the
+    wrong place.
     """
     if condition.get("fps_hint"):
         return float(condition["fps_hint"])  # type: ignore[arg-type]
@@ -523,10 +792,43 @@ def _fps_hint(condition: dict[str, object], scenario: dict[str, object]) -> floa
             row = row[resolution]  # type: ignore[index]
         base = row.get(cell.get("model")) if isinstance(row, dict) else None
         if base:
-            return float(base) * float(condition.get("fps_scale", 1.0))
+            # The table holds window-of-one measurements, so a windowed cell is
+            # scaled by the loop's gain over one rather than inheriting the
+            # demand-driven rate unchanged.
+            return round(
+                float(base)
+                * float(condition.get("fps_scale", 1.0))
+                * _window_gain(condition, scenario),
+                2,
+            )
     if isinstance(table, (int, float)):
         return float(table)
+    derived = _fps_from_model(condition, scenario)
+    if derived is not None:
+        return derived
     return DEFAULT_FPS_HINT
+
+
+def _settle_s(
+    condition: dict[str, object], trial: dict[str, object], override: float | None
+) -> float:
+    """Settling seconds for one trial.
+
+    A windowed cell (`-iD`) is a different power and thermal state from the
+    demand-driven one, so the scenario can declare a longer ramp for it
+    (``trial.settle_s_windowed``) instead of every window cell repeating the same
+    override in ``cells``. Explicit per-cell overrides still win, and the CLI
+    wins over everything.
+    """
+    if override is not None:
+        return float(override)
+    if condition.get("settle_s"):
+        return float(condition["settle_s"])  # type: ignore[arg-type]
+    inflight = int(condition.get("inflight", 1))
+    windowed = trial.get("settle_s_windowed")
+    if inflight > 1 and isinstance(windowed, (int, float)):
+        return float(windowed)
+    return float(trial.get("settle_s", 30.0))  # type: ignore[arg-type]
 
 
 def trial_budget(
@@ -553,11 +855,7 @@ def trial_budget(
     trial = scenario.get("trial") or {}
     trial = trial if isinstance(trial, dict) else {}
     fps = _fps_hint(condition, scenario)
-    settle_s = float(
-        settle
-        if settle is not None
-        else condition.get("settle_s") or trial.get("settle_s", 30.0)
-    )
+    settle_s = _settle_s(condition, trial, settle)
     frames = int(
         analysis_frames
         if analysis_frames is not None
@@ -765,6 +1063,17 @@ def main(argv: list[str] | None = None) -> int:
         "--conditions", default=None, help="comma separated subset by name"
     )
     parser.add_argument(
+        "--design",
+        choices=("scenario", "full"),
+        default="scenario",
+        help=(
+            "which cell list to expand: 'scenario' (the pruned design.cells in "
+            "scenarios.json, default) or 'full' (every chain x resolution x "
+            "model x window combination; 297 cells here, 891 trials at "
+            "--repeats 3)"
+        ),
+    )
+    parser.add_argument(
         "--gap", type=float, default=5.0, help="seconds to idle between trials"
     )
     parser.add_argument(
@@ -791,10 +1100,18 @@ def main(argv: list[str] | None = None) -> int:
     out_root = Path(args.out or scenario.get("out_dir") or (REPO / "results/bench"))
     if not out_root.is_absolute():
         out_root = (REPO / out_root).resolve()
+    default_root = (REPO / "results/bench").resolve()
+    if args.design == "full" and out_root == default_root and not args.dry_run:
+        print(
+            "warning: --design full is the whole matrix (~300 cells, days of board "
+            "time) and is about to write into the shared default output. Give it "
+            "its own root: --out results/bench-full",
+            file=sys.stderr,
+        )
 
     wanted = [name.strip() for name in (args.conditions or "").split(",") if name.strip()]
     conditions: list[tuple[str, dict[str, object]]] = []
-    generated = matrix_conditions(scenario)
+    generated = matrix_conditions(scenario, design=args.design)
     pool: Iterable[tuple[str, dict[str, object]]] = (
         generated
         if generated
@@ -832,7 +1149,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("no runnable conditions")
 
     source = str(scenario.get("source", ""))
-    out_root.mkdir(parents=True, exist_ok=True)
+    if not args.dry_run:
+        out_root.mkdir(parents=True, exist_ok=True)
 
     budgets = {
         name: trial_budget(
@@ -847,11 +1165,15 @@ def main(argv: list[str] | None = None) -> int:
     ceilings = [float(budgets[name]["duration_s"]) for name, _ in conditions]
     settles = {float(budgets[name]["settle_s"]) for name, _ in conditions}
     windows = {int(budgets[name]["analysis_frames"]) for name, _ in conditions}
+    # Ceilings only: engine load, gaps and the fact that a trial stops as soon
+    # as its window is full both push this number, in opposite directions.
+    ceiling_hours = sum(ceilings) * repeats / 3600.0
     print(
         f"{len(conditions)} cell(s) x {repeats} pass(es); analysis window "
         f"{', '.join(str(n) for n in sorted(windows))} frames after "
         f"{', '.join(f'{s:g}' for s in sorted(settles))}s settle; "
-        f"time ceiling {min(ceilings):.0f}-{max(ceilings):.0f}s -> {out_root}",
+        f"time ceiling {min(ceilings):.0f}-{max(ceilings):.0f}s "
+        f"(<= {ceiling_hours:.1f} h total) -> {out_root}",
         file=sys.stderr,
     )
 
@@ -881,7 +1203,6 @@ def main(argv: list[str] | None = None) -> int:
         for name in order:
             condition = by_name[name]
             trial_dir = out_root / name / f"r{repeat + 1}"
-            trial_dir.mkdir(parents=True, exist_ok=True)
             budget = budgets[name]
             context = {
                 "python": sys.executable,
@@ -915,6 +1236,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             before = machine_state()
+            trial_dir.mkdir(parents=True, exist_ok=True)
             log_path = trial_dir / "workload.log"
             print(f"--- {name} r{repeat + 1} -> {trial_dir}", file=sys.stderr)
             t_start = time.monotonic()
@@ -996,9 +1318,12 @@ def main(argv: list[str] | None = None) -> int:
         "budgets": budgets,
         "trials": trials,
     }
-    (out_root / "run.json").write_text(
-        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-    )
+    if not args.dry_run:
+        # A dry run plans, it does not write: the artefact root may be the
+        # shared `results/bench` and a plan there would look like a measurement.
+        (out_root / "run.json").write_text(
+            json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+        )
     failed = [trial for trial in trials if trial.get("returncode") not in (0, None)]
     print(
         f"{len(trials) - len(failed)}/{len(trials)} trials ok -> {out_root}",

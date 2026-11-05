@@ -29,7 +29,7 @@ the clearest way to show a delta that is *not* a difference.
 | **slot** | a cell's position inside a pass. Only used by the order audit (`run.json`). |
 | **block** | a group of cells run back-to-back (both chains at one resolution/model), so the pair is minutes apart instead of hours. |
 | **anchor** | the reference cell every delta is expressed against (`anchor` in `scenarios.json`). Every cell runs once per pass, so the anchor is *not* measured more often — it is the shared zero, which is why any run of a subset must include it. |
-| **window** | the frames a trial is summarised over: everything after `settle_s` seconds, capped at `analysis_frames` frames. |
+| **window** | the frames a trial is summarised over: everything after that trial's settle (30 s, 45 s for a windowed cell — read back from its `run.meta.json`), capped at `analysis_frames` frames. |
 | **dispersion** | how much a single trial's value moves between passes (std). |
 | **CI** | how well the *mean* is known. Different object, see below. |
 | **Δ (delta)** | a difference between two cells, computed *inside* one pass. |

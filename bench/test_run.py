@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -163,3 +164,134 @@ def test_the_hint_table_has_a_resolution_level() -> None:
     ladder = dict(conditions["ros-N4-p2c1-720p-n-i4"])
     ladder.update(SCENARIO["cells"]["ros-N4-p2c1-720p-n-i4"])
     assert R._fps_hint(ladder, SCENARIO) == 6.0
+
+
+# ------------------------------------------------------------- the full design
+def full_cells() -> list[tuple[str, dict[str, object]]]:
+    return R.matrix_conditions(SCENARIO, design="full")
+
+
+def test_the_full_design_is_every_combination() -> None:
+    """`--design full` is the cross product of the factors, windows included.
+
+    Monolith: 3 resolutions x 3 models at its one window = 9. Every ROS shape:
+    3 resolutions x 3 models x 4 windows = 36, times 8 shapes. The point of
+    stating the arithmetic in a test is that the number is the *design*: 297
+    cells, 891 trials at three passes.
+    """
+    names = [name for name, _ in full_cells()]
+    assert len(names) == len(set(names)) == 297
+
+    chains = Counter(condition["cell"]["chain"] for _, condition in full_cells())  # type: ignore[index]
+    assert chains["monolith"] == 9
+    assert sum(count for chain, count in chains.items() if chain != "monolith") == 288
+    assert len(chains) == 9
+    for chain, count in chains.items():
+        if chain != "monolith":
+            assert count == 3 * 3 * 4, chain
+
+    resolutions = Counter(condition["cell"]["resolution"] for _, condition in full_cells())  # type: ignore[index]
+    models = Counter(condition["cell"]["model"] for _, condition in full_cells())  # type: ignore[index]
+    windows = Counter(condition["inflight"] for _, condition in full_cells())
+    assert resolutions == Counter({"720p": 99, "360p": 99, "180p": 99})
+    assert models == Counter({"n": 99, "m": 99, "x": 99})
+    # 9 monolith cells + 8 shapes x 3 x 3 at the window of one.
+    assert windows == Counter({1: 81, 2: 72, 4: 72, 8: 72})
+
+
+def test_the_full_design_contains_the_pruned_one() -> None:
+    """The default design is a subset of the full matrix, workload and all.
+
+    Same cell names, same command templates, same conditioning: `--design full`
+    changes which cells exist, never how any of them is measured.
+    """
+    pruned = by_name()
+    full = dict(full_cells())
+    missing = sorted(set(pruned) - set(full))
+    assert not missing, missing
+    for name in pruned:
+        assert pruned[name].get("cmd") == full[name].get("cmd")
+        assert pruned[name].get("shell") == full[name].get("shell")
+
+
+def test_the_monolith_has_no_window() -> None:
+    """One process, one frame at a time: its window domain is [1]."""
+    assert R.chain_windows(SCENARIO["factors"]["chain"]["monolith"]) == [1]
+    assert R.chain_windows(SCENARIO["factors"]["chain"]["ros-N4-p2c1"]) == [1, 2, 4, 8]
+
+
+def test_a_window_outside_the_chain_domain_is_rejected() -> None:
+    """The declared domain and the design list cannot drift apart.
+
+    A cell that asks for a window the chain does not declare would either launch
+    a different graph or invite hand-editing `windows` until the name is a lie.
+    """
+    scenario = json.loads(json.dumps(SCENARIO))
+    scenario["design"]["cells"].append(["monolith", "720p", "n", 4])
+    with pytest.raises(SystemExit, match="declares windows"):
+        R.matrix_conditions(scenario)
+
+
+# ------------------------------------------------------------ derived hints
+def test_derived_hints_are_pessimistic_and_windowed() -> None:
+    """A cell with no measured hint is costed, not given a flat default.
+
+    The derived rate reproduces the shipped window-of-one entries (that is the
+    sanity check in `fps_model`), and a windowed cell of a family the table does
+    cover may not exceed the table's rate by more than the declared gain cap --
+    an over-estimate is the failure that costs data, because it shortens the
+    ceiling until the analysis window comes up short.
+    """
+    caps = float(SCENARIO["fps_model"]["window_gain_cap"])
+    conditions = by_name()
+    assert 4.0 <= R._fps_from_model(conditions["monolith-720p-n"], SCENARIO) <= 6.5
+    assert 3.5 <= R._fps_from_model(conditions["ros-N4-p2c1-720p-n"], SCENARIO) <= 5.5
+
+    for name, condition in full_cells():
+        hint = R._fps_hint(condition, SCENARIO)
+        assert 0.5 <= hint < R.DEFAULT_FPS_HINT, (name, hint)
+        inflight = int(condition["inflight"])
+        if inflight == 1:
+            continue
+        same_family = dict(condition, inflight=1)
+        one = R._fps_hint(same_family, SCENARIO)
+        assert one <= hint <= one * caps * 1.01 + 1e-9, (name, one, hint)
+
+
+def test_the_frame_cap_never_binds_before_the_ceiling() -> None:
+    """Every cell's `max_frames` must cover its own settle at its own hint.
+
+    The cap exists to catch an fps *overshoot* and must never truncate a trial
+    that is simply faster than its hint, or the window would come up short and
+    the cell would be silently measured over fewer frames.
+    """
+    for name, condition in full_cells():
+        budget = R.trial_budget(
+            condition, SCENARIO, settle=None, analysis_frames=None, duration=None
+        )
+        needed = float(budget["settle_s"]) * float(budget["fps_hint"])
+        assert float(budget["max_frames"]) > needed, name
+        assert float(budget["duration_s"]) > float(budget["settle_s"]), name
+
+
+# --------------------------------------------------------------- the window
+def test_a_windowed_cell_settles_longer_than_a_demand_driven_one() -> None:
+    """The settle rule follows the cell, not a hand-copied override.
+
+    A windowed cell is a different power/thermal state, so `run.py` gives it
+    `trial.settle_s_windowed`; `analyze.py` reads that back per trial. A CLI
+    override still wins over both.
+    """
+    conditions = by_name()
+    assert R.trial_budget(
+        conditions["ros-N4-p2c1-720p-n"], SCENARIO, settle=None,
+        analysis_frames=None, duration=None,
+    )["settle_s"] == 30.0
+    assert R.trial_budget(
+        dict(conditions["ros-N4-p2c1-720p-n"], inflight=4), SCENARIO, settle=None,
+        analysis_frames=None, duration=None,
+    )["settle_s"] == 45.0
+    assert R.trial_budget(
+        dict(conditions["ros-N4-p2c1-720p-n"], inflight=4), SCENARIO, settle=12.0,
+        analysis_frames=500, duration=None,
+    )["settle_s"] == 12.0

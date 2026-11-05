@@ -176,6 +176,7 @@ rendered demo videos to the report when any exist.
 | flag | applies to | effect |
 |---|---|---|
 | `--conditions a,b` | `run.py` | subset by cell name (`monolith-720p-n`, ...) |
+| `--design scenario\|full` | `run.py` | which cells exist: the pruned `design.cells` (default) or every combination (297 cells, 891 trials) |
 | `--repeats N` | `run.py` | passes over the selected cells (see *Trial order*) |
 | `--settle S` | `run.py` | seconds per trial treated as settling (default from `trial.settle_s`) |
 | `--analysis-frames N` | `run.py` | frames of analysis window per trial (default from `trial.analysis_frames`) |
@@ -385,9 +386,9 @@ The experiment is written once as **factors** and a **design** list, not as N
 hand-copied command templates:
 
 ```
-factors.resolution   720p | 360p | 180p   -> source file, rotate, clip_frames
+factors.resolution   720p | 360p | 180p   -> source file, rotate, clip_frames, frame_mb
 factors.model        n    | m    | x      -> TensorRT engine path
-factors.chain        monolith | ros-N4-p2c1 | ros-N12-p8c3 -> cmd / shell
+factors.chain        monolith | ros-N4-p2c1 | ros-N12-p8c3 -> cmd / shell + windows
 conditioning.ops     the one stage-2 chain, run by every cell
 ```
 
@@ -396,7 +397,59 @@ A cell is `<chain>-<resolution>-<model>[-i<D>]` (`monolith-720p-n`,
 resolution, model variant and frames in flight -- and nothing else.
 `design.cells` is the list of combos that actually exist (40: the 18-cell model
 matrix, 14 shape cells and 8 window cells); leave the list out and `run.py`
-generates the full product.
+generates the full product described next. Each chain factor also declares the
+fourth coordinate's domain, `windows` (`[1]` for the monolith, `[1,2,4,8]` for
+the ROS shapes); a design cell asking for a window outside it is rejected.
+
+### The full matrix (`--design full`)
+
+The 40-cell design is a set of *pruned* subsets, which is right for answering one
+factor at a time and wrong if what you want is the whole picture. `--design full`
+ignores `design.cells` and expands every combination the factors admit:
+
+| dimension | values | count |
+|---|---|---|
+| chain | `monolith` + 8 ROS shapes | 9 |
+| resolution | `720p`, `360p`, `180p` | 3 |
+| model | `n`, `m`, `x` | 3 |
+| frames in flight | `1`, `2`, `4`, `8` (ROS only) | 4 |
+
+which is 9 monolith cells (window 1 only) + 8 x 3 x 3 x 4 = 288 ROS cells =
+**297 cells**, i.e. **891 trials** at three passes. At the current budget the
+ceilings sum to ~34 h per pass, so a three-pass run is roughly four days of
+unattended board time (`run.py` prints its own upper bound before starting, and
+warns if the output is the shared default root).
+
+```bash
+bench/run.py --design full --out results/bench-full --repeats 3
+bench/run.py --design full --dry-run                       # 891 planned trials
+bench/run.py --design full --conditions monolith-720p-n,ros-N4-p2c1-720p-n  # still a subset
+```
+
+Nothing about a cell changes: same command template, same conditioning, same
+budget. What does change is that a family's window ladder is contiguous by
+construction -- the design is emitted `resolution -> model -> chain -> window`
+with the `reference_chain` placed immediately after the monolith, so inside each
+33-cell block the monolith and the four-node chain are adjacent (the headline
+pair) and every `-iD` cell sits next to its own `i1` zero. Blocks are still
+shuffled per pass and reversed on alternate passes.
+
+Two knobs exist for this mode and do nothing otherwise:
+
+* **`trial.settle_s_windowed` (45 s).** A windowed cell is a different power and
+  thermal state, so it settles longer -- as a rule, not as 216 hand-copied
+  per-cell overrides. `analyze.py` reads each trial's budget back from
+  `run.meta.json`, so the window it summarises starts after that trial's own
+  settle rather than one global number.
+* **`fps_model`.** A derived, deliberately pessimistic frame-rate hint for every
+  cell the measured `trial.fps_hint` table does not cover: per process,
+  residency = its stages + the hop out of it + a small fixed cost, then
+  `X = min(D/Σ, 1/max s)` times `pessimism`, with `window_gain_cap` limiting what
+  a window may buy (the one gain measured on this board was 1.5x). An entry in
+  `trial.fps_hint` or `cells` always wins over it. Only an over-estimate costs
+  data -- it shortens the ceiling until the analysis window comes up short -- so
+  the model is allowed to be too slow, never too fast; a `window_short` warning
+  after a full run is the signal that `pessimism` is now too large.
 
 **The conditioning chain is a constant, not a coordinate.** Every cell -- both
 front-ends, every shape, resolution, model and window -- runs the same seven ops
@@ -520,8 +573,9 @@ ops are ~13.6 ms and the model still sets the pace.
 The 18-cell model matrix is ~2.1 h per pass at the current budget (3 passes
 ~6.5 h), the 14 shape cells ~1.8 h, the 8 window cells ~0.9 h, so the full
 40-cell design is ~4.8 h per pass (~14.5 h for 3) before engine load and gaps.
-Those are ceilings: a trial stops as soon as its window is full, which is usually
-earlier. The spread is wide: `monolith-180p-n` is ~140 s while
+The whole product of the factors (`--design full`) is 297 cells and ~34 h per
+pass. Those are ceilings: a trial stops as soon as its window is full, which is
+usually earlier. The spread is wide: `monolith-180p-n` is ~140 s while
 `ros-N4-p2c1-720p-x` is ~950 s, and the conditioning chain is what moved both
 (the ops cost 103.5 ms at 720p and 13.6 at 180p, so the resolution axis now
 changes the *per-frame cost*, not only the payload). That is also why the shape
@@ -555,8 +609,10 @@ The two failure modes here have different currencies, so the design uses both.
   cold. `settle_s` is dropped by the analyser, and each trial gets a time ceiling
   derived from its frame budget.
 
-`scenarios.json` therefore carries `trial.settle_s`, `trial.analysis_frames` and
-`trial.fps_hint` (a table per chain, resolution and model). The
+`scenarios.json` therefore carries `trial.settle_s` (30 s, plus
+`settle_s_windowed` 45 s for the `-iD` cells), `trial.analysis_frames` and
+`trial.fps_hint` (a table per chain, resolution and model, with `fps_model`
+deriving one for any cell the table does not cover). The
 hints are **0.7x** the estimated rate *with the seven-op chain*, not 0.9x, and
 they are re-derived whenever the chain or the box changes: the same desk with a
 browser and an editor open measured 1.4x slower with identical code, which turned
@@ -574,6 +630,11 @@ duration  = settle_s + 1.1 * analysis_frames / fps_hint     # stop condition
 max_frames= 2.0*settle_s*fps_hint + 1.5*analysis_frames      # hard cap behind it
 loops     = ceil(max_frames / clip_frames) + 1               # exact, not 1000
 ```
+
+The window is per trial, not per run: `analyze.py` reads `budget.settle_s` back
+out of each `run.meta.json` (falling back to `trial.settle_s`, then to `--settle`
+if you pass it), so a run that mixes 30 s and 45 s cells still starts every
+window after that cell's own ramp.
 
 The cap is sized to cover an fps *overshoot* (twice the hinted rate during the
 settle, 50 % slack on the window), because it must never bind before the ceiling:
@@ -603,6 +664,9 @@ condition name -- output paths, env merge, process-group discovery.
 
 * **New axis value** (another resolution, another model): add an entry to the
   matching `factors` table and list the cells in `design`. Nothing else changes.
+* **New chain shape**: add the chain factor with its `windows` list. `--design
+  full` picks it up with no further edit; the pruned design only measures it
+  where it is listed.
 * **New axis** (e.g. chain length): add a `factors.<name>` table, extend the
   cells to `[chain, resolution, model, <name>]`, and reference `{<name>}` in the
   chain templates.

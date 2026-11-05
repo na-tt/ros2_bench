@@ -18,11 +18,63 @@
   "loops": 1000,
   "repeats": 3,
   "anchor": "monolith-720p-n",
+  "reference_chain": "ros-N4-p2c1",
+  "reference_chain_note": "The ROS chain the headline claim is about (four nodes, one process per stage), declared only so `--design full` can put it next to the monolith inside every block: the full matrix is 33 cells per (resolution, model) block, and without this the pair every delta quotes would be ten trials -- hours -- apart instead of adjacent. It does not affect the pruned design, which lists its cells in its own order.",
   "anchor_note": "The reference cell every delta is expressed against. Not measured more often than the other cells -- every cell runs once per pass -- so its job is to be the shared zero: any run of a subset of the matrix must include it, or that run yields no comparable delta. It is the headline cell and the anchor of the historic baseline; it is no longer the cheapest cell (the conditioning chain costs ~103.5 ms at 720p against ~13.6 at 180p), but `analyze.py --anchor` re-derives every delta from the records already on disk, so changing it costs nothing.",
   "out_dir": "results/bench",
+  "fps_model": {
+    "note": "Derived frame-rate hints for the cells the measured table does not cover -- in practice every cell of `--design full` that is not one of the 40 pruned ones. It is the closed loop of docs/proposals/frames-in-flight.md: per process, residency = the stages it runs + the hop out of it (serialisation happens in the publisher's thread) + a small fixed per-process cost; a hop costs the fitted transport model (fixed + per-MB for a BGR frame, one number for candidates); then X = min(D / sum(residency), 1 / max(residency)), i.e. the loop cannot outrun its longest frame and its knee is at D* = sum/max, and X is multiplied by `pessimism`. Two corrections keep a derived hint on the safe side, because only an over-estimate costs data: `pessimism` on the rate, and `window_gain_cap` on what a window may buy (the one gain measured on this board was 1.5x, op-free at 180p: 29.5 -> 44.2 fps, well under what the closed model allows once queueing and DDS overhead grow with the window). Constants are the measured baseline: decode 2.8/1.0/0.4 ms, the seven-op chain 103.5/31.6/13.6 ms at 720p/360p/180p, engine 12.6/26.3/46.8 ms for n/m/x (which is total latency, so charging it as infer-only is already pessimistic), stages 4-6 ~1 ms, hop 3.6 ms + 2.2 ms/MB (450 MB/s). `pre` is the WHOLE chain and is divided by the number of groups that run it, so the eight-process stage 2 is not charged seven chains. Sanity check: it reproduces the shipped monolith row to within ~10 % and the four-node row to ~15 % (720p-n 4.3 vs 4, 180p-n 17 vs 13). It is a derivation, not a measurement -- it only sizes a trial's ceiling, an entry in `trial.fps_hint` always wins, and a `window_short` warning in the report means `pessimism` is now too large.",
+    "pessimism": 0.6,
+    "node_ms": 1.5,
+    "window_gain_cap": 1.5,
+    "stage_ms": {
+      "acq": {
+        "720p": 2.8,
+        "360p": 1.0,
+        "180p": 0.4
+      },
+      "pre": {
+        "720p": 103.5,
+        "360p": 31.6,
+        "180p": 13.6
+      },
+      "infer": {
+        "n": 12.6,
+        "m": 26.3,
+        "x": 46.8
+      },
+      "post": {
+        "720p": 1.1,
+        "360p": 0.7,
+        "180p": 0.5
+      },
+      "nms": {
+        "720p": 0.6,
+        "360p": 0.35,
+        "180p": 0.25
+      },
+      "filter": {
+        "720p": 0.3,
+        "360p": 0.2,
+        "180p": 0.15
+      },
+      "coord": {
+        "720p": 0.2,
+        "360p": 0.15,
+        "180p": 0.1
+      }
+    },
+    "hop_ms": {
+      "fixed": 3.6,
+      "per_mb": 2.2,
+      "candidate": 0.3
+    }
+  },
   "trial": {
-    "note": "The design is stated in frames -- that is what the percentiles are computed from -- and each trial gets a time ceiling derived from them, because the machine state that dominates trial-to-trial variance is a function of elapsed time, not of frame count. `settle_s` is skipped by the analyser (thermal/clock ramp); `analysis_frames` is then taken verbatim, so every cell reports percentiles over the same n. `fps_hint` is a table of estimates per (chain, resolution, model) and must be PESSIMISTIC: each value is ~0.7x the expected rate with the seven-op chain, which costs ~103.5 ms/frame at 720p and ~13.6 at 180p on top of the op-free pipeline (59.5 fps for monolith-720p-n before conditioning). It is per resolution and model, not one scale on a 720p row, because the ops and the model scale differently with pixels: at 720p the chain is ~7x the inference of the n engine, at 180p they are comparable, so the model spread widens as the resolution falls. An over-estimate shortens the ceiling until the window goes short; an under-estimate only runs a little longer. Re-derive from a clean run and keep the margin.",
+    "note": "The design is stated in frames -- that is what the percentiles are computed from -- and each trial gets a time ceiling derived from them, because the machine state that dominates trial-to-trial variance is a function of elapsed time, not of frame count. `settle_s` is skipped by the analyser (thermal/clock ramp); `analysis_frames` is then taken verbatim, so every cell reports percentiles over the same n. `fps_hint` is a table of estimates per (chain, resolution, model) and must be PESSIMISTIC: each value is ~0.7x the expected rate with the seven-op chain, which costs ~103.5 ms/frame at 720p and ~13.6 at 180p on top of the op-free pipeline (59.5 fps for monolith-720p-n before conditioning). It is per resolution and model, not one scale on a 720p row, because the ops and the model scale differently with pixels: at 720p the chain is ~7x the inference of the n engine, at 180p they are comparable, so the model spread widens as the resolution falls. An over-estimate shortens the ceiling until the window goes short; an under-estimate only runs a little longer. Re-derive from a clean run and keep the margin. Cells this table does not cover -- every `--design full` cell outside the pruned 40 -- fall back to `fps_model`, which is derived, not measured; an entry here always wins over it.",
     "settle_s": 30,
+    "settle_s_windowed": 45,
+    "settle_s_windowed_note": "A cell with frames in flight is a different power and thermal state from the demand-driven one (4 fps against 40 fps), so its ramp is longer than the 30 s the rest of the matrix uses. It is a rule here rather than a per-cell override in `cells`, because `--design full` measures every window of every chain and hand-copying 45 into 216 cells is how they drift apart.",
     "analysis_frames": 2500,
     "fps_hint": {
       "monolith": {
@@ -67,17 +119,20 @@
       "720p": {
         "source": "assets/video/0000f77c-6257be58_720p.mov",
         "rotate": 0,
-        "clip_frames": 1211
+        "clip_frames": 1211,
+        "frame_mb": 2.76
       },
       "360p": {
         "source": "assets/video/0000f77c-6257be58_360p.mov",
         "rotate": 0,
-        "clip_frames": 1211
+        "clip_frames": 1211,
+        "frame_mb": 0.69
       },
       "180p": {
         "source": "assets/video/0000f77c-6257be58_180p.mov",
         "rotate": 0,
-        "clip_frames": 1211
+        "clip_frames": 1211,
+        "frame_mb": 0.17
       }
     },
     "model": {
@@ -95,6 +150,9 @@
     "chain": {
       "monolith": {
         "note": "single-process baseline",
+        "windows": [
+          1
+        ],
         "cmd": [
           "{python}",
           "-m",
@@ -138,40 +196,88 @@
       },
       "ros-N2-p1c0": {
         "note": "two processes: acquisition | everything else. One pixel hop and nothing else, so this cell prices a process boundary -- if a ROS cost exists that is not transport, it appears here first. p1c0, N2.",
+        "windows": [
+          1,
+          2,
+          4,
+          8
+        ],
         "shell": "source {repo}/ws/install/setup.bash && PYTHONPATH={repo}/monolith/yolocar/src:$PYTHONPATH ros2 launch yolocar_ros bench.launch.py model:={model} max_frames:={frames} duration:={duration} loops:={loops} source:={source} rotate:={rotate} 'chain:=acq|pre+infer+post' 'pre_ops:={pre_ops}' inflight:={inflight} records:={out}/records.jsonl summary:={out}/summary.json log_level:=WARNING"
       },
       "ros-N3-p1c1": {
         "note": "pixels cross one boundary: three processes but only one frame serialisation. It beats p2c0 despite the same node count if H1 holds. p1c1, N3.",
+        "windows": [
+          1,
+          2,
+          4,
+          8
+        ],
         "shell": "source {repo}/ws/install/setup.bash && PYTHONPATH={repo}/monolith/yolocar/src:$PYTHONPATH ros2 launch yolocar_ros bench.launch.py model:={model} max_frames:={frames} duration:={duration} loops:={loops} source:={source} rotate:={rotate} 'chain:=acq|pre+infer|post' 'pre_ops:={pre_ops}' inflight:={inflight} records:={out}/records.jsonl summary:={out}/summary.json log_level:=WARNING"
       },
       "ros-N3-p2c0": {
         "note": "the mirror of p1c1: same process count, pixels cross twice. p1c1 vs p2c0 is the H1 test -- same N, different payload classes. p2c0, N3.",
+        "windows": [
+          1,
+          2,
+          4,
+          8
+        ],
         "shell": "source {repo}/ws/install/setup.bash && PYTHONPATH={repo}/monolith/yolocar/src:$PYTHONPATH ros2 launch yolocar_ros bench.launch.py model:={model} max_frames:={frames} duration:={duration} loops:={loops} source:={source} rotate:={rotate} 'chain:=acq|pre|infer+post' 'pre_ops:={pre_ops}' inflight:={inflight} records:={out}/records.jsonl summary:={out}/summary.json log_level:=WARNING"
       },
       "ros-N4-p2c1": {
         "note": "four-node chain (acquisition -> preprocessing -> inference -> postprocessing), one process each, running the seven-op conditioning chain like every other cell. The inference node owns the decode/threshold step, so compare `infer + post` against the monolith's two buckets. This is the only cell both the model matrix and the shape axis need: it is p2c1 with the common workload, so the shape axis gets its four-node baseline without a second cell. Prerequisite: `cd ws && colcon build --symlink-install`.",
+        "windows": [
+          1,
+          2,
+          4,
+          8
+        ],
         "shell": "source {repo}/ws/install/setup.bash && PYTHONPATH={repo}/monolith/yolocar/src:$PYTHONPATH ros2 launch yolocar_ros bench.launch.py model:={model} max_frames:={frames} duration:={duration} loops:={loops} source:={source} rotate:={rotate} 'chain:=acq|pre|infer|post' 'pre_ops:={pre_ops}' inflight:={inflight} records:={out}/records.jsonl summary:={out}/summary.json log_level:=WARNING"
       },
       "ros-N5-p3c1": {
         "note": "one pixel hop more than p2c1 and nothing else: the additivity check. Its delta against p2c1 must reproduce one hop cost, or the per-hop model is wrong. p3c1, N5.",
+        "windows": [
+          1,
+          2,
+          4,
+          8
+        ],
         "shell": "source {repo}/ws/install/setup.bash && PYTHONPATH={repo}/monolith/yolocar/src:$PYTHONPATH ros2 launch yolocar_ros bench.launch.py model:={model} max_frames:={frames} duration:={duration} loops:={loops} source:={source} rotate:={rotate} 'chain:=acq|pre|pre|infer|post' 'pre_ops:={pre_ops}' pre_groups:=2,5 inflight:={inflight} records:={out}/records.jsonl summary:={out}/summary.json log_level:=WARNING"
       },
       "ros-N5-p2c2": {
         "note": "first cut inside stages 4-6: nms alone, then filter+coord. Candidate hops carry kilobytes, so this is the cheapest boundary in the pipeline. p2c2, N5.",
+        "windows": [
+          1,
+          2,
+          4,
+          8
+        ],
         "shell": "source {repo}/ws/install/setup.bash && PYTHONPATH={repo}/monolith/yolocar/src:$PYTHONPATH ros2 launch yolocar_ros bench.launch.py model:={model} max_frames:={frames} duration:={duration} loops:={loops} source:={source} rotate:={rotate} 'chain:=acq|pre|infer|nms|filter+coord' 'pre_ops:={pre_ops}' inflight:={inflight} records:={out}/records.jsonl summary:={out}/summary.json log_level:=WARNING"
       },
       "ros-N6-p2c3": {
         "note": "stages 4-6 fully split: three candidate hops. With p2c2 it gives the marginal cost of a candidate boundary. p2c3, N6.",
+        "windows": [
+          1,
+          2,
+          4,
+          8
+        ],
         "shell": "source {repo}/ws/install/setup.bash && PYTHONPATH={repo}/monolith/yolocar/src:$PYTHONPATH ros2 launch yolocar_ros bench.launch.py model:={model} max_frames:={frames} duration:={duration} loops:={loops} source:={source} rotate:={rotate} 'chain:=acq|pre|infer|nms|filter|coord' 'pre_ops:={pre_ops}' inflight:={inflight} records:={out}/records.jsonl summary:={out}/summary.json log_level:=WARNING"
       },
       "ros-N12-p8c3": {
         "note": "the far end: one process per op plus split stages 4-6. Eleven hops, eight of them carrying a frame -- the transport-dominant extreme of the axis. p8c3, N12.",
+        "windows": [
+          1,
+          2,
+          4,
+          8
+        ],
         "shell": "source {repo}/ws/install/setup.bash && PYTHONPATH={repo}/monolith/yolocar/src:$PYTHONPATH ros2 launch yolocar_ros bench.launch.py model:={model} max_frames:={frames} duration:={duration} loops:={loops} source:={source} rotate:={rotate} 'chain:=acq|pre|pre|pre|pre|pre|pre|pre|infer|nms|filter|coord' 'pre_ops:={pre_ops}' pre_groups:=1,1,1,1,1,1,1 inflight:={inflight} records:={out}/records.jsonl summary:={out}/summary.json log_level:=WARNING"
       }
     }
   },
   "design": {
-    "note": "Architecture x resolution x model, plus the frames-in-flight ladder: 40 cells. It is listed in full so the file states the truth rather than a wish; `bench/README.md` has the cost per cell and the pruning recipes (`--conditions`, or a shorter `design`). The model matrix is 2 chains x 3 resolutions x 3 models = 18; `ros-N4-p2c1` is also the four-node baseline of the shape axis, so it is not listed twice. The shape cells (`ros-N*`, 14 more) run two resolutions and model n as their own subset; the eight fourth-coordinate cells are the frames-in-flight ladder (window 2, 4 or 8 instead of 1), which only exists for the ROS chains -- the monolith is one thread, so its window is 1 by construction. Run a ladder as its own `--conditions` subset with its `i1` cell of the same family in the same invocation: that cell is the local zero for every window delta, while `anchor` stays the monolith.",
+    "note": "This is the default design: architecture x resolution x model, plus the frames-in-flight ladder, 40 cells. It is listed in full so the file states the truth rather than a wish; `bench/README.md` has the cost per cell and the pruning recipes (`--conditions`, or a shorter `design`). The model matrix is 2 chains x 3 resolutions x 3 models = 18; `ros-N4-p2c1` is also the four-node baseline of the shape axis, so it is not listed twice. The shape cells (`ros-N*`, 14 more) run two resolutions and model n as their own subset; the eight fourth-coordinate cells are the frames-in-flight ladder (window 2, 4 or 8 instead of 1), which only exists for the ROS chains -- the monolith is one thread, so its window is 1 by construction. Run a ladder as its own `--conditions` subset with its `i1` cell of the same family in the same invocation: that cell is the local zero for every window delta, while `anchor` stays the monolith.\n\n`run.py --design full` ignores this list and expands every combination the factors admit instead: chain x resolution x model x window, with the window domain being each chain's `windows` list. That is 9 monolith cells (window 1 only) + 8 ROS shapes x 3 resolutions x 3 models x 4 windows = 297 cells, i.e. 891 trials at three passes -- days of board time, and a dedicated `--out` directory. The list here stays the default because it is what a subset run is a subset *of*: `--design full` changes which cells exist, never how any of them are measured.",
     "cells": [
       [
         "monolith",
@@ -592,7 +698,7 @@
     ]
   },
   "cells": {
-    "note": "Per-cell overrides, merged over the generated cell. The `ros-N*` shape cells set `fps_hint` explicitly: their cost is dominated by the conditioning chain and the partition, which the matrix table (indexed by chain, resolution and model) does not cover. `ros-N4-p2c1` itself needs no override: it is a matrix cell, so `trial.fps_hint` covers it. Use this block for a measured hint, a different window for one cell, or \"enabled\": false to retire a cell. The window cells (`-iD`) also set `settle_s: 45`: a 4 fps cell and a 40 fps cell are different power and thermal states on the same board, so the ramp takes longer than the 30 s the rest of the matrix uses. Their `fps_hint` is the *expected* peak at that window with the usual margin taken off (the closed-loop prediction is `X = min(D / sum(residency), 1 / max residency)`), and an over-estimate only costs a `window_short` warning. With the conditioning chain the montage is asymmetric: at 720p the pre node costs ~103.5 ms and becomes the bottleneck, so the window buys little beyond two frames; at 180p the ops are ~13.6 ms and the model still sets the pace. These hints are estimates, so lower them on a loaded board.",
+    "note": "Per-cell overrides, merged over the generated cell. The `ros-N*` shape cells set `fps_hint` explicitly: their cost is dominated by the conditioning chain and the partition, which the matrix table (indexed by chain, resolution and model) does not cover. `ros-N4-p2c1` itself needs no override: it is a matrix cell, so `trial.fps_hint` covers it. Use this block for a measured hint, a different window for one cell, or \"enabled\": false to retire a cell. The longer settle of a windowed cell is *not* set here any more: it is the rule `trial.settle_s_windowed` (45 s), because `--design full` measures every window of every chain and hand-copying the number into 216 cells is how they drift apart. Their `fps_hint` is the *expected* peak at that window with the usual margin taken off (the closed-loop prediction is `X = min(D / sum(residency), 1 / max residency)`), and an over-estimate only costs a `window_short` warning. With the conditioning chain the montage is asymmetric: at 720p the pre node costs ~103.5 ms and becomes the bottleneck, so the window buys little beyond two frames; at 180p the ops are ~13.6 ms and the model still sets the pace. These hints are estimates, so lower them on a loaded board. A cell of `--design full` that is not listed here falls back to `fps_model`, not to a flat default.",
     "ros-N2-p1c0-720p-n": {
       "fps_hint": 5
     },
@@ -636,36 +742,28 @@
       "fps_hint": 10
     },
     "ros-N4-p2c1-720p-n-i2": {
-      "fps_hint": 5,
-      "settle_s": 45
+      "fps_hint": 5
     },
     "ros-N4-p2c1-720p-n-i4": {
-      "fps_hint": 6,
-      "settle_s": 45
+      "fps_hint": 6
     },
     "ros-N4-p2c1-720p-n-i8": {
-      "fps_hint": 6,
-      "settle_s": 45
+      "fps_hint": 6
     },
     "ros-N4-p2c1-180p-n-i2": {
-      "fps_hint": 18,
-      "settle_s": 45
+      "fps_hint": 18
     },
     "ros-N4-p2c1-180p-n-i4": {
-      "fps_hint": 22,
-      "settle_s": 45
+      "fps_hint": 22
     },
     "ros-N4-p2c1-180p-n-i8": {
-      "fps_hint": 26,
-      "settle_s": 45
+      "fps_hint": 26
     },
     "ros-N12-p8c3-720p-n-i2": {
-      "fps_hint": 5,
-      "settle_s": 45
+      "fps_hint": 5
     },
     "ros-N12-p8c3-720p-n-i4": {
-      "fps_hint": 6,
-      "settle_s": 45
+      "fps_hint": 6
     }
   }
 }

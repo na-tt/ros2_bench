@@ -193,6 +193,18 @@ source install/setup.bash
   bench/analyze.py --md results/report.md --json results/report.json
   ```
 
+* **To measure every combination instead of the pruned subsets**, add
+  `--design full`: chain x resolution x model x window, i.e. 9 monolith cells +
+  8 ROS shapes x 3 x 3 x 4 windows = 297 cells, 891 trials at `--repeats 3`
+  (~34 h of ceilings per pass, days in total). It only changes which cells
+  exist -- same templates, same conditioning, same budget -- and `--conditions`
+  still selects a subset of it. Give it its own output root; `run.py` warns if
+  the run would land in the shared default:
+  ```bash
+  bench/run.py --design full --out results/bench-full --repeats 3
+  bench/run.py --design full --dry-run    # 891 planned trials, nothing launched
+  ```
+
 * **To run a ROS 2 implementation** (the four-node chain -- see *Current State*):
   ```bash
   cd ws && colcon build --symlink-install && source install/setup.bash
@@ -512,6 +524,29 @@ type only at the very end.
   `summary.provenance.shape`. `docs/proposals/chain-shapes.md` has the full
   table, the predictions and the two-tier measurement design. **The axis has
   not been measured yet** -- the cells exist, the numbers do not.
+* **`--design full` measures the whole product of the factors, not a subset.**
+  `bench/run.py --design full` ignores `design.cells` and expands chain x
+  resolution x model x window from the factor tables: 9 monolith cells (window 1
+  only, it is one thread) + 8 ROS shapes x 3 resolutions x 3 models x 4 windows
+  = 297 cells, 891 trials at `--repeats 3`. The fourth coordinate's domain is
+  declared per chain factor as `windows` (`[1]` / `[1,2,4,8]`) and a design cell
+  outside it is rejected, so the pruned list and the full product cannot drift
+  apart. Two rules exist for this mode and are inert otherwise:
+  `trial.settle_s_windowed` (45 s) is applied to any cell with `inflight > 1`
+  instead of 216 hand-copied overrides, and `analyze.py` reads each trial's
+  settle back from `run.meta.json` so a mixed run still starts every window
+  after that cell's own ramp; `fps_model` derives a deliberately pessimistic
+  hint for cells the measured `trial.fps_hint` table does not cover (per-process
+  residency + hop costs, `X = min(D/Σ, 1/max s)` x `pessimism`, with
+  `window_gain_cap` on what a window may buy). A measured hint always wins, and
+  being too slow is safe (the trial stops on `max_frames`), while being too fast
+  truncates the window -- a `window_short` warning after a full run means the
+  model is now too optimistic. The design is emitted
+  `resolution -> model -> chain -> window` with `reference_chain` right after the
+  monolith, so inside each 33-cell block the headline pair is adjacent and every
+  `-iD` cell sits next to its `i1` zero. **Not measured yet** -- the option
+  exists, the 297 cells do not (the budgets put one pass at ~34 h of ceilings,
+  ~4 days for three).
 * **Run the launch from the repository root.** Default source/model/records
   paths are relative, and `yolocar` must be on `PYTHONPATH`
   (`PYTHONPATH=monolith/yolocar/src:$PYTHONPATH`) because there is no `pip` on
